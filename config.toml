@@ -10,14 +10,35 @@ recent_window = 20
 
 [claude]
 binary = "claude"
+# Default model for any role that doesn't override below.
 model = "claude-opus-4-7"
+# Per-role overrides. Omit a key to inherit `model`.
+#   Sanitizer: runs on every message; Haiku is fast and reliable for OTP /
+#              account-number pattern recognition + structured JSON output.
+#   Assistant: inherits `model` (smartest available) — does memory-aware reasoning.
+#   Curator:   destructive summarization. Mistakes are silent and permanent —
+#              err toward smarter compression. Sonnet is the right balance.
+#   Scout:     web summarization + triage. Sonnet is plenty; Opus is wasted.
+sanitizer_model = "claude-haiku-4-5"
+# assistant_model = "claude-sonnet-4-6"
+curator_model   = "claude-sonnet-4-6"
+scout_model     = "claude-sonnet-4-6"
 timeout_secs = 180
 scout_allowed_tools = ["WebSearch", "WebFetch"]
 
 [scout]
+# Off by default — only flip on after tuning topics below to what you
+# actually care about. Scout spends tokens silently in the background.
 enabled = false
 interval_minutes = 10
-topics = ["world news headlines", "technology news"]
+topics = [
+    "world news headlines",
+    "US national news",
+    "technology and AI news",
+    "science and space",
+    "local weather and severe-weather alerts",
+    "notable events in the user's region",
+]
 
 [curator]
 enabled = true

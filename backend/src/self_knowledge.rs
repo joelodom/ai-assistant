@@ -173,6 +173,34 @@ fn baseline() -> Vec<(&'static str, String)> {
                 .to_string(),
         ),
         (
+            "scout-design-choices",
+            "The Scout is OPT-IN (disabled by default). Three reasons: (1) it spends tokens \
+             silently in the background on a ~10 min interval; (2) on a fresh install it has no \
+             learned user preferences yet, so its findings would be noisy and possibly \
+             unwanted; (3) the user should consciously choose what topics it watches before \
+             turning it loose. Enable via `[scout].enabled = true` in `config.toml`. \
+             The model is Claude Sonnet 4.6 — web summarization and triage is well within \
+             Sonnet's range; Opus would be wasted spend on this task. The default topic list is \
+             intentionally broad (world news, US news, tech/AI, science, local weather, regional \
+             events) and is meant to be EDITED to match what the user actually cares about. \
+             Findings still go through the Sanitizer (with PublicWeb provenance) before landing \
+             in memory."
+                .to_string(),
+        ),
+        (
+            "curator-model-choice",
+            "The Curator uses Claude Sonnet 4.6 by default — NOT Haiku, even though it's a \
+             summarization task. Reasoning: the Curator is the only component that destructively \
+             rewrites memory items (the summary replaces the original body). Its mistakes are \
+             silent and permanent — a buried name or offhand date that turns out to matter later \
+             just vanishes. Sanitizer mistakes are noisy (the user notices an over-redaction and \
+             re-sends), Assistant mistakes are correctable in the next turn, but Curator mistakes \
+             are unrecoverable. The Curator runs every 60 min in the background, so latency \
+             isn't load-bearing the way it is for the Sanitizer. Override via \
+             `[claude].curator_model`."
+                .to_string(),
+        ),
+        (
             "what-i-protect-against",
             "I am defending against sophisticated, financially motivated attackers whose goal \
              is account takeover or direct theft. I must NEVER let the following reach long-term \

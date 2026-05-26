@@ -105,8 +105,17 @@ impl Default for ClaudeCfg {
             model: "claude-opus-4-7".to_string(),
             sanitizer_model: Some("claude-haiku-4-5".to_string()),
             assistant_model: None,
-            curator_model: Some("claude-haiku-4-5".to_string()),
-            scout_model: None,
+            // Sonnet, not Haiku: the Curator destructively rewrites items
+            // (the summary replaces the original body). Its mistakes are
+            // silent and permanent, so we err toward smarter compression
+            // over speed. The Curator runs in the background every 60 min;
+            // latency isn't load-bearing the way it is for the Sanitizer.
+            curator_model: Some("claude-sonnet-4-6".to_string()),
+            // Sonnet, not Opus: Scout summarizes news/web findings into a
+            // short bulleted list. That's a tractable extraction-and-
+            // summarization task — Opus is wasted spend here. Sonnet
+            // handles web-tool use and triage cleanly.
+            scout_model: Some("claude-sonnet-4-6".to_string()),
             timeout_secs: 180,
             scout_allowed_tools: vec!["WebSearch".to_string(), "WebFetch".to_string()],
         }
@@ -131,11 +140,23 @@ impl ClaudeCfg {
 impl Default for ScoutCfg {
     fn default() -> Self {
         Self {
+            // Off by default — Scout silently spends tokens in the background
+            // and dumps findings into memory before the user has expressed
+            // any topic preferences. Flip on after you've tuned the topic
+            // list below to what you actually care about.
             enabled: false,
             interval_minutes: 10,
+            // Broad starter set — meant to be edited. The user's actual
+            // interests get learned over time through preference statements
+            // ("stop telling me about crypto"), but the Scout needs some
+            // seed list to query on a fresh install.
             topics: vec![
                 "world news headlines".to_string(),
-                "technology news".to_string(),
+                "US national news".to_string(),
+                "technology and AI news".to_string(),
+                "science and space".to_string(),
+                "local weather and severe-weather alerts".to_string(),
+                "notable events in the user's region".to_string(),
             ],
         }
     }
