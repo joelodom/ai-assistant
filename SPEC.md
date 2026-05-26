@@ -1,14 +1,16 @@
 # Personal AI Assistant — Requirements & Architecture Spec
 
-**Document type:** Build specification for Claude Code (Opus)
-**Status:** v1 prototype scope, written to be extensible
+**Document type:** Requirements + as-built record for the v1 prototype
+**Status:** v1 prototype built and running locally
 **Audience:** Claude Code in a fresh session. This document is the source of truth — read it fully before generating any code.
 
 ---
 
 ## 0. How to use this document
 
-This is a requirements document, not a design that has been validated. Treat the **Functional Requirements**, **Security Model**, and **Message Contract** sections as fixed intent. Treat the **Tech Stack** and **Build Phases** as strong recommendations that you may refine, but flag any deviation explicitly and explain why before changing it.
+This is both a requirements document and a record of what was actually built in v1. Treat the **Functional Requirements**, **Security Model**, **Threat Model**, and **Message Contract** sections as fixed intent. Sections marked **(as built)** record concrete implementation choices made during the v1 build — change them deliberately, not casually.
+
+If you're extending the prototype: re-read §11 (Non-negotiable invariants) before touching the Sanitizer, memory store, or any path that could open an outbound side channel.
 
 ---
 
@@ -93,7 +95,7 @@ Note that the architecture depicted runs on a cloud server, but initial prototyp
                                                           └──────────────────────────────────────┘
 ```
 
-**Naming note (open decision):** working names used in this doc — *the Gate* (sanitizer), *the Assistant Core* (the main "heavy lifter" LLM layer), *the Curator* (the memory-decay worker), *the Scout* (background news worker). Rename freely; pick something the user likes.
+**Naming (as built):** The working names stuck. The codebase uses *Sanitizer* (a.k.a. the Gate), *Assistant* (the Core / "heavy lifter"), *Curator*, and *Scout*. User-visible UI labels for turn types are: `you` / `assistant` / `gate` (for Sanitizer stub notices) / `system` (for the introduction) / `error`.
 
 Regardig the background worker, it should probably call the assistant core just to wake it up and let the assistant core do any fetching of news or events that the user is interested in. Fetches of PUBLIC URLs should still go through the sanitizer but the sanitizer should only sanitize the user's personal data, so it should be tagged as probably public. The point of this is that just in case there is an attack where the user's personal data is put on a "public URL" there is still a sanitization on it to hopefully stop the attack.
 
@@ -132,15 +134,29 @@ Notes:
 - The client is responsible for obtaining geolocation and current datetime. Metadata is intentionally free-form so it can grow without a schema change.
 - A message with attachments and no `content` question = "here is more data to remember."
 
-### 5.2 Backend → client
+### 5.2 Backend → client (as built)
+
+Five frame types, all JSON, snake_case `type` discriminator. Defined in `shared/src/lib.rs::ServerMessage`:
+
 ```json
-{
-  "type": "reply" | "stub_notice" | "error",
-  "text": "the assistant's response, or a redaction stub notice",
-  "meta": { "tier_summary": "...", "sources": [ ] }   // optional
-}
+// Streaming reply chunk — zero or more per turn.
+{ "type": "reply_chunk", "text": "..." }
+
+// End of a streamed reply. Optionally carries the full reply text (used for
+// the introduction and for cases where the backend chose to send one shot).
+{ "type": "reply_done", "text": null | "...", "meta": { "tier_summary": "pass|redact|introduction", "sources": [] } }
+
+// Sanitizer Tier-1 drop, or sanitizer-failure notice. Content-free.
+{ "type": "stub_notice", "text": "Received and dropped an email that ..." }
+
+// Backend-side error surfaced to the user.
+{ "type": "error", "text": "..." }
+
+// Keepalive reply.
+{ "type": "pong" }
 ```
-Support **streaming** replies (token/chunk frames) so the conversation feels live; define a simple `reply_chunk` / `reply_done` framing if you implement it in Phase 1, otherwise stub it for later.
+
+On connect, the backend immediately sends one `reply_done` frame containing an **introduction** so a brand-new user knows who/what this is and that they can start sending data. The intro text branches on whether memory is empty (bootstrap) vs. populated (welcome back).
 
 ---
 
@@ -148,9 +164,32 @@ Support **streaming** replies (token/chunk frames) so the conversation feels liv
 
 The store must not keep everything forever. Ingestion volume may be large — potentially gigabytes per month once photos and documents are included. Data **decays by importance, not by a fixed calendar**, and decay is driven by the Assistant/Curator's judgment.
 
-### 6.1 Storage substrate
-- File-based on the EC2 instance (the user prefers a file structure over a heavy database for the prototype). A reasonable layout: per-item files (sanitized text + small JSON sidecar of metadata/importance), grouped by date or kind, plus a lightweight index file the Assistant Core can scan or query. SQLite is acceptable *only* if you justify it as the index layer; primary content stays as readable text files.
-- Everything in the store is **already sanitized.** Raw input never lands here.
+### 6.1 Storage substrate (as built)
+
+- File-based, **no database**. Layout under the configured memory root:
+
+  ```
+  <root>/
+    items/
+      YYYY-MM-DD/
+        YYYYMMDDTHHMMSSZ-<uuid>.txt   # sanitized body, plain text
+        YYYYMMDDTHHMMSSZ-<uuid>.json  # sidecar: kind, importance, decay_stage,
+                                      #          tags, redaction_report, state,
+                                      #          metadata (datetime + geo)
+    stubs/
+      <id>.json                       # Tier-1 drop records (content-free)
+    preferences.json                  # learned user preferences (with timestamps)
+  ```
+
+- **No index file.** The volume justified by v1 is small enough that the Assistant scans sidecars per turn (`MemoryStore::scan_all`). When this stops being trivial, the right move is a SQLite index over sidecars; the bodies stay as text on disk.
+
+- **Atomic writes.** Every body, sidecar, stub, and preference write goes through `memory::atomic_write` (write temp file → fsync → rename). A crash mid-write cannot leave a partially-written item.
+
+- **Override the root** with `--memory-dir <path>` or `AI_ASSISTANT_MEMORY_DIR=<path>`. The directory **is** the database — point the backend at different folders to run against different datasets.
+
+- **Backup = `tar czf data.tgz <root>`.** The format is human-readable text + JSON; no binary state lives outside the directory.
+
+- Everything in the store is **already sanitized.** Raw input never lands here. (See §3.1 and §13.)
 
 ### 6.2 Decay tiers (progressive summarization, not hard delete)
 - **Fresh (recent):** kept in full (sanitized). Highest fidelity.
@@ -190,18 +229,22 @@ The store must not keep everything forever. Ingestion volume may be large — po
 
 ## 9. Tech stack
 
-- **Backend:** Rust on an EC2 instance. Async runtime: **Tokio**. WebSocket server via `tokio-tungstenite` or an `axum` WebSocket handler. HTTP client (`reqwest`) for the Claude API and web search.
-- **Client:** Rust, **native Mac application**, v1 typed input.
-  - Options to evaluate and pick: **`egui`/`eframe`** (pure-Rust native window, simplest path for a typed chat UI) vs **Tauri** (web-tech UI shell with a Rust core; richer UI, more moving parts). For a fast v1 typed prototype, `egui` is the lower-friction choice; Tauri is the better long-term bet if the UI gets rich. State the trade-off and choose.
-- **Transport:** WebSocket (JSON frames per §5; optional streaming).
-- **LLM:** Use Claude in a way that uses the user's Claude Max token budget rather than the Claude API. That may change in the future.
-- **Config:** a single config file/env for intervals, decay thresholds, model names, and the sanitizer rule set.
+- **Backend (as built):** Rust, async via **Tokio**, WebSocket via **axum**'s `ws` extractor. Workspace layout: `shared/` (wire protocol), `backend/` (server), `client/` (UI). Runs locally for the prototype; the same binary is intended for EC2.
+- **Client (as built):** Rust, native via **`egui`/`eframe`**. Chosen over Tauri for v1 because the typed-chat surface is simple, the build is fast, and the dependency footprint is smaller. Revisit if the UI grows rich (image previews, file pickers, settings tabs).
+- **Transport (as built):** WebSocket, JSON frames per §5.2. Streaming is implemented as `reply_chunk` (zero or more) followed by `reply_done`.
+- **LLM (as built):** The backend shells out to the `claude` CLI (one `tokio::process::Command` per call) so the user's Claude Max subscription is the token budget. There is **no shared session** between calls — each invocation is a fresh `claude -p`. This is load-bearing for the Sanitizer's ephemeral-context invariant (§3.1).
+  - Tools per call:
+    - Sanitizer + Curator: `--tools ""` (all tools disabled).
+    - Assistant + Scout: `--allowedTools WebSearch,WebFetch --permission-mode dontAsk` (the `dontAsk` is required for tools to actually fire in `-p` mode, where there's no human to approve prompts).
+  - The model name is configurable; default `claude-opus-4-7`.
+  - Tests swap in a `MockLlmClient` via `AI_ASSISTANT_MOCK_CLAUDE=1`. See §14.
+- **Config (as built):** `config.toml` at the working directory (optional — all keys have built-in defaults). CLI flags `--config`, `--memory-dir`, `--addr` override the file. Env vars `AI_ASSISTANT_MEMORY_DIR` and `AI_ASSISTANT_ADDR` also override.
 
 ---
 
-## 10. Build phases
+## 10. Build phases (as built)
 
-[ Deleted section as I will try to have this built all at once. ]
+V1 was built in a single pass rather than phased. The system is small enough that the phase boundaries didn't earn their keep. Future work — voice input, photo OCR, EC2 deployment, richer search — should land as its own discrete step with the existing invariants preserved.
 
 ---
 
@@ -214,7 +257,46 @@ The store must not keep everything forever. Ingestion volume may be large — po
 
 ---
 
-## 12. Final notes
+## 12. Operations (as built)
 
-- Retention windows / decay thresholds should be determined by AI. This means that the application needs to have some ability to curate all of the data from time to time. This needs to be designed during implementation.
-- Make the Claude model modular. Pick the smartest one to start but the user may change it over time.
+- **Run locally:**
+  ```bash
+  ./target/release/ai-assistant-backend                            # ./memory, ws://127.0.0.1:8765/ws
+  ./target/release/ai-assistant-backend --memory-dir ~/data/work   # different dataset
+  AI_ASSISTANT_MEMORY_DIR=/tmp/scratch ./target/release/ai-assistant-backend
+  ./target/release/ai-assistant-client --url ws://127.0.0.1:8765/ws
+  ```
+- **Backup:** `tar czf data-$(date +%F).tgz -C <parent> <dirname>`. There is no other persistent state.
+- **Logs:** stderr, controlled by `RUST_LOG` (default `info`).
+- **Client prefs:** UI scale (and any future client-only preferences) persist at `~/.ai-assistant-client.json`. The client supports ⌘+ / ⌘− / ⌘0 to zoom and a slider in the Settings panel.
+
+---
+
+## 13. Error policy (as built)
+
+LLM calls fail sometimes — out of tokens, CLI not found, network blip, malformed JSON. The system never silently swallows these; every failure is both **surfaced to the user** and **recorded in memory** so the user can ask about it later.
+
+- **Sanitizer failure.** Input is **dropped without inspection** (the ephemerality invariant is preserved: the raw text never moves out of the per-request stack). An audit record of kind `sanitizer_error` is written to memory containing the timestamp, the *length* of the dropped input (not the content), and the underlying error message. The client receives a `stub_notice` explaining what happened and that a note was saved.
+- **Assistant failure.** The user's sanitized message was already persisted before the LLM call (so it isn't lost). A paired `assistant_error` record is written with the timestamp and underlying error. The client receives an `error` frame with a user-friendly explanation and a hint about likely causes (token exhaustion, rate limiting).
+- **Curator/Scout failure.** Logged at warn level; loop continues at the next interval. No user-visible surface.
+- The Sanitizer's prompt is hardened against prompt injection: input is enclosed in `<<<BEGIN_INPUT>>>` / `<<<END_INPUT>>>` markers with explicit instructions to treat everything inside as data, not instructions.
+
+---
+
+## 14. Testability (as built)
+
+The backend is designed so the whole pipeline can run without spending a single Claude token.
+
+- `LlmClient` trait in `backend/src/claude.rs` with three implementations:
+  - `ClaudeCliClient` — production. Spawns `claude -p ...`.
+  - `MockLlmClient` — deterministic, in-process, no network. Default responses keyed off prompt markers (`SANITIZER_TASK`, `SCOUT_TASK`, `CURATOR_TASK`); per-test overrides via `respond_when(matcher, response)`.
+  - `FailingLlmClient` — always errors. Used to exercise the failure paths in §13.
+- Set `AI_ASSISTANT_MOCK_CLAUDE=1` to swap the production client for the mock at process start.
+- `cargo test --workspace` runs 19 unit tests + 3 integration tests covering: Sanitizer JSON parsing (drop/redact/pass + nested braces), memory roundtrip + search + atomic-write durability, Curator stage promotion + summarization, preference detection, the full WebSocket roundtrip with intro and reply frames, the Tier-1 OTP-never-on-disk invariant, and the sanitizer-failure audit path.
+
+---
+
+## 15. Final notes
+
+- Retention windows / decay thresholds are AI-driven via the **Curator** (see §6, §7). Thresholds are configurable in `config.toml` (`fresh_age_hours`, `aging_age_days`, `stale_age_days`). The Curator advances items through Fresh → Aging → Summarized → Stale and uses Claude to collapse aging items into short summaries; low-importance items decay sooner.
+- The Claude model name is modular — configurable via `[claude].model` in `config.toml`. Default is the latest available Opus.

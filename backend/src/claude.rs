@@ -57,8 +57,18 @@ impl LlmClient for ClaudeCliClient {
             .arg("--output-format")
             .arg("text");
 
-        if !opts.allowed_tools.is_empty() {
-            cmd.arg("--allowedTools").arg(opts.allowed_tools.join(","));
+        if opts.allowed_tools.is_empty() {
+            // No tools requested → disable all built-in tools so a stray tool
+            // call can't fire. This is what the Sanitizer and Curator want.
+            cmd.arg("--tools").arg("");
+        } else {
+            // Tools requested → allow them AND set permission-mode dontAsk
+            // so claude doesn't try to prompt a non-existent human for
+            // approval. Without this flag, `-p` will quietly skip tool use.
+            cmd.arg("--allowedTools")
+                .arg(opts.allowed_tools.join(","))
+                .arg("--permission-mode")
+                .arg("dontAsk");
         }
 
         // Prompt via stdin to avoid argv length limits and shell quoting.

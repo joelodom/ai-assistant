@@ -216,7 +216,15 @@ fn build_prompt(
         "You are the user's personal AI assistant. You are like a trusted human assistant: \
          you have read what the user has given you, remember it, and answer plainly. \
          You CANNOT take any action in the outside world — no sending email, no booking, \
-         no transactions. If asked, explain why and offer to help the user do it themselves.\n\n",
+         no transactions. If asked, explain why and offer to help the user do it themselves.\n\
+         \n\
+         You DO have read-only access to the web via two tools:\n\
+           • WebSearch — search the web for current information\n\
+           • WebFetch — fetch a specific URL the user gave you\n\
+         Use them freely whenever the question benefits from current information \
+         (news, weather, prices, events, recent changes, anything time-sensitive). \
+         Reading from the web is consistent with the diode invariant — you fetch \
+         in, you never push out.\n\n",
     );
     buf.push_str(&format!(
         "Right now: {}\n",
@@ -290,10 +298,16 @@ mod tests {
     use tempfile::TempDir;
 
     async fn setup() -> (TempDir, Assistant) {
+        let (td, a, _mock) = setup_with_mock().await;
+        (td, a)
+    }
+
+    async fn setup_with_mock() -> (TempDir, Assistant, Arc<MockLlmClient>) {
         let td = TempDir::new().unwrap();
         let store = Arc::new(MemoryStore::open(td.path().to_path_buf()).await.unwrap());
         let llm = MockLlmClient::new();
-        (td, Assistant::new(llm, store))
+        let assistant = Assistant::new(llm.clone(), store);
+        (td, assistant, llm)
     }
 
     fn meta() -> Metadata {
@@ -373,5 +387,45 @@ mod tests {
         assert!(detect_preference("Stop telling me about sports").is_some());
         assert!(detect_preference("don't tell me about the weather").is_some());
         assert!(detect_preference("I love coffee").is_none());
+    }
+
+    #[tokio::test]
+    async fn assistant_passes_websearch_and_webfetch_to_llm() {
+        let (_td, a, mock) = setup_with_mock().await;
+        let s = SanitizerResult {
+            tier: Tier::Pass,
+            output: "What's the weather in Lafayette today?".into(),
+            redaction_report: "".into(),
+        };
+        a.respond(&s, &meta()).await.unwrap();
+        // The assistant turn is the LLM call with the user message in its
+        // prompt — find it and assert tools were allowed.
+        let calls = mock.calls();
+        let turn = calls
+            .iter()
+            .find(|c| c.prompt.contains("weather in Lafayette"))
+            .expect("expected an assistant LLM call");
+        assert!(turn.allowed_tools.contains(&"WebSearch".to_string()));
+        assert!(turn.allowed_tools.contains(&"WebFetch".to_string()));
+    }
+
+    #[tokio::test]
+    async fn assistant_prompt_mentions_web_capabilities() {
+        let (_td, a, mock) = setup_with_mock().await;
+        let s = SanitizerResult {
+            tier: Tier::Pass,
+            output: "hello".into(),
+            redaction_report: "".into(),
+        };
+        a.respond(&s, &meta()).await.unwrap();
+        let calls = mock.calls();
+        let turn = calls
+            .iter()
+            .find(|c| c.prompt.contains("USER MESSAGE"))
+            .expect("expected an assistant LLM call");
+        assert!(
+            turn.prompt.contains("WebSearch"),
+            "assistant prompt should advertise WebSearch capability"
+        );
     }
 }
