@@ -15,6 +15,7 @@ pub struct Curator {
     pub llm: Arc<dyn LlmClient>,
     pub memory: Arc<MemoryStore>,
     pub cfg: CuratorCfg,
+    pub model: Option<String>,
 }
 
 impl Curator {
@@ -75,9 +76,13 @@ impl Curator {
                 }
                 DecayStage::Summarized => {
                     let prompt = build_summary_prompt(&item.body);
+                    let opts = LlmOptions {
+                        model: self.model.clone(),
+                        ..Default::default()
+                    };
                     let summary = self
                         .llm
-                        .oneshot(&prompt, LlmOptions::default())
+                        .oneshot(&prompt, opts)
                         .await
                         .unwrap_or_else(|_| {
                             // Fall back to a deterministic truncation if the
@@ -182,6 +187,7 @@ mod tests {
                 aging_age_days: 14,
                 stale_age_days: 90,
             },
+            model: None,
         };
         curator.tick().await.unwrap();
 
@@ -227,6 +233,7 @@ mod tests {
                 aging_age_days: 14,
                 stale_age_days: 90,
             },
+            model: None,
         };
         curator.tick().await.unwrap();
 

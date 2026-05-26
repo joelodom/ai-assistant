@@ -29,7 +29,19 @@ pub struct MemoryCfg {
 #[serde(default)]
 pub struct ClaudeCfg {
     pub binary: String,
+    /// Default model for roles that don't override. The roles below
+    /// individually override when set; leaving them None means "use `model`".
     pub model: String,
+    /// Sanitizer runs on every turn and does tight pattern-recognition +
+    /// structured JSON output — Haiku is fast and reliable for this.
+    pub sanitizer_model: Option<String>,
+    /// Assistant Core does memory-aware reasoning; default to the main model
+    /// (typically the smartest).
+    pub assistant_model: Option<String>,
+    /// Curator summarizes aging items — Haiku is plenty.
+    pub curator_model: Option<String>,
+    /// Scout browses the web and synthesizes findings.
+    pub scout_model: Option<String>,
     /// Per-call timeout in seconds.
     pub timeout_secs: u64,
     /// Tools to allow the Scout and Assistant (sanitizer never gets tools).
@@ -91,9 +103,28 @@ impl Default for ClaudeCfg {
         Self {
             binary: "claude".to_string(),
             model: "claude-opus-4-7".to_string(),
+            sanitizer_model: Some("claude-haiku-4-5".to_string()),
+            assistant_model: None,
+            curator_model: Some("claude-haiku-4-5".to_string()),
+            scout_model: None,
             timeout_secs: 180,
             scout_allowed_tools: vec!["WebSearch".to_string(), "WebFetch".to_string()],
         }
+    }
+}
+
+impl ClaudeCfg {
+    pub fn model_for_sanitizer(&self) -> String {
+        self.sanitizer_model.clone().unwrap_or_else(|| self.model.clone())
+    }
+    pub fn model_for_assistant(&self) -> String {
+        self.assistant_model.clone().unwrap_or_else(|| self.model.clone())
+    }
+    pub fn model_for_curator(&self) -> String {
+        self.curator_model.clone().unwrap_or_else(|| self.model.clone())
+    }
+    pub fn model_for_scout(&self) -> String {
+        self.scout_model.clone().unwrap_or_else(|| self.model.clone())
     }
 }
 

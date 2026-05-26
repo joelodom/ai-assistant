@@ -17,6 +17,7 @@ pub struct Scout {
     pub assistant: Arc<Assistant>,
     pub cfg: ScoutCfg,
     pub allowed_tools: Vec<String>,
+    pub model: Option<String>,
 }
 
 impl Scout {
@@ -67,6 +68,7 @@ TOPICS: {topics}
         );
         let opts = LlmOptions {
             allowed_tools: self.allowed_tools.clone(),
+            model: self.model.clone(),
             ..Default::default()
         };
         let body = self.llm.oneshot(&prompt, opts).await?;

@@ -99,12 +99,14 @@ async fn main() -> Result<()> {
         assistant: built.state.assistant.clone(),
         cfg: built.cfg.scout.clone(),
         allowed_tools: built.cfg.claude.scout_allowed_tools.clone(),
+        model: Some(built.cfg.claude.model_for_scout()),
     }
     .spawn();
     backend::curator::Curator {
         llm: built.llm.clone(),
         memory: built.memory.clone(),
         cfg: built.cfg.curator.clone(),
+        model: Some(built.cfg.claude.model_for_curator()),
     }
     .spawn();
 

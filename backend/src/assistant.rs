@@ -18,25 +18,48 @@ use std::sync::Arc;
 pub struct Assistant {
     pub llm: Arc<dyn LlmClient>,
     pub memory: Arc<MemoryStore>,
+    pub model: Option<String>,
+    pub system_facts: Arc<crate::self_knowledge::SystemFacts>,
 }
 
 impl Assistant {
     pub fn new(llm: Arc<dyn LlmClient>, memory: Arc<MemoryStore>) -> Self {
-        Self { llm, memory }
+        Self {
+            llm,
+            memory,
+            model: None,
+            system_facts: Arc::new(crate::self_knowledge::SystemFacts::placeholder()),
+        }
+    }
+
+    pub fn with_model_and_facts(
+        llm: Arc<dyn LlmClient>,
+        memory: Arc<MemoryStore>,
+        model: Option<String>,
+        system_facts: Arc<crate::self_knowledge::SystemFacts>,
+    ) -> Self {
+        Self { llm, memory, model, system_facts }
     }
 
     /// Produce the introduction the client sees on connect. Pure function so
     /// it's easy to test and to render the same text in different surfaces.
     pub async fn introduction(&self) -> String {
         let prefs = self.memory.preferences().await;
-        let stats = self.memory.stats();
-        let total = stats.get("total").copied().unwrap_or(0);
-        let bootstrap = total == 0 && prefs.statements.is_empty();
+        // Bootstrap state = no user data. SelfKnowledge items are seeded by
+        // the system on every startup, so they don't count.
+        let user_items: usize = self
+            .memory
+            .scan_all()
+            .unwrap_or_default()
+            .iter()
+            .filter(|i| i.sidecar.kind != crate::memory::ItemKind::SelfKnowledge)
+            .count();
+        let bootstrap = user_items == 0 && prefs.statements.is_empty();
         if bootstrap {
             BOOTSTRAP_INTRO.to_string()
         } else {
             format!(
-                "Welcome back. I have {total} item(s) in memory and {} stored preference(s). \
+                "Welcome back. I have {user_items} item(s) in memory and {} stored preference(s). \
                  Ask me what you need to be thinking about, or hand me more to remember.",
                 prefs.statements.len()
             )
@@ -77,13 +100,24 @@ impl Assistant {
             .unwrap_or_default();
         let prefs = self.memory.preferences().await;
 
-        let prompt = build_prompt(metadata, &sanitized.output, sanitized.tier, &recent, &keyword_hits, &prefs.statements);
+        let item_count = self.memory.stats().get("total").copied().unwrap_or(0);
+        let facts_block = self.system_facts.render_prompt_block(item_count);
+        let prompt = build_prompt(
+            metadata,
+            &sanitized.output,
+            sanitized.tier,
+            &recent,
+            &keyword_hits,
+            &prefs.statements,
+            &facts_block,
+        );
 
         // The assistant can use web tools when answering questions about the
         // outside world — they're read-only and consistent with the diode
         // invariant (we fetch in, we never push out).
         let opts = LlmOptions {
             allowed_tools: vec!["WebSearch".into(), "WebFetch".into()],
+            model: self.model.clone(),
             ..Default::default()
         };
         let reply = self.llm.oneshot(&prompt, opts).await?;
@@ -210,6 +244,7 @@ fn build_prompt(
     recent: &[MemoryItem],
     keyword_hits: &[MemoryItem],
     preferences: &[crate::memory::PreferenceStatement],
+    system_facts_block: &str,
 ) -> String {
     let mut buf = String::new();
     buf.push_str(
@@ -226,6 +261,11 @@ fn build_prompt(
          Reading from the web is consistent with the diode invariant — you fetch \
          in, you never push out.\n\n",
     );
+    buf.push_str(system_facts_block);
+    buf.push_str("\nWhen asked about yourself — what model you use, how you work, why you made \
+                  a design choice — use the SYSTEM SELF-KNOWLEDGE block above for runtime facts \
+                  AND the SelfKnowledge memory items (visible in the memory blocks below) for \
+                  rationale and architecture. Be specific and accurate; do not invent details.\n\n");
     buf.push_str(&format!(
         "Right now: {}\n",
         metadata.datetime_iso

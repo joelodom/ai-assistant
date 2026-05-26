@@ -62,6 +62,10 @@ pub enum ItemKind {
     /// The Assistant Core failed after the user message was already saved.
     /// Body describes the failure; the preceding user item is in memory.
     AssistantError,
+    /// Self-knowledge: facts about the system itself, seeded on startup or
+    /// added by the assistant during conversation. Searchable like any
+    /// other memory.
+    SelfKnowledge,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -368,6 +372,43 @@ mod tests {
 
         let hits = store.search("car", 10).unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn store_survives_drop_and_reopen() {
+        // Invariant #6: restart-safe. Simulate a hard restart by dropping
+        // the store and opening a fresh one at the same path.
+        let td = TempDir::new().unwrap();
+        let path = td.path().to_path_buf();
+
+        let before_sidecar = {
+            let s = MemoryStore::open(path.clone()).await.unwrap();
+            s.add("first", ItemKind::UserMessage, 0.5, None, "".into(), vec!["a".into()])
+                .await
+                .unwrap();
+            let sc = s
+                .add("second", ItemKind::Ingestion, 0.7, None, "rep".into(), vec!["b".into()])
+                .await
+                .unwrap();
+            s.add_preference("don't tell me about sports").await.unwrap();
+            s.add_stub("dropped a 2FA message", "OTP".into()).await.unwrap();
+            sc
+            // store dropped here
+        };
+
+        // No graceful shutdown, no flush — just open and read.
+        let after = MemoryStore::open(path).await.unwrap();
+        let items = after.recent(10).unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|i| i.body == "first"));
+        assert!(items.iter().any(|i| i.body == "second"));
+        let prefs = after.preferences().await;
+        assert_eq!(prefs.statements.len(), 1);
+        // The sidecar from before should round-trip byte-identical metadata.
+        let matched = items.iter().find(|i| i.sidecar.id == before_sidecar.id).unwrap();
+        assert_eq!(matched.sidecar.importance, 0.7);
+        assert_eq!(matched.sidecar.redaction_report, "rep");
+        assert!(matched.sidecar.tags.contains(&"b".to_string()));
     }
 
     #[tokio::test]

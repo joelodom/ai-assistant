@@ -39,6 +39,21 @@ relaxing one, stop and ask.
 4. **Tier-1 (drop) content is never stored or forwarded** — only a content-free
    stub note.
 5. **The memory store contains sanitized data only.**
+6. **The backend is restart-safe at any time.** `kill`, `Ctrl-C`, panic, OS
+   reboot, power loss — any of these must be safe. The data directory is the
+   only persistent state; there is no in-memory-only cache, no lockfile, no
+   sequence number, no "graceful shutdown" required. Every write goes through
+   `memory::atomic_write` (temp file → fsync → rename). A user can stop the
+   backend mid-conversation, restart it, reconnect, and lose nothing except
+   the in-flight request itself.
+
+   **When extending**: if you find yourself wanting per-process state (a
+   counter, a cache, an in-memory index, a "current session") — first ask
+   whether it must survive restart. If yes, persist it via `MemoryStore` or
+   a sidecar file under the data directory using `atomic_write`. If no, fine —
+   but document that it's deliberately ephemeral. Never introduce a
+   shutdown-required path (e.g. "flush this buffer on exit") without an
+   atomic equivalent that works when the process is killed.
 
 ## Layout
 

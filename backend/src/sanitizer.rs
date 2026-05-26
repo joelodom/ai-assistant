@@ -39,11 +39,20 @@ pub enum InputProvenance {
 
 pub struct Sanitizer {
     llm: Arc<dyn LlmClient>,
+    model: Option<String>,
 }
 
 impl Sanitizer {
     pub fn new(llm: Arc<dyn LlmClient>) -> Self {
-        Self { llm }
+        Self { llm, model: None }
+    }
+
+    pub fn with_model(llm: Arc<dyn LlmClient>, model: Option<String>) -> Self {
+        Self { llm, model }
+    }
+
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
     }
 
     pub async fn sanitize(
@@ -55,6 +64,7 @@ impl Sanitizer {
         // The sanitizer is forbidden from using any tools — pure transform.
         let opts = LlmOptions {
             allowed_tools: vec![],
+            model: self.model.clone(),
             ..Default::default()
         };
         let raw_response = self.llm.oneshot(&prompt, opts).await?;

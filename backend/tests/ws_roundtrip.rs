@@ -193,6 +193,109 @@ async fn sanitizer_drop_path_emits_stub_notice_and_persists_only_stub() {
 }
 
 #[tokio::test]
+async fn self_knowledge_is_in_assistant_prompt() {
+    std::env::set_var("AI_ASSISTANT_MOCK_CLAUDE", "1");
+
+    let td = TempDir::new().unwrap();
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let memory_dir = td.path().to_path_buf();
+    let addr_str = addr.to_string();
+    let mut cfg = backend::config::Config::default();
+    cfg.memory.dir = memory_dir.clone();
+    cfg.server.addr = addr_str.clone();
+    cfg.scout.enabled = false;
+    cfg.curator.enabled = false;
+    // Confirm Haiku really is the sanitizer default.
+    assert_eq!(cfg.claude.model_for_sanitizer(), "claude-haiku-4-5");
+
+    let built = backend::build_app(cfg).await.unwrap();
+
+    // The Assistant should have SystemFacts wired and SelfKnowledge items
+    // seeded. Verify both visible in the prompt by capturing one assistant
+    // turn through a mock.
+    let mock = backend::claude::MockLlmClient::new();
+    let facts = built.state.assistant.system_facts.clone();
+    let assistant = std::sync::Arc::new(backend::assistant::Assistant::with_model_and_facts(
+        mock.clone(),
+        built.memory.clone(),
+        None,
+        facts,
+    ));
+    let sanitizer = std::sync::Arc::new(backend::sanitizer::Sanitizer::new(mock.clone()));
+    let state = backend::ws::AppState { sanitizer, assistant };
+    tokio::spawn(async move {
+        let app = backend::ws::router(state);
+        let listener = tokio::net::TcpListener::bind(&addr_str).await.unwrap();
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let _ = ws.next().await; // intro
+
+    ws.send(Message::Text(
+        serde_json::to_string(&ClientMessage::Message {
+            payload: MessagePayload {
+                content: "What model do you use for the sanitizer?".into(),
+                attachments: vec![],
+            },
+            metadata: Metadata {
+                datetime_iso: "2026-05-25T14:03:00-05:00".into(),
+                geolocation: None,
+                freeform: serde_json::Value::Null,
+            },
+        })
+        .unwrap(),
+    ))
+    .await
+    .unwrap();
+
+    // Drain frames until reply_done so the assistant LLM call completes.
+    while let Some(frame) = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .ok()
+        .flatten()
+    {
+        if let Message::Text(t) = frame.unwrap() {
+            let parsed: ServerMessage = serde_json::from_str(&t).unwrap();
+            if matches!(parsed, ServerMessage::ReplyDone { .. }) {
+                break;
+            }
+        }
+    }
+
+    // The assistant turn should have included the SYSTEM SELF-KNOWLEDGE block
+    // AND surfaced SelfKnowledge memory items via the recent/search path.
+    let calls = mock.calls();
+    // The sanitizer prompt also contains the user's text (inside the
+    // BEGIN_INPUT markers); distinguish on the assistant-only marker.
+    let assistant_call = calls
+        .iter()
+        .find(|c| c.prompt.contains("USER MESSAGE:"))
+        .expect("expected an assistant call");
+    assert!(
+        assistant_call.prompt.contains("SYSTEM SELF-KNOWLEDGE"),
+        "assistant prompt missing system facts block; prompt was:\n{}",
+        assistant_call.prompt
+    );
+    assert!(
+        assistant_call.prompt.contains("claude-haiku-4-5"),
+        "assistant prompt should mention the sanitizer's actual model"
+    );
+    assert!(
+        assistant_call.prompt.contains("SelfKnowledge"),
+        "assistant prompt should surface SelfKnowledge memory items"
+    );
+}
+
+#[tokio::test]
 async fn sanitizer_failure_drops_input_persists_audit_and_notifies_user() {
     std::env::set_var("AI_ASSISTANT_MOCK_CLAUDE", "1");
 
