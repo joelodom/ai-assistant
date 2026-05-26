@@ -83,6 +83,17 @@ pub struct AssistantApp {
 
     show_settings: bool,
 
+    /// HAZMAT toggle: when true, the next message bypasses the Sanitizer.
+    /// Sticky within a session (does not auto-clear after send) so the user
+    /// can run a sequence of bypass messages, but always resets to false
+    /// on app startup. A bright red indicator in the UI makes the state
+    /// impossible to miss.
+    bypass_sanitizer: bool,
+
+    /// Force the assistant to route directly to the heavier model (Opus),
+    /// skipping the default Sonnet pre-pass.
+    force_opus: bool,
+
     prefs: Prefs,
     /// Tracks last applied scale so we only push a new pixels_per_point when
     /// it changes (and only save prefs to disk on actual change).
@@ -133,6 +144,8 @@ impl AssistantApp {
             input_buf: String::new(),
             pending_attachments: Vec::new(),
             show_settings: false,
+            bypass_sanitizer: false,
+            force_opus: false,
             applied_scale: prefs.ui_scale,
             prefs,
             location,
@@ -221,8 +234,20 @@ impl AssistantApp {
             return;
         }
         let attachments = std::mem::take(&mut self.pending_attachments);
+        let hazmat = self.bypass_sanitizer;
+        let force_opus = self.force_opus;
+        // Mark hazmat / opus in the local transcript so the user sees what
+        // routing applied — they should never wonder later whether a message
+        // went through the Gate or which model handled it.
+        let body = render_user_outgoing(&text, &attachments);
+        let display = match (hazmat, force_opus) {
+            (true, true) => format!("☢ HAZMAT 🧠 OPUS\n{body}"),
+            (true, false) => format!("☢ HAZMAT (sanitizer bypassed)\n{body}"),
+            (false, true) => format!("🧠 OPUS (forced)\n{body}"),
+            (false, false) => body,
+        };
         self.transcript.push(Turn::User {
-            text: render_user_outgoing(&text, &attachments),
+            text: display,
             ts: now_str(),
         });
         let msg = ClientMessage::Message {
@@ -231,6 +256,8 @@ impl AssistantApp {
                 attachments,
             },
             metadata: self.current_metadata(),
+            bypass_sanitizer: hazmat,
+            force_opus,
         };
         let _ = self.ui_tx.send(UiToNet::Send(msg));
     }
@@ -575,14 +602,53 @@ impl eframe::App for AssistantApp {
                     {
                         self.pick_files();
                     }
+                    // HAZMAT toggle. Red when on; impossible to miss.
+                    let hazmat_label = if self.bypass_sanitizer {
+                        egui::RichText::new("☢ HAZMAT ON — bypassing sanitizer ☢")
+                            .color(egui::Color32::from_rgb(255, 60, 60))
+                            .strong()
+                    } else {
+                        egui::RichText::new("☢ Hazmat (bypass sanitizer)")
+                            .color(egui::Color32::from_rgb(200, 140, 80))
+                    };
+                    ui.checkbox(&mut self.bypass_sanitizer, hazmat_label)
+                        .on_hover_text(
+                            "DANGEROUS: when on, the next messages skip the Sanitizer (the Gate) \
+                             and go directly to the Assistant. Use only when you know what you're \
+                             doing — the Sanitizer protects you from leaking secrets (2FA codes, \
+                             reset links, account numbers) into long-term memory. The bypass is \
+                             tagged in the memory audit trail. Toggle off when done.",
+                        );
+                    let opus_label = if self.force_opus {
+                        egui::RichText::new("🧠 Opus (forced)")
+                            .color(egui::Color32::from_rgb(180, 140, 255))
+                            .strong()
+                    } else {
+                        egui::RichText::new("🧠 Opus")
+                            .color(egui::Color32::from_rgb(160, 160, 200))
+                    };
+                    ui.checkbox(&mut self.force_opus, opus_label)
+                        .on_hover_text(
+                            "Force the heavier model (Opus) for the next messages. Default is \
+                             Sonnet, which is faster and self-escalates when it judges a \
+                             question genuinely needs Opus. Tick this to skip Sonnet entirely \
+                             — useful when you already know the question is hard.",
+                        );
                     ui.weak(format!(
-                        "{} char(s) · {} attachment(s)",
+                        "{} char · {} attached",
                         self.input_buf.chars().count(),
-                        self.pending_attachments.len()
+                        self.pending_attachments.len(),
                     ));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let send_label = if self.bypass_sanitizer {
+                            egui::RichText::new("Send (HAZMAT)  ⌘↵")
+                                .color(egui::Color32::from_rgb(255, 80, 80))
+                                .strong()
+                        } else {
+                            egui::RichText::new("Send  ⌘↵")
+                        };
                         let send_clicked = ui
-                            .add_enabled(self.connected, egui::Button::new("Send  ⌘↵"))
+                            .add_enabled(self.connected, egui::Button::new(send_label))
                             .clicked();
                         if send_clicked || cmd_enter {
                             self.send_current();

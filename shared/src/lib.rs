@@ -13,6 +13,19 @@ pub enum ClientMessage {
     Message {
         payload: MessagePayload,
         metadata: Metadata,
+        /// HAZMAT escape hatch. When true, the Sanitizer is skipped entirely
+        /// and this message goes directly to the Assistant. Use only when
+        /// the user has consciously chosen to bypass for a specific input
+        /// (e.g. they want the raw text reasoned over verbatim). The backend
+        /// logs a WARN and tags the resulting memory item with "hazmat" so
+        /// the bypass is auditable.
+        #[serde(default)]
+        bypass_sanitizer: bool,
+        /// When true, skip the default Sonnet path and route the Assistant
+        /// call directly to the configured escalation model (Opus). Used
+        /// when the user knows the question deserves the heavier model.
+        #[serde(default)]
+        force_opus: bool,
     },
     Ping,
 }

@@ -42,10 +42,11 @@ pub async fn build_app(cfg: config::Config) -> anyhow::Result<Built> {
         llm.clone(),
         Some(cfg.claude.model_for_sanitizer()),
     ));
-    let assistant = Arc::new(assistant::Assistant::with_model_and_facts(
+    let assistant = Arc::new(assistant::Assistant::with_models_and_facts(
         llm.clone(),
         memory.clone(),
         Some(cfg.claude.model_for_assistant()),
+        Some(cfg.claude.model_for_assistant_escalation()),
         facts,
     ));
     let state = ws::AppState {

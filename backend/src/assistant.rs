@@ -19,7 +19,27 @@ pub struct Assistant {
     pub llm: Arc<dyn LlmClient>,
     pub memory: Arc<MemoryStore>,
     pub model: Option<String>,
+    /// Heavier model Sonnet hands off to when it judges a question needs
+    /// deeper reasoning, or when the user sets `force_opus` on the message.
+    pub escalation_model: Option<String>,
     pub system_facts: Arc<crate::self_knowledge::SystemFacts>,
+}
+
+/// Marker Sonnet emits as the FIRST line of its reply to hand off to Opus.
+/// Backend detects the prefix, discards the rest of Sonnet's text, and
+/// re-runs the same prompt against the escalation model.
+pub const ESCALATION_MARKER: &str = "ESCALATE_TO_OPUS:";
+
+#[derive(Debug, Clone)]
+pub struct RespondOutcome {
+    pub text: String,
+    /// Which model produced the final text (post-escalation if any).
+    pub model_used: String,
+    /// True if Sonnet handed off, false if the configured primary model
+    /// answered directly (whether Sonnet, Opus-via-force, or other).
+    pub escalated: bool,
+    /// Short reason string Sonnet provided after the marker, if any.
+    pub escalation_reason: Option<String>,
 }
 
 impl Assistant {
@@ -28,6 +48,7 @@ impl Assistant {
             llm,
             memory,
             model: None,
+            escalation_model: None,
             system_facts: Arc::new(crate::self_knowledge::SystemFacts::placeholder()),
         }
     }
@@ -38,7 +59,29 @@ impl Assistant {
         model: Option<String>,
         system_facts: Arc<crate::self_knowledge::SystemFacts>,
     ) -> Self {
-        Self { llm, memory, model, system_facts }
+        Self {
+            llm,
+            memory,
+            model,
+            escalation_model: None,
+            system_facts,
+        }
+    }
+
+    pub fn with_models_and_facts(
+        llm: Arc<dyn LlmClient>,
+        memory: Arc<MemoryStore>,
+        model: Option<String>,
+        escalation_model: Option<String>,
+        system_facts: Arc<crate::self_knowledge::SystemFacts>,
+    ) -> Self {
+        Self {
+            llm,
+            memory,
+            model,
+            escalation_model,
+            system_facts,
+        }
     }
 
     /// Produce the introduction the client sees on connect. Pure function so
@@ -67,12 +110,14 @@ impl Assistant {
     }
 
     /// Run a single conversational turn. Returns the assistant's full reply
-    /// text. Persists both the user message and the assistant's note.
+    /// text plus metadata about which model produced it and whether it was
+    /// escalated. Persists both the user message and the assistant's note.
     pub async fn respond(
         &self,
         sanitized: &SanitizerResult,
         metadata: &Metadata,
-    ) -> Result<String> {
+        force_opus: bool,
+    ) -> Result<RespondOutcome> {
         // Persist user-side first (even if Tier::Drop, we already wrote a
         // stub from the WS handler — that path doesn't reach here).
         let user_importance = importance_hint(&sanitized.output);
@@ -81,14 +126,22 @@ impl Assistant {
         } else {
             ItemKind::Ingestion
         };
+        let mut tags = tag_guess(&sanitized.output);
+        let is_hazmat = sanitized.redaction_report.contains("HAZMAT BYPASS");
+        if is_hazmat {
+            tags.push("hazmat".to_string());
+        }
         self.memory
             .add(
                 &sanitized.output,
                 user_kind,
-                user_importance,
+                // Hazmat items get higher importance so they're easier to
+                // find in a later audit ("show me everything I bypassed
+                // the sanitizer for").
+                if is_hazmat { 0.8 } else { user_importance },
                 Some(metadata.clone()),
                 sanitized.redaction_report.clone(),
-                tag_guess(&sanitized.output),
+                tags,
             )
             .await?;
 
@@ -115,23 +168,91 @@ impl Assistant {
         // The assistant can use web tools when answering questions about the
         // outside world — they're read-only and consistent with the diode
         // invariant (we fetch in, we never push out).
+        //
+        // Model routing:
+        //   force_opus=true → straight to escalation model, no Sonnet pre-pass.
+        //   force_opus=false → primary model (Sonnet); if it self-escalates
+        //                       via ESCALATE_TO_OPUS, we re-run with the
+        //                       escalation model.
+        let primary_model = if force_opus {
+            self.escalation_model.clone().or_else(|| self.model.clone())
+        } else {
+            self.model.clone()
+        };
+
         let opts = LlmOptions {
             allowed_tools: vec!["WebSearch".into(), "WebFetch".into()],
-            model: self.model.clone(),
+            model: primary_model.clone(),
             ..Default::default()
         };
-        let reply = self.llm.oneshot(&prompt, opts).await?;
-        let reply = reply.trim().to_string();
+        let raw_reply = self.llm.oneshot(&prompt, opts).await?;
+        let raw_reply = raw_reply.trim().to_string();
 
-        // Persist assistant note.
+        // Check for self-escalation (only when not already forced).
+        let (final_text, model_used, escalated, reason) = if !force_opus
+            && raw_reply.starts_with(ESCALATION_MARKER)
+        {
+            let reason = raw_reply
+                .trim_start_matches(ESCALATION_MARKER)
+                .trim()
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let escalation_model = self
+                .escalation_model
+                .clone()
+                .or_else(|| self.model.clone());
+            let opts2 = LlmOptions {
+                allowed_tools: vec!["WebSearch".into(), "WebFetch".into()],
+                model: escalation_model.clone(),
+                ..Default::default()
+            };
+            let opus_reply = self.llm.oneshot(&prompt, opts2).await?;
+            (
+                opus_reply.trim().to_string(),
+                escalation_model.unwrap_or_default(),
+                true,
+                if reason.is_empty() { None } else { Some(reason) },
+            )
+        } else {
+            (
+                raw_reply,
+                primary_model.unwrap_or_default(),
+                false,
+                None,
+            )
+        };
+
+        // Persist assistant note. Tag escalations and Opus-forced turns so
+        // the audit trail makes routing decisions visible.
+        let mut note_tags = vec!["assistant".to_string()];
+        if escalated {
+            note_tags.push("escalated".into());
+        }
+        if force_opus {
+            note_tags.push("force-opus".into());
+        }
+        let note_body = if escalated {
+            format!(
+                "(assistant reply via {model_used}, escalated from {}{}) {final_text}",
+                self.model.clone().unwrap_or_else(|| "primary".into()),
+                reason
+                    .as_deref()
+                    .map(|r| format!(" — reason: {r}"))
+                    .unwrap_or_default()
+            )
+        } else {
+            format!("(assistant reply via {model_used}) {final_text}")
+        };
         self.memory
             .add(
-                &format!("(assistant reply) {reply}"),
+                &note_body,
                 ItemKind::AssistantNote,
                 0.2,
                 Some(metadata.clone()),
                 String::new(),
-                vec!["assistant".into()],
+                note_tags,
             )
             .await
             .ok();
@@ -143,7 +264,12 @@ impl Assistant {
             self.memory.add_preference(&pref).await.ok();
         }
 
-        Ok(reply)
+        Ok(RespondOutcome {
+            text: final_text,
+            model_used,
+            escalated,
+            escalation_reason: reason,
+        })
     }
 }
 
@@ -259,7 +385,24 @@ fn build_prompt(
          Use them freely whenever the question benefits from current information \
          (news, weather, prices, events, recent changes, anything time-sensitive). \
          Reading from the web is consistent with the diode invariant — you fetch \
-         in, you never push out.\n\n",
+         in, you never push out.\n\
+         \n\
+         MODEL ESCALATION: You are running as the standard model (typically Sonnet). \
+         For the vast majority of conversation — recall, light reasoning, factual lookup, \
+         friendly chat — answer directly. But if a question GENUINELY needs deeper \
+         reasoning than you can reliably provide (e.g. subtle architectural trade-offs, \
+         multi-step formal reasoning, careful security analysis, untangling a confusing \
+         situation with many constraints, the user explicitly asking for Opus), you can \
+         hand off to the heavier model. To do so, output EXACTLY this format as your \
+         entire reply — no preamble, no answer:\n\
+         \n\
+           ESCALATE_TO_OPUS: <one short sentence saying why you're escalating>\n\
+         \n\
+         The backend will detect the marker, run the same prompt against Opus, and the \
+         user will receive Opus's answer directly. Do NOT escalate routinely — only when \
+         your honest assessment is that Opus would meaningfully outperform you. If the \
+         user just asks for a fact, recalls a memory, or wants a casual response, answer \
+         yourself.\n\n",
     );
     buf.push_str(system_facts_block);
     buf.push_str("\nWhen asked about yourself — what model you use, how you work, why you made \
@@ -374,7 +517,7 @@ mod tests {
             output: "Bought milk".to_string(),
             redaction_report: "".into(),
         };
-        a.respond(&s, &meta()).await.unwrap();
+        a.respond(&s, &meta(), false).await.unwrap();
         let i = a.introduction().await;
         assert!(i.contains("Welcome back"));
     }
@@ -387,7 +530,7 @@ mod tests {
             output: "Please stop telling me about crypto news.".into(),
             redaction_report: "".into(),
         };
-        a.respond(&s, &meta()).await.unwrap();
+        a.respond(&s, &meta(), false).await.unwrap();
         let p = a.memory.preferences().await;
         assert_eq!(p.statements.len(), 1);
         assert!(p.statements[0].text.to_lowercase().contains("crypto"));
@@ -401,7 +544,7 @@ mod tests {
             output: "Dentist appointment Tuesday at 3pm".into(),
             redaction_report: "".into(),
         };
-        a.respond(&s, &meta()).await.unwrap();
+        a.respond(&s, &meta(), false).await.unwrap();
         let recent = a.memory.recent(5).unwrap();
         // No question mark, no question-starter — classified as Ingestion.
         let item = recent.iter().find(|i| i.sidecar.kind == ItemKind::Ingestion).unwrap();
@@ -417,7 +560,7 @@ mod tests {
             output: "What should I be thinking about right now?".into(),
             redaction_report: "".into(),
         };
-        a.respond(&s, &meta()).await.unwrap();
+        a.respond(&s, &meta(), false).await.unwrap();
         let recent = a.memory.recent(5).unwrap();
         assert!(recent.iter().any(|i| i.sidecar.kind == ItemKind::UserMessage));
     }
@@ -437,7 +580,7 @@ mod tests {
             output: "What's the weather in Lafayette today?".into(),
             redaction_report: "".into(),
         };
-        a.respond(&s, &meta()).await.unwrap();
+        a.respond(&s, &meta(), false).await.unwrap();
         // The assistant turn is the LLM call with the user message in its
         // prompt — find it and assert tools were allowed.
         let calls = mock.calls();
@@ -450,6 +593,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sonnet_self_escalation_triggers_opus_re_run() {
+        let td = TempDir::new().unwrap();
+        let store = Arc::new(MemoryStore::open(td.path().to_path_buf()).await.unwrap());
+        let mock = MockLlmClient::new();
+        let assistant = Assistant::with_models_and_facts(
+            mock.clone(),
+            store,
+            Some("claude-sonnet-4-6".to_string()),
+            Some("claude-opus-4-7".to_string()),
+            Arc::new(crate::self_knowledge::SystemFacts::placeholder()),
+        );
+
+        // Sonnet responds with the escalation marker; the second call (Opus)
+        // gets a real answer. Both are matched on prompt content so we can
+        // distinguish by model used.
+        let pulse = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let pulse_for_mock = pulse.clone();
+        // Override: first call returns the marker, second returns a real answer.
+        // The mock has no notion of call order, so use the model field to pick.
+        // (model is in LlmOptions, not the prompt — so we route via a custom
+        // matcher: when the prompt mentions USER MESSAGE we count, and the
+        // mock responds based on which call it is.)
+        // Simpler: respond differently to the same prompt across calls via a
+        // counter in the override closure. The MockLlmClient doesn't expose
+        // closure overrides, so we use a trick: respond_when prefers prompt
+        // substrings, and we know Sonnet sees a USER MESSAGE prompt — but
+        // we can't distinguish Sonnet's call from Opus's by prompt alone
+        // since they're identical. Instead, we just call respond() and
+        // verify by inspecting calls() — the mock returns the default
+        // canned response for the assistant prompt (which doesn't contain
+        // the marker), so we cannot easily test the escalation branch this
+        // way. We rely on the integration test for that.
+        let _ = (pulse, pulse_for_mock); // keep names alive
+
+        // Direct unit test of the escalation parse path:
+        mock.respond_when(
+            "USER MESSAGE",
+            "ESCALATE_TO_OPUS: needs deep reasoning about a non-obvious tradeoff",
+        );
+        let s = SanitizerResult {
+            tier: Tier::Pass,
+            output: "Should I use eventual consistency or strict ordering for X?".into(),
+            redaction_report: "".into(),
+        };
+        // With the mock returning the marker, the assistant should re-call
+        // the mock (now with the escalation model) — but the mock still
+        // returns the marker on the second call too, so the final text
+        // will start with the marker. That's fine; what we're testing is:
+        //   - escalated == true
+        //   - model_used == escalation model
+        let outcome = assistant.respond(&s, &meta(), false).await.unwrap();
+        assert!(outcome.escalated, "should have escalated");
+        assert_eq!(outcome.model_used, "claude-opus-4-7");
+        assert!(outcome.escalation_reason.is_some());
+    }
+
+    #[tokio::test]
+    async fn force_opus_routes_directly_to_escalation_model_no_re_run() {
+        let td = TempDir::new().unwrap();
+        let store = Arc::new(MemoryStore::open(td.path().to_path_buf()).await.unwrap());
+        let mock = MockLlmClient::new();
+        let assistant = Assistant::with_models_and_facts(
+            mock.clone(),
+            store,
+            Some("claude-sonnet-4-6".to_string()),
+            Some("claude-opus-4-7".to_string()),
+            Arc::new(crate::self_knowledge::SystemFacts::placeholder()),
+        );
+        let s = SanitizerResult {
+            tier: Tier::Pass,
+            output: "anything".into(),
+            redaction_report: "".into(),
+        };
+        let outcome = assistant.respond(&s, &meta(), true).await.unwrap();
+        // No escalation marker → no second call. Model used should be Opus
+        // directly (force_opus path skips Sonnet).
+        assert!(!outcome.escalated, "force_opus path doesn't go through escalation");
+        assert_eq!(outcome.model_used, "claude-opus-4-7");
+
+        // Verify only ONE assistant LLM call happened (i.e. no Sonnet pre-pass).
+        let calls = mock.calls();
+        let assistant_calls: Vec<_> = calls
+            .iter()
+            .filter(|c| c.prompt.contains("USER MESSAGE"))
+            .collect();
+        assert_eq!(assistant_calls.len(), 1, "expected exactly one assistant call");
+        assert_eq!(
+            assistant_calls[0].allowed_tools,
+            vec!["WebSearch", "WebFetch"]
+        );
+    }
+
+    #[tokio::test]
     async fn assistant_prompt_mentions_web_capabilities() {
         let (_td, a, mock) = setup_with_mock().await;
         let s = SanitizerResult {
@@ -457,7 +693,7 @@ mod tests {
             output: "hello".into(),
             redaction_report: "".into(),
         };
-        a.respond(&s, &meta()).await.unwrap();
+        a.respond(&s, &meta(), false).await.unwrap();
         let calls = mock.calls();
         let turn = calls
             .iter()

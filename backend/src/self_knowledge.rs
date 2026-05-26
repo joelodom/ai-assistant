@@ -151,6 +151,22 @@ fn baseline() -> Vec<(&'static str, String)> {
                 .to_string(),
         ),
         (
+            "hazmat-bypass",
+            "There is an explicit user-controlled escape hatch called HAZMAT mode. When the user \
+             ticks the \"☢ Hazmat (bypass sanitizer)\" checkbox in the client and sends a \
+             message, the Sanitizer is skipped entirely for that message and the raw content \
+             goes directly to the Assistant. This is a deliberate, opt-in violation of the \
+             usual \"Sanitizer sees everything\" rule, intended for cases where the user knows \
+             the content is safe and doesn't want it filtered (e.g. they're testing the \
+             assistant, or pasting a document they want reasoned over verbatim). Backend logs a \
+             WARN for every bypass. Memory items written from a bypass carry the `hazmat` tag \
+             and an elevated importance score (0.8) so they're easy to audit later — the user \
+             can ask \"show me everything I bypassed the sanitizer for\" and the assistant can \
+             find them. The bypass does NOT persist: each message requires the checkbox to be \
+             on at send time, and the checkbox is reset to off whenever the client restarts."
+                .to_string(),
+        ),
+        (
             "ephemeral-sanitizer",
             "Critical security property: every time the Sanitizer runs, it gets a brand-new \
              subprocess with NO shared session state. The raw input only lives on the request \
@@ -160,6 +176,30 @@ fn baseline() -> Vec<(&'static str, String)> {
              a sanitized version of the message, and a non-sensitive redaction report) moves \
              downstream. This is why I cannot \"remember exactly what you said\" if the Gate \
              redacted parts of it — the original is gone."
+                .to_string(),
+        ),
+        (
+            "assistant-model-routing",
+            "The Assistant defaults to Claude Sonnet 4.6 — fast and strong enough for the \
+             vast majority of conversation. There are two ways to invoke the heavier model \
+             (Opus 4.7):\n\
+             \n\
+             1. Self-escalation: Sonnet can hand off when it judges a question genuinely \
+                needs deeper reasoning. It does this by replying with exactly \
+                `ESCALATE_TO_OPUS: <short reason>` as its entire response. The backend \
+                detects the marker, re-runs the same prompt against Opus, and the user \
+                receives Opus's answer. Memory items from escalated turns are tagged \
+                `escalated` so the audit trail makes routing visible. Sonnet is instructed \
+                to escalate only when Opus would meaningfully outperform — not for routine \
+                recall, light reasoning, or casual chat.\n\
+             2. User-forced: the client exposes a \"🧠 Opus\" checkbox. When ticked, the \
+                message goes with `force_opus=true`; the backend skips Sonnet entirely \
+                and routes straight to Opus. Memory is tagged `force-opus`.\n\
+             \n\
+             The user-visible reply includes a \"🧠 Handing off to <model> for deeper \
+             reasoning\" preamble when an escalation happens, so the user knows which \
+             model produced the answer. Configurable via `[claude].assistant_model` and \
+             `[claude].assistant_escalation_model` in `config.toml`."
                 .to_string(),
         ),
         (

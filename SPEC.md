@@ -57,6 +57,19 @@ The Sanitizer is the **first layer everything passes through** — including the
 - The Sanitizer must not share conversation state or memory with the main assistant. It is a pure function: raw input in, sanitized output (+ a redaction report) out, then forget everything.
 - Implementation note: the Sanitizer LLM call must use a fresh request with no shared history. Do not reuse the main assistant's context for it.
 
+### 3.4 HAZMAT bypass (as built)
+
+The default rule is: every message goes through the Sanitizer, no exceptions. There is one **explicit, user-controlled, opt-in exception**: HAZMAT mode. The client exposes a checkbox (`☢ Hazmat (bypass sanitizer)`); when ticked, the next message's `bypass_sanitizer` flag is true and the backend skips the Sanitizer for that message, passing the raw content directly to the Assistant.
+
+Constraints on the bypass:
+- **User-initiated only.** No background worker, ingestor, or programmatic path may set the bypass flag. The flag only flips via the UI affordance.
+- **Per-message.** Each message decides independently. The flag does not persist on the backend.
+- **Session-scoped at the UI.** The checkbox resets to off on every client restart so a forgotten toggle doesn't carry between sessions.
+- **Audited.** The backend logs `WARN` for every bypass with the message length. The resulting memory item is tagged `hazmat` and carries elevated importance (0.8) so the user can audit later with "show me everything I bypassed the sanitizer for."
+- **Visible.** The client renders the user's outgoing message with a `☢ HAZMAT (sanitizer bypassed) ☢` banner in the local transcript so the user never wonders whether a message went through the Gate.
+
+Intended use: pasting a document the user knows is safe and wants reasoned over verbatim, testing assistant behavior on edge-case inputs, or asking the assistant to discuss content where redaction would defeat the purpose. The user is taking on the risk explicitly.
+
 ### 3.2 Three-tier handling
 For each piece of input, the Sanitizer classifies and acts:
 
@@ -127,12 +140,14 @@ All traffic over a single WebSocket connection. JSON messages.
     "datetime_iso": "2026-05-25T14:03:00-05:00",
     "geolocation": { "lat": 30.53, "lon": -92.08, "label": "Opelousas, LA" },
     "freeform": { }   // open-ended; AI-friendly; NOTHING SECRET goes here by design
-  }
+  },
+  "bypass_sanitizer": false   // optional; true = HAZMAT mode (§3.4). Default false.
 }
 ```
 Notes:
 - The client is responsible for obtaining geolocation and current datetime. Metadata is intentionally free-form so it can grow without a schema change.
 - A message with attachments and no `content` question = "here is more data to remember."
+- `bypass_sanitizer` defaults to false (omit the field for normal traffic). Only the explicit user-driven UI checkbox sets it; see §3.4.
 
 ### 5.2 Backend → client (as built)
 
@@ -251,7 +266,7 @@ V1 was built in a single pass rather than phased. The system is small enough tha
 ## 11. Non-negotiable invariants (restate at top of generated code)
 1. **No outbound actions, ever.** Read-in / respond-out only.
 2. **Raw input is ephemeral.** It exists only inside a Sanitizer pass, is never logged or persisted, and the pass context is destroyed afterward.
-3. **The Sanitizer sees everything, including the user's own queries.** Nothing reaches the Assistant Core or the store un-gated.
+3. **The Sanitizer sees everything, including the user's own queries.** Nothing reaches the Assistant Core or the store un-gated — *except* via the explicit, audited, user-driven HAZMAT bypass (§3.4). No code path may set the bypass flag programmatically.
 4. **Tier-1 content is never stored or forwarded** — only a content-free stub.
 5. **The store contains sanitized data only.**
 

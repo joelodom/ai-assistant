@@ -35,7 +35,8 @@ relaxing one, stop and ask.
    `--continue`, no shared session) and dies after the call. Raw input is
    never logged, never written to disk, never reaches the Assistant Core or
    the memory store.
-3. **The Sanitizer sees everything**, including the user's own queries.
+3. **The Sanitizer sees everything**, including the user's own queries,
+   with one explicit, user-controlled exception: HAZMAT mode (see below).
 4. **Tier-1 (drop) content is never stored or forwarded** — only a content-free
    stub note.
 5. **The memory store contains sanitized data only.**
@@ -85,6 +86,21 @@ The memory directory is the only persistent state. Override its location with
 `tar czf data.tgz <dir>`. The on-disk format is human-readable text + JSON;
 all writes are atomic (temp file + rename) so crashes mid-write cannot
 corrupt items.
+
+## HAZMAT bypass
+
+The client exposes a `☢ Hazmat (bypass sanitizer)` checkbox. When ticked,
+the `ClientMessage::Message.bypass_sanitizer` flag is set and the backend
+skips the Sanitizer entirely for that message — the raw content goes
+straight to the Assistant. The backend logs `WARN` for every bypass and the
+resulting memory item is tagged `hazmat` with elevated importance, so the
+audit trail is intact. The checkbox is session-scoped and resets to off on
+every client restart.
+
+If you add a new path that ingests data (e.g. a new attachment kind, a
+new background ingestor), it MUST default to going through the Sanitizer.
+Only the explicit, user-driven UI affordance gets to set the bypass flag —
+never as a side effect, never automatically.
 
 ## Error policy
 

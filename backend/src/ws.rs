@@ -9,7 +9,7 @@
 //! so a brand-new user sees who/what this is and is ready to send data.
 
 use crate::assistant::Assistant;
-use crate::sanitizer::{InputProvenance, Sanitizer};
+use crate::sanitizer::{InputProvenance, Sanitizer, SanitizerResult};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -92,7 +92,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 let pong = ServerMessage::Pong;
                 let _ = sender.send(Message::Text(serde_json::to_string(&pong).unwrap())).await;
             }
-            ClientMessage::Message { payload, metadata } => {
+            ClientMessage::Message {
+                payload,
+                metadata,
+                bypass_sanitizer,
+                force_opus,
+            } => {
                 let mut bundle = payload.content.clone();
                 if !payload.attachments.is_empty() {
                     bundle.push_str("\n\n[attachments]\n");
@@ -111,11 +116,27 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 }
 
-                let sanitized = match state
-                    .sanitizer
-                    .sanitize(&bundle, InputProvenance::Personal)
-                    .await
-                {
+                let sanitize_result = if bypass_sanitizer {
+                    tracing::warn!(
+                        bundle_len = bundle.chars().count(),
+                        "HAZMAT BYPASS: user invoked direct-to-assistant path; \
+                         Sanitizer skipped for this message"
+                    );
+                    Ok(SanitizerResult {
+                        tier: shared::Tier::Pass,
+                        output: bundle.clone(),
+                        redaction_report:
+                            "HAZMAT BYPASS — Sanitizer skipped at user request"
+                                .to_string(),
+                    })
+                } else {
+                    state
+                        .sanitizer
+                        .sanitize(&bundle, InputProvenance::Personal)
+                        .await
+                };
+
+                let sanitized = match sanitize_result {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::warn!(error = %e, "sanitizer failed");
@@ -172,12 +193,27 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         let _ = sender.send(Message::Text(serde_json::to_string(&notice).unwrap())).await;
                     }
                     Tier::Redact | Tier::Pass => {
-                        match state.assistant.respond(&sanitized, &metadata).await {
-                            Ok(reply) => {
+                        match state.assistant.respond(&sanitized, &metadata, force_opus).await {
+                            Ok(outcome) => {
+                                // If the assistant escalated (Sonnet handed
+                                // off to Opus), tell the user before
+                                // streaming the final answer.
+                                if outcome.escalated {
+                                    let prefix = if let Some(r) = &outcome.escalation_reason {
+                                        format!("🧠 Handing off to {} for deeper reasoning — {}\n\n", outcome.model_used, r)
+                                    } else {
+                                        format!("🧠 Handing off to {} for deeper reasoning…\n\n", outcome.model_used)
+                                    };
+                                    let frame = ServerMessage::ReplyChunk { text: prefix };
+                                    let _ = sender
+                                        .send(Message::Text(serde_json::to_string(&frame).unwrap()))
+                                        .await;
+                                }
                                 // We have the full reply text already. The
                                 // frame protocol supports chunks, so split
                                 // on paragraph boundaries to feel live; if
                                 // there are no breaks, send as one chunk.
+                                let reply = &outcome.text;
                                 let chunks: Vec<&str> = if reply.contains("\n\n") {
                                     reply.split("\n\n").collect()
                                 } else {
@@ -191,14 +227,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         .send(Message::Text(serde_json::to_string(&frame).unwrap()))
                                         .await;
                                 }
+                                let mut tier_summary = match sanitized.tier {
+                                    Tier::Redact => "redact".to_string(),
+                                    Tier::Pass => "pass".to_string(),
+                                    Tier::Drop => "drop".to_string(),
+                                };
+                                tier_summary.push_str(&format!(" · model={}", outcome.model_used));
+                                if outcome.escalated {
+                                    tier_summary.push_str(" · escalated");
+                                }
+                                if force_opus {
+                                    tier_summary.push_str(" · force_opus");
+                                }
                                 let done = ServerMessage::ReplyDone {
                                     text: None,
                                     meta: Some(ReplyMeta {
-                                        tier_summary: Some(match sanitized.tier {
-                                            Tier::Redact => "redact".into(),
-                                            Tier::Pass => "pass".into(),
-                                            Tier::Drop => "drop".into(),
-                                        }),
+                                        tier_summary: Some(tier_summary),
                                         sources: vec![],
                                     }),
                                 };

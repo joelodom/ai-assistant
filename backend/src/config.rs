@@ -35,9 +35,14 @@ pub struct ClaudeCfg {
     /// Sanitizer runs on every turn and does tight pattern-recognition +
     /// structured JSON output — Haiku is fast and reliable for this.
     pub sanitizer_model: Option<String>,
-    /// Assistant Core does memory-aware reasoning; default to the main model
-    /// (typically the smartest).
+    /// Assistant Core does memory-aware reasoning. Default is Sonnet (fast +
+    /// strong); when Sonnet judges a question needs deeper reasoning, it
+    /// self-escalates to `assistant_escalation_model` (or the user can force
+    /// via the `force_opus` message flag).
     pub assistant_model: Option<String>,
+    /// Model used when Sonnet self-escalates or the user forces Opus.
+    /// Defaults to the configured `model` (typically Opus 4.7).
+    pub assistant_escalation_model: Option<String>,
     /// Curator summarizes aging items — Haiku is plenty.
     pub curator_model: Option<String>,
     /// Scout browses the web and synthesizes findings.
@@ -109,7 +114,13 @@ impl Default for ClaudeCfg {
             binary: "claude".to_string(),
             model: "claude-opus-4-7".to_string(),
             sanitizer_model: Some("claude-haiku-4-5".to_string()),
-            assistant_model: None,
+            // Sonnet by default: faster + cheaper than Opus, and strong
+            // enough for the vast majority of conversation. When a question
+            // genuinely needs Opus-grade reasoning, Sonnet self-escalates
+            // via the ESCALATE_TO_OPUS marker. The user can also force
+            // Opus via the client toggle (force_opus on a per-message basis).
+            assistant_model: Some("claude-sonnet-4-6".to_string()),
+            assistant_escalation_model: Some("claude-opus-4-7".to_string()),
             // Sonnet, not Haiku: the Curator destructively rewrites items
             // (the summary replaces the original body). Its mistakes are
             // silent and permanent, so we err toward smarter compression
@@ -133,6 +144,11 @@ impl ClaudeCfg {
     }
     pub fn model_for_assistant(&self) -> String {
         self.assistant_model.clone().unwrap_or_else(|| self.model.clone())
+    }
+    pub fn model_for_assistant_escalation(&self) -> String {
+        self.assistant_escalation_model
+            .clone()
+            .unwrap_or_else(|| self.model.clone())
     }
     pub fn model_for_curator(&self) -> String {
         self.curator_model.clone().unwrap_or_else(|| self.model.clone())

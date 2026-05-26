@@ -63,6 +63,8 @@ async fn full_roundtrip_with_mock_llm() {
             geolocation: None,
             freeform: serde_json::Value::Null,
         },
+        bypass_sanitizer: false,
+        force_opus: false,
     };
     ws.send(Message::Text(serde_json::to_string(&msg).unwrap()))
         .await
@@ -154,6 +156,8 @@ async fn sanitizer_drop_path_emits_stub_notice_and_persists_only_stub() {
             geolocation: None,
             freeform: serde_json::Value::Null,
         },
+        bypass_sanitizer: false,
+        force_opus: false,
     };
     ws.send(Message::Text(serde_json::to_string(&msg).unwrap()))
         .await
@@ -251,6 +255,8 @@ async fn self_knowledge_is_in_assistant_prompt() {
                 geolocation: None,
                 freeform: serde_json::Value::Null,
             },
+            bypass_sanitizer: false,
+            force_opus: false,
         })
         .unwrap(),
     ))
@@ -292,6 +298,116 @@ async fn self_knowledge_is_in_assistant_prompt() {
     assert!(
         assistant_call.prompt.contains("SelfKnowledge"),
         "assistant prompt should surface SelfKnowledge memory items"
+    );
+}
+
+#[tokio::test]
+async fn hazmat_bypass_skips_sanitizer_and_tags_memory() {
+    std::env::set_var("AI_ASSISTANT_MOCK_CLAUDE", "1");
+
+    let td = TempDir::new().unwrap();
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let memory_dir = td.path().to_path_buf();
+    let addr_str = addr.to_string();
+    let mut cfg = backend::config::Config::default();
+    cfg.memory.dir = memory_dir.clone();
+    cfg.server.addr = addr_str.clone();
+    cfg.scout.enabled = false;
+    cfg.curator.enabled = false;
+    let built = backend::build_app(cfg).await.unwrap();
+
+    // Wire our own mock so we can inspect the calls.
+    let mock = backend::claude::MockLlmClient::new();
+    let sanitizer = std::sync::Arc::new(backend::sanitizer::Sanitizer::new(mock.clone()));
+    let assistant = std::sync::Arc::new(backend::assistant::Assistant::with_model_and_facts(
+        mock.clone(),
+        built.memory.clone(),
+        None,
+        built.state.assistant.system_facts.clone(),
+    ));
+    let state = backend::ws::AppState { sanitizer, assistant };
+    tokio::spawn(async move {
+        let app = backend::ws::router(state);
+        let listener = tokio::net::TcpListener::bind(&addr_str).await.unwrap();
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let _ = ws.next().await; // intro
+
+    // Send WITH bypass_sanitizer = true.
+    let secret_marker = "SECRET_MARKER_XYZ_99887";
+    let msg = ClientMessage::Message {
+        payload: MessagePayload {
+            content: format!("My private note: {secret_marker}"),
+            attachments: vec![],
+        },
+        metadata: Metadata {
+            datetime_iso: "2026-05-25T14:03:00-05:00".into(),
+            geolocation: None,
+            freeform: serde_json::Value::Null,
+        },
+        bypass_sanitizer: true,
+        force_opus: false,
+    };
+    ws.send(Message::Text(serde_json::to_string(&msg).unwrap()))
+        .await
+        .unwrap();
+
+    while let Some(frame) = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .ok()
+        .flatten()
+    {
+        if let Message::Text(t) = frame.unwrap() {
+            let parsed: ServerMessage = serde_json::from_str(&t).unwrap();
+            if matches!(parsed, ServerMessage::ReplyDone { .. }) {
+                break;
+            }
+        }
+    }
+
+    // Verify: Sanitizer was NOT called for the bypass message.
+    let calls = mock.calls();
+    let sanitizer_call_for_message = calls.iter().any(|c| {
+        c.prompt.contains("SANITIZER_TASK") && c.prompt.contains(secret_marker)
+    });
+    assert!(
+        !sanitizer_call_for_message,
+        "Sanitizer was invoked despite bypass flag"
+    );
+
+    // Verify: Assistant DID see the raw content.
+    let assistant_saw_it = calls.iter().any(|c| {
+        c.prompt.contains("USER MESSAGE:") && c.prompt.contains(secret_marker)
+    });
+    assert!(
+        assistant_saw_it,
+        "Assistant never received the raw bypass content"
+    );
+
+    // Verify: memory item is tagged `hazmat` and references the HAZMAT BYPASS marker.
+    let mut found_hazmat_item = false;
+    for entry in walkdir::WalkDir::new(&memory_dir).into_iter().flatten() {
+        if entry.path().extension().and_then(|s| s.to_str()) == Some("json") {
+            if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                if text.contains("\"hazmat\"") && text.contains("HAZMAT BYPASS") {
+                    found_hazmat_item = true;
+                }
+            }
+        }
+    }
+    assert!(
+        found_hazmat_item,
+        "no memory sidecar tagged `hazmat` with HAZMAT BYPASS in redaction_report"
     );
 }
 
@@ -351,6 +467,8 @@ async fn sanitizer_failure_drops_input_persists_audit_and_notifies_user() {
             geolocation: None,
             freeform: serde_json::Value::Null,
         },
+        bypass_sanitizer: false,
+        force_opus: false,
     };
     ws.send(Message::Text(serde_json::to_string(&msg).unwrap()))
         .await
