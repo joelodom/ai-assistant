@@ -72,6 +72,13 @@ pub const CONFIG_REQUEST_FILE_MARKER: &str = "CONFIG_REQUEST_FILE:";
 /// Format: `CONFIG_BEGIN_OAUTH: <connector>`.
 pub const CONFIG_BEGIN_OAUTH_MARKER: &str = "CONFIG_BEGIN_OAUTH:";
 
+/// User-facing substitute when the LLM returns zero bytes. Kept
+/// concise, honest, and actionable.
+pub const EMPTY_REPLY_POLITE_MESSAGE: &str =
+    "(I came back with an empty response this time — that happens occasionally, often \
+     when I attempt a tool call but don't produce follow-up text. Try asking again, or \
+     rephrasing the question. The message you sent is still in memory.)";
+
 #[derive(Debug, Clone)]
 pub struct RespondOutcome {
     pub text: String,
@@ -358,6 +365,24 @@ impl Assistant {
                 duration_ms = llm_start.elapsed().as_millis() as u64,
                 "llm_call_done"
             );
+
+            // Empty reply: model came back with zero bytes. Surface as
+            // WARN (anomalous, deserves attention) and substitute a
+            // polite user-facing message so the UI doesn't render a
+            // silent blank. Most common cause: the model emitted only
+            // tool calls (WebSearch / WebFetch) without follow-up text,
+            // or a soft refusal the CLI swallowed. Re-asking usually
+            // works.
+            if reply.is_empty() {
+                tracing::warn!(
+                    model = ?current_model,
+                    duration_ms = llm_start.elapsed().as_millis() as u64,
+                    search_rounds,
+                    n_manual_excerpts = manual_excerpts.len(),
+                    "llm_returned_empty_reply"
+                );
+                break EMPTY_REPLY_POLITE_MESSAGE.to_string();
+            }
 
             // Check ESCALATE first — it short-circuits the rest of the
             // reply per the marker's contract.
