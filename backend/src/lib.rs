@@ -2,6 +2,7 @@
 //! Integration tests in `tests/` exercise the modules directly.
 
 pub mod assistant;
+pub mod attachments;
 pub mod claude;
 pub mod config;
 pub mod curator;

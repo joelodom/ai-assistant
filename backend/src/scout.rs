@@ -1,6 +1,8 @@
 //! The Scout. Periodically asks Claude (with WebSearch/WebFetch enabled) to
-//! summarize what's notable on the user's configured topics, then funnels the
-//! result through the Sanitizer (PublicWeb provenance) and stores it.
+//! infer what the user cares about from memory + preferences, search the web
+//! for noteworthy items, funnel the result through the Sanitizer (PublicWeb
+//! provenance), and store. Falls back to base-rate human interests when
+//! memory is thin.
 
 use crate::assistant::Assistant;
 use crate::claude::{LlmClient, LlmOptions};
@@ -31,7 +33,7 @@ impl Scout {
 
     async fn run(self) {
         let interval = Duration::from_secs(self.cfg.interval_minutes.saturating_mul(60).max(60));
-        tracing::info!(?interval, topics = ?self.cfg.topics, "scout: running");
+        tracing::info!(?interval, pinned_topics = ?self.cfg.pinned_topics, "scout: running");
         loop {
             if let Err(e) = self.tick().await {
                 tracing::warn!(error = %e, "scout tick failed");
@@ -42,28 +44,110 @@ impl Scout {
 
     async fn tick(&self) -> anyhow::Result<()> {
         let now = Utc::now();
-        let topics = self.cfg.topics.join(", ");
         let prefs = self.assistant.memory.preferences().await;
-        let prefs_block = if prefs.statements.is_empty() {
+
+        // Build a digest of what we know about the user so Scout can infer
+        // interests. Exclude SelfKnowledge (system-seeded) and assistant
+        // notes (they'd just echo the assistant's own voice back).
+        let all = self.assistant.memory.scan_all().unwrap_or_default();
+        let user_items: Vec<_> = all
+            .iter()
+            .filter(|i| {
+                !matches!(
+                    i.sidecar.kind,
+                    crate::memory::ItemKind::SelfKnowledge
+                        | crate::memory::ItemKind::AssistantNote
+                )
+            })
+            .collect();
+        let user_item_count = user_items.len();
+
+        let mut memory_digest = String::new();
+        // Include the 30 most recent items (newest first), truncated.
+        let recent_slice: Vec<_> = user_items.iter().rev().take(30).collect();
+        for item in &recent_slice {
+            let body = if item.body.len() > 300 {
+                format!("{}…", &item.body[..300])
+            } else {
+                item.body.clone()
+            };
+            memory_digest.push_str(&format!(
+                "- [{}] ({:?}) {}\n",
+                item.sidecar.created_at.format("%Y-%m-%d"),
+                item.sidecar.kind,
+                body.replace('\n', " ")
+            ));
+        }
+        if memory_digest.is_empty() {
+            memory_digest.push_str("(memory is empty — you have nothing to go on yet)\n");
+        }
+
+        let mut prefs_block = String::new();
+        if !prefs.statements.is_empty() {
+            prefs_block.push_str("USER PREFERENCES (respect these — skip filtered topics):\n");
+            for p in &prefs.statements {
+                prefs_block.push_str(&format!("- {}\n", p.text));
+            }
+        }
+
+        // Try to pull a location hint from the most recent item that has one.
+        let location_hint = recent_slice
+            .iter()
+            .find_map(|i| {
+                i.sidecar
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.geolocation.as_ref())
+                    .map(|g| {
+                        g.label
+                            .clone()
+                            .unwrap_or_else(|| format!("{:.2},{:.2}", g.lat, g.lon))
+                    })
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let pinned_block = if self.cfg.pinned_topics.is_empty() {
             String::new()
         } else {
-            let mut s = String::from("\nUSER PREFERENCES (respect these — skip filtered topics):\n");
-            for p in &prefs.statements {
-                s.push_str(&format!("- {}\n", p.text));
-            }
-            s
+            format!(
+                "PINNED TOPICS (user explicitly asked to always watch these):\n{}\n",
+                self.cfg
+                    .pinned_topics
+                    .iter()
+                    .map(|t| format!("- {t}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
         };
 
         let prompt = format!(
             r#"SCOUT_TASK
 
 Right now: {now}
+User location (best guess): {location_hint}
 
-You are the Scout. Briefly browse the web for noteworthy items in the user's
-topics below. Return a short bulleted list — five bullets max, one line each.
-Skip filler. If nothing notable today, say so.{prefs_block}
+You are the Scout — a background worker for a personal AI assistant. Your job:
+  1. Figure out what THIS user would find noteworthy right now.
+  2. Search the web for those things.
+  3. Return a short bulleted list — five bullets max, one line each. Skip filler.
 
-TOPICS: {topics}
+How to decide what to look for:
+  - If the memory digest below gives you a clear sense of the user (their interests,
+    location, profession, family, recurring themes), search for items in those areas.
+  - If memory is thin or empty, fall back to base-rate human interests for an adult
+    in {location_hint}: major world/national news, severe-weather alerts for their
+    region, big science/tech stories of broad interest. Mark these bullets with
+    "[base rate — limited memory]" so the user knows you were guessing.
+  - ALWAYS include genuinely time-sensitive items even if outside inferred interests
+    (severe weather, natural disasters, major breaking news affecting their area).
+  - SKIP anything the preferences list asks you to skip.
+  - Prefer fresh items (last 24-72 hours). Skip evergreen content unless newly relevant.
+
+User memory digest ({user_item_count} item(s)):
+{memory_digest}
+{prefs_block}{pinned_block}
+Output: just the bullets, one per line. If genuinely nothing notable, say
+"Nothing notable today."
 "#,
         );
         let opts = LlmOptions {

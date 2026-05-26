@@ -79,10 +79,7 @@ pub struct AssistantApp {
     streaming_reply: String,
 
     input_buf: String,
-    /// Optional pasted/dropped attachment as text.
-    pending_attachment_text: String,
-    pending_attachment_kind: AttachmentKind,
-    pending_attachment_name: String,
+    pending_attachments: Vec<Attachment>,
 
     show_settings: bool,
 
@@ -134,9 +131,7 @@ impl AssistantApp {
             transcript: Vec::new(),
             streaming_reply: String::new(),
             input_buf: String::new(),
-            pending_attachment_text: String::new(),
-            pending_attachment_kind: AttachmentKind::Document,
-            pending_attachment_name: String::new(),
+            pending_attachments: Vec::new(),
             show_settings: false,
             applied_scale: prefs.ui_scale,
             prefs,
@@ -222,22 +217,10 @@ impl AssistantApp {
             return;
         }
         let text = std::mem::take(&mut self.input_buf);
-        if text.trim().is_empty() && self.pending_attachment_text.is_empty() {
+        if text.trim().is_empty() && self.pending_attachments.is_empty() {
             return;
         }
-        let mut attachments = Vec::new();
-        if !self.pending_attachment_text.is_empty() {
-            attachments.push(Attachment {
-                kind: self.pending_attachment_kind,
-                data: std::mem::take(&mut self.pending_attachment_text),
-                mime: "text/plain".into(),
-                name: if self.pending_attachment_name.is_empty() {
-                    None
-                } else {
-                    Some(std::mem::take(&mut self.pending_attachment_name))
-                },
-            });
-        }
+        let attachments = std::mem::take(&mut self.pending_attachments);
         self.transcript.push(Turn::User {
             text: render_user_outgoing(&text, &attachments),
             ts: now_str(),
@@ -251,6 +234,101 @@ impl AssistantApp {
         };
         let _ = self.ui_tx.send(UiToNet::Send(msg));
     }
+
+    /// Open a native file picker and queue every chosen file as an attachment.
+    fn pick_files(&mut self) {
+        let files = rfd::FileDialog::new()
+            .set_title("Attach files")
+            .pick_files();
+        if let Some(paths) = files {
+            for p in paths {
+                self.attach_from_path(&p);
+            }
+        }
+    }
+
+    fn attach_from_path(&mut self, path: &std::path::Path) {
+        match read_and_classify(path) {
+            Ok(att) => self.pending_attachments.push(att),
+            Err(e) => self.transcript.push(Turn::Error {
+                text: format!("Couldn't attach {}: {e}", path.display()),
+                ts: now_str(),
+            }),
+        }
+    }
+
+    fn drain_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<egui::DroppedFile> = ctx.input(|i| i.raw.dropped_files.clone());
+        for df in dropped {
+            if let Some(p) = df.path {
+                self.attach_from_path(&p);
+            }
+        }
+    }
+}
+
+const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+
+fn read_and_classify(path: &std::path::Path) -> Result<Attachment, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_ATTACHMENT_BYTES {
+        return Err(format!(
+            "file is {} MB; cap is {} MB",
+            bytes.len() / 1024 / 1024,
+            MAX_ATTACHMENT_BYTES / 1024 / 1024
+        ));
+    }
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string());
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+    let (mime, kind, is_text) = classify_extension(&ext);
+    let data = if is_text {
+        // Text-ish: send as UTF-8 string. The backend treats data as raw text.
+        String::from_utf8(bytes).map_err(|_| "file is not valid UTF-8".to_string())?
+    } else {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    };
+    Ok(Attachment {
+        kind,
+        data,
+        mime: mime.to_string(),
+        name,
+    })
+}
+
+fn classify_extension(ext: &str) -> (&'static str, AttachmentKind, bool) {
+    match ext {
+        // Plain text / source
+        "txt" | "md" | "markdown" | "log" => ("text/plain", AttachmentKind::Document, true),
+        "json" => ("application/json", AttachmentKind::Document, true),
+        "csv" => ("text/csv", AttachmentKind::Document, true),
+        "html" | "htm" => ("text/html", AttachmentKind::Document, true),
+        "xml" => ("application/xml", AttachmentKind::Document, true),
+        "yaml" | "yml" => ("application/yaml", AttachmentKind::Document, true),
+        "rs" | "py" | "js" | "ts" | "go" | "c" | "cpp" | "h" | "rb" | "java" | "swift" => {
+            ("text/x-source", AttachmentKind::Document, true)
+        }
+        // Email
+        "eml" | "msg" => ("message/rfc822", AttachmentKind::Email, true),
+        // Calendar
+        "ics" | "ical" => ("text/calendar", AttachmentKind::Calendar, true),
+        // PDF — binary, but backend extracts text
+        "pdf" => ("application/pdf", AttachmentKind::Document, false),
+        // Images
+        "jpg" | "jpeg" => ("image/jpeg", AttachmentKind::Photo, false),
+        "png" => ("image/png", AttachmentKind::Photo, false),
+        "gif" => ("image/gif", AttachmentKind::Photo, false),
+        "webp" => ("image/webp", AttachmentKind::Photo, false),
+        "heic" | "heif" => ("image/heic", AttachmentKind::Photo, false),
+        _ => ("application/octet-stream", AttachmentKind::Document, false),
+    }
 }
 
 fn render_user_outgoing(text: &str, attachments: &[Attachment]) -> String {
@@ -260,12 +338,37 @@ fn render_user_outgoing(text: &str, attachments: &[Attachment]) -> String {
         let mut s = text.to_string();
         for a in attachments {
             s.push_str(&format!(
-                "\n[attached {:?}{}]",
+                "\n[attached {:?}{} · {} · {}]",
                 a.kind,
-                a.name.as_deref().map(|n| format!(" {n}")).unwrap_or_default()
+                a.name.as_deref().map(|n| format!(" {n}")).unwrap_or_default(),
+                a.mime,
+                approx_size(a),
             ));
         }
         s
+    }
+}
+
+fn approx_size(a: &Attachment) -> String {
+    // For text-ish mimes, data is raw text — use char count.
+    // For binary, data is base64 — back out approx byte count.
+    let bytes = if a.mime.starts_with("text/")
+        || a.mime == "application/json"
+        || a.mime == "application/xml"
+        || a.mime == "application/yaml"
+        || a.mime == "message/rfc822"
+    {
+        a.data.len()
+    } else {
+        // base64: 4 chars → 3 bytes (minus padding).
+        a.data.len() * 3 / 4
+    };
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
 
@@ -409,65 +512,78 @@ impl eframe::App for AssistantApp {
                             });
                         }
                     }
-                    ui.separator();
-                    ui.heading("Attachment");
-                    ui.label("Type a text attachment (e.g. paste email body):");
-                    egui::ComboBox::from_label("kind")
-                        .selected_text(format!("{:?}", self.pending_attachment_kind))
-                        .show_ui(ui, |ui| {
-                            for k in [
-                                AttachmentKind::Email,
-                                AttachmentKind::Document,
-                                AttachmentKind::Calendar,
-                                AttachmentKind::Photo,
-                            ] {
-                                ui.selectable_value(
-                                    &mut self.pending_attachment_kind,
-                                    k,
-                                    format!("{:?}", k),
-                                );
-                            }
-                        });
-                    ui.text_edit_singleline(&mut self.pending_attachment_name);
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.pending_attachment_text)
-                            .desired_rows(6),
-                    );
                 });
         }
 
+        // Pick up files dropped on the window before painting the input panel.
+        self.drain_dropped_files(ctx);
+
         egui::TopBottomPanel::bottom("input")
             .resizable(true)
-            .min_height(120.0)
-            .default_height(160.0)
+            .min_height(160.0)
+            .default_height(200.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
+
+                // Pending attachments strip.
+                if !self.pending_attachments.is_empty() {
+                    let mut remove_idx: Option<usize> = None;
+                    ui.horizontal_wrapped(|ui| {
+                        for (i, a) in self.pending_attachments.iter().enumerate() {
+                            let size = approx_size(a);
+                            let label = format!(
+                                "📎 {} ({}, {})",
+                                a.name.clone().unwrap_or_else(|| "(unnamed)".into()),
+                                a.mime,
+                                size
+                            );
+                            ui.group(|ui| {
+                                ui.label(label);
+                                if ui.small_button("✕").clicked() {
+                                    remove_idx = Some(i);
+                                }
+                            });
+                        }
+                    });
+                    if let Some(i) = remove_idx {
+                        self.pending_attachments.remove(i);
+                    }
+                    ui.add_space(2.0);
+                }
+
+                // Compute height reserve for the bottom row (buttons).
+                let reserved = 36.0 + if self.pending_attachments.is_empty() { 0.0 } else { 4.0 };
                 ui.add_sized(
-                    [ui.available_width(), ui.available_height() - 36.0],
+                    [ui.available_width(), (ui.available_height() - reserved).max(40.0)],
                     egui::TextEdit::multiline(&mut self.input_buf)
                         .hint_text(
                             "Type a message, paste an email, drop a note. \
-                             Enter = newline · ⌘+Enter or Send button = send.",
+                             Drag files into the window or click 📎 to attach. \
+                             Enter = newline · ⌘+Enter or Send = send.",
                         ),
                 );
-                // ⌘+Enter shortcut works whether or not the text area has focus.
+
                 let cmd_enter = ui.input(|i| {
                     i.key_pressed(egui::Key::Enter)
                         && (i.modifiers.command || i.modifiers.mac_cmd || i.modifiers.ctrl)
                 });
                 ui.horizontal(|ui| {
-                    ui.weak(format!("{} char(s)", self.input_buf.chars().count()));
+                    if ui
+                        .button("📎 Attach")
+                        .on_hover_text("Open file picker. Multiple selection allowed. Or just drag files into the window.")
+                        .clicked()
+                    {
+                        self.pick_files();
+                    }
+                    ui.weak(format!(
+                        "{} char(s) · {} attachment(s)",
+                        self.input_buf.chars().count(),
+                        self.pending_attachments.len()
+                    ));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let send_clicked = ui
                             .add_enabled(self.connected, egui::Button::new("Send  ⌘↵"))
                             .clicked();
-                        if !self.pending_attachment_text.is_empty() {
-                            ui.weak(format!(
-                                "attachment: {:?} ({} chars)",
-                                self.pending_attachment_kind,
-                                self.pending_attachment_text.chars().count()
-                            ));
-                        }
                         if send_clicked || cmd_enter {
                             self.send_current();
                         }

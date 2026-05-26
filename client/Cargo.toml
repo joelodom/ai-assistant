@@ -21,3 +21,5 @@ tokio-tungstenite = "0.21"
 eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow"] }
 egui = "0.27"
 ureq = { version = "2", features = ["json"] }
+rfd = "0.14"
+base64 = "0.22"

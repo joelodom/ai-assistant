@@ -53,7 +53,12 @@ pub struct ClaudeCfg {
 pub struct ScoutCfg {
     pub enabled: bool,
     pub interval_minutes: u64,
-    pub topics: Vec<String>,
+    /// Optional explicit topics the user wants the Scout to always watch.
+    /// Normally empty — the Scout infers topics from the user's memory and
+    /// preferences each tick. Use this only when you want to pin a topic
+    /// you don't trust the inference to surface (e.g. a niche industry
+    /// newsletter the user reads but rarely mentions).
+    pub pinned_topics: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,24 +145,17 @@ impl ClaudeCfg {
 impl Default for ScoutCfg {
     fn default() -> Self {
         Self {
-            // Off by default — Scout silently spends tokens in the background
-            // and dumps findings into memory before the user has expressed
-            // any topic preferences. Flip on after you've tuned the topic
-            // list below to what you actually care about.
+            // Off by default — Scout silently spends tokens in the background.
+            // Enable once you've used the assistant enough that there's
+            // some memory for the Scout to infer interests from.
             enabled: false,
             interval_minutes: 10,
-            // Broad starter set — meant to be edited. The user's actual
-            // interests get learned over time through preference statements
-            // ("stop telling me about crypto"), but the Scout needs some
-            // seed list to query on a fresh install.
-            topics: vec![
-                "world news headlines".to_string(),
-                "US national news".to_string(),
-                "technology and AI news".to_string(),
-                "science and space".to_string(),
-                "local weather and severe-weather alerts".to_string(),
-                "notable events in the user's region".to_string(),
-            ],
+            // Empty by default. Scout reads recent memory + preferences each
+            // tick and infers what to watch for. When memory is sparse it
+            // falls back to base-rate human interests (major news, weather,
+            // severe-weather alerts). Pin a topic here only if you want a
+            // guaranteed sweep that doesn't rely on inference.
+            pinned_topics: vec![],
         }
     }
 }

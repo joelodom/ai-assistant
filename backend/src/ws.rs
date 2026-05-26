@@ -97,15 +97,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 if !payload.attachments.is_empty() {
                     bundle.push_str("\n\n[attachments]\n");
                     for a in &payload.attachments {
+                        let extracted = crate::attachments::extract_text(a);
                         bundle.push_str(&format!(
-                            "- {:?} ({}{}):\n{}\n",
+                            "--- attachment: {:?}{} ({}) ---\n{}\n",
                             a.kind,
+                            a.name
+                                .as_deref()
+                                .map(|n| format!(" \"{n}\""))
+                                .unwrap_or_default(),
                             a.mime,
-                            a.name.as_deref().map(|n| format!(", name={n}")).unwrap_or_default(),
-                            // For non-text attachments the client should
-                            // pre-OCR / pre-extract; raw base64 is left as
-                            // a hint. Sanitizer can still classify it.
-                            &a.data.chars().take(8000).collect::<String>(),
+                            extracted,
                         ));
                     }
                 }

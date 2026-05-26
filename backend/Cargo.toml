@@ -25,6 +25,8 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["trace"] }
 walkdir = "2"
 async-trait = "0.1"
+base64 = "0.22"
+pdf-extract = "0.7"
 
 [dev-dependencies]
 tokio-tungstenite = "0.21"

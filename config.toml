@@ -27,18 +27,16 @@ timeout_secs = 180
 scout_allowed_tools = ["WebSearch", "WebFetch"]
 
 [scout]
-# Off by default — only flip on after tuning topics below to what you
-# actually care about. Scout spends tokens silently in the background.
+# Off by default — Scout silently spends tokens in the background.
+# Enable once you've used the assistant enough that there's some memory
+# for Scout to infer interests from.
 enabled = false
 interval_minutes = 10
-topics = [
-    "world news headlines",
-    "US national news",
-    "technology and AI news",
-    "science and space",
-    "local weather and severe-weather alerts",
-    "notable events in the user's region",
-]
+# Scout has NO hardcoded topic list. It reads your recent memory + stored
+# preferences each tick and decides what to look for. Falls back to base-rate
+# human interests for your location when memory is thin. Use pinned_topics
+# only when you want a guaranteed sweep that doesn't rely on inference.
+pinned_topics = []
 
 [curator]
 enabled = true

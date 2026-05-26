@@ -36,7 +36,7 @@ pub struct SystemFacts {
     pub curator_interval_minutes: u64,
     pub scout_enabled: bool,
     pub scout_interval_minutes: u64,
-    pub scout_topics: Vec<String>,
+    pub scout_pinned_topics: Vec<String>,
     pub memory_dir: PathBuf,
     pub server_addr: String,
     pub build_version: String,
@@ -59,7 +59,7 @@ impl SystemFacts {
             curator_interval_minutes: curator.interval_minutes,
             scout_enabled: scout.enabled,
             scout_interval_minutes: scout.interval_minutes,
-            scout_topics: scout.topics.clone(),
+            scout_pinned_topics: scout.pinned_topics.clone(),
             memory_dir: memory.dir.clone(),
             server_addr: server.addr.clone(),
             build_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -77,7 +77,7 @@ impl SystemFacts {
             curator_interval_minutes: 0,
             scout_enabled: false,
             scout_interval_minutes: 0,
-            scout_topics: vec![],
+            scout_pinned_topics: vec![],
             memory_dir: PathBuf::from("(unset)"),
             server_addr: "(unset)".into(),
             build_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -102,14 +102,14 @@ impl SystemFacts {
             self.curator_interval_minutes,
         ));
         s.push_str(&format!(
-            "  • Scout model: {}  ({}, every {} min, topics: {})\n",
+            "  • Scout model: {}  ({}, every {} min; topics inferred from memory{})\n",
             self.scout_model,
             if self.scout_enabled { "enabled" } else { "disabled" },
             self.scout_interval_minutes,
-            if self.scout_topics.is_empty() {
-                "none".to_string()
+            if self.scout_pinned_topics.is_empty() {
+                String::new()
             } else {
-                self.scout_topics.join(", ")
+                format!("; pinned: {}", self.scout_pinned_topics.join(", "))
             },
         ));
         s.push_str(&format!("  • Memory directory: {}\n", self.memory_dir.display()));
@@ -174,17 +174,25 @@ fn baseline() -> Vec<(&'static str, String)> {
         ),
         (
             "scout-design-choices",
-            "The Scout is OPT-IN (disabled by default). Three reasons: (1) it spends tokens \
-             silently in the background on a ~10 min interval; (2) on a fresh install it has no \
-             learned user preferences yet, so its findings would be noisy and possibly \
-             unwanted; (3) the user should consciously choose what topics it watches before \
-             turning it loose. Enable via `[scout].enabled = true` in `config.toml`. \
+            "The Scout is OPT-IN (disabled by default). Reasons: it spends tokens silently in \
+             the background on a ~10 min interval, and on a fresh install with no memory it \
+             can't yet infer what the user cares about. Enable via `[scout].enabled = true` in \
+             `config.toml` once the assistant has accumulated enough memory to be useful. \
              The model is Claude Sonnet 4.6 — web summarization and triage is well within \
-             Sonnet's range; Opus would be wasted spend on this task. The default topic list is \
-             intentionally broad (world news, US news, tech/AI, science, local weather, regional \
-             events) and is meant to be EDITED to match what the user actually cares about. \
-             Findings still go through the Sanitizer (with PublicWeb provenance) before landing \
-             in memory."
+             Sonnet's range; Opus would be wasted spend.\n\
+             \n\
+             The Scout has NO hardcoded topic list. Each tick it reads the user's recent memory \
+             and stored preferences, infers what the user cares about, and searches accordingly. \
+             If memory is thin, it falls back to base-rate human interests for the user's \
+             location (major news, severe-weather alerts, broadly relevant science/tech) and \
+             marks those bullets with \"[base rate — limited memory]\" so the user knows. \
+             Time-sensitive items (severe weather, breaking news affecting the user's region) \
+             are always included regardless of inferred interests. The user can pin specific \
+             topics via `[scout].pinned_topics` if they want a guaranteed sweep that doesn't \
+             rely on inference, but normally you'd just tell the assistant (\"keep an eye on \
+             Boston Celtics news\") and the preference + memory pipeline picks it up next tick. \
+             Findings go through the Sanitizer (with PublicWeb provenance) before landing in \
+             memory."
                 .to_string(),
         ),
         (
@@ -330,7 +338,7 @@ mod tests {
             curator_interval_minutes: 60,
             scout_enabled: false,
             scout_interval_minutes: 10,
-            scout_topics: vec!["tech news".into()],
+            scout_pinned_topics: vec!["tech news".into()],
             memory_dir: PathBuf::from("./memory"),
             server_addr: "127.0.0.1:8765".into(),
             build_version: "0.1.0".into(),
