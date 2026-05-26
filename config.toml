@@ -1,0 +1,27 @@
+# Sample config. All fields are optional; missing fields use built-in defaults.
+# CLI flags (--memory-dir, --addr) override values here.
+
+[server]
+addr = "127.0.0.1:8765"
+
+[memory]
+dir = "./memory"
+recent_window = 20
+
+[claude]
+binary = "claude"
+model = "claude-opus-4-7"
+timeout_secs = 180
+scout_allowed_tools = ["WebSearch", "WebFetch"]
+
+[scout]
+enabled = false
+interval_minutes = 10
+topics = ["world news headlines", "technology news"]
+
+[curator]
+enabled = true
+interval_minutes = 60
+fresh_age_hours = 48
+aging_age_days = 14
+stale_age_days = 90
