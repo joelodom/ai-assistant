@@ -212,12 +212,15 @@ impl Assistant {
         }
     }
 
+    // Note: turn_id is set on the PARENT `turn` span created in ws.rs so
+    // every event in the pipeline (including the preprocessor's, which
+    // fires before respond) carries the same UUID. This span adds the
+    // post-preprocess fields the parent didn't have.
     #[tracing::instrument(
+        name = "respond",
         skip_all,
         fields(
-            turn_id = %uuid::Uuid::new_v4(),
             tier = ?preprocessed.tier,
-            force_opus,
             input_len = preprocessed.output.chars().count(),
             importance = preprocessed.importance,
         )
@@ -309,7 +312,7 @@ impl Assistant {
             let connectors_block = self.connectors.render_prompt_block();
             let manual_block = render_manual_pointer(&self.manual);
             let excerpts_block = render_manual_excerpts(&manual_excerpts);
-            let prompt = build_prompt(
+            let (prompt, composition) = build_prompt(
                 metadata,
                 &preprocessed.output,
                 preprocessed.tier,
@@ -325,6 +328,17 @@ impl Assistant {
                 n_retrieved = retrieved.len(),
                 top_score = retrieved.first().map(|s| s.final_score),
                 prompt_len = prompt.len(),
+                composition.persona = composition.persona,
+                composition.system_facts = composition.system_facts,
+                composition.manual_pointer = composition.manual_pointer,
+                composition.connectors = composition.connectors,
+                composition.manual_excerpts = composition.manual_excerpts,
+                composition.orientation = composition.orientation,
+                composition.metadata = composition.metadata,
+                composition.preferences = composition.preferences,
+                composition.memory = composition.memory,
+                composition.tier_note = composition.tier_note,
+                composition.user_message = composition.user_message,
                 model = ?current_model,
                 search_rounds,
                 n_manual_excerpts = manual_excerpts.len(),
@@ -855,6 +869,26 @@ fn render_manual_excerpts(excerpts: &[(String, String)]) -> String {
     s
 }
 
+/// Per-section byte sizes of an assembled prompt — emitted as a
+/// structured field in `llm_call_starting` so log analysis can tell how
+/// much of each turn's prompt was system overhead vs retrieved memory vs
+/// the user's actual message.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct PromptComposition {
+    pub persona: usize,
+    pub system_facts: usize,
+    pub manual_pointer: usize,
+    pub connectors: usize,
+    pub manual_excerpts: usize,
+    pub orientation: usize,
+    pub metadata: usize,
+    pub preferences: usize,
+    pub memory: usize,
+    pub tier_note: usize,
+    pub user_message: usize,
+    pub total: usize,
+}
+
 fn build_prompt(
     metadata: &Metadata,
     user_text: &str,
@@ -865,8 +899,10 @@ fn build_prompt(
     connectors_block: &str,
     manual_block: &str,
     manual_excerpts_block: &str,
-) -> String {
+) -> (String, PromptComposition) {
     let mut buf = String::new();
+    let mut comp = PromptComposition::default();
+    let mut mark = 0usize;
     buf.push_str(
         "You are the user's personal AI assistant. You are like a trusted human assistant: \
          you have read what the user has given you, remember it, and answer plainly. \
@@ -897,20 +933,37 @@ fn build_prompt(
          the user clearly asks (\"forget that\", \"don't remember X\"); never on your own \
          initiative.\n\n",
     );
+    comp.persona = buf.len() - mark;
+    mark = buf.len();
+
     buf.push_str(system_facts_block);
     buf.push('\n');
+    comp.system_facts = buf.len() - mark;
+    mark = buf.len();
+
     if !manual_block.is_empty() {
         buf.push_str(manual_block);
     }
+    comp.manual_pointer = buf.len() - mark;
+    mark = buf.len();
+
     if !connectors_block.is_empty() {
         buf.push_str(connectors_block);
     }
+    comp.connectors = buf.len() - mark;
+    mark = buf.len();
+
     if !manual_excerpts_block.is_empty() {
         buf.push_str(manual_excerpts_block);
     }
+    comp.manual_excerpts = buf.len() - mark;
+    mark = buf.len();
     buf.push_str("\nWhen asked about yourself, use the SYSTEM SELF-KNOWLEDGE block above for \
                   runtime facts (model names, intervals, paths) and READ_MANUAL: <section> for \
                   procedural / architectural detail. Be specific; do not invent details.\n\n");
+    comp.orientation = buf.len() - mark;
+    mark = buf.len();
+
     buf.push_str(&format!("Right now: {}\n", metadata.datetime_iso));
     if let Some(geo) = &metadata.geolocation {
         let label = geo
@@ -920,6 +973,8 @@ fn build_prompt(
         buf.push_str(&format!("Location: {label} ({:.4}, {:.4})\n", geo.lat, geo.lon));
     }
     buf.push('\n');
+    comp.metadata = buf.len() - mark;
+    mark = buf.len();
 
     if !preferences.is_empty() {
         buf.push_str("USER PREFERENCES (apply when relevant):\n");
@@ -932,6 +987,8 @@ fn build_prompt(
         }
         buf.push('\n');
     }
+    comp.preferences = buf.len() - mark;
+    mark = buf.len();
 
     if !retrieved.is_empty() {
         buf.push_str("MEMORY (top hybrid-retrieved items for this turn — scored by relevance + recency + importance):\n");
@@ -940,6 +997,8 @@ fn build_prompt(
         }
         buf.push('\n');
     }
+    comp.memory = buf.len() - mark;
+    mark = buf.len();
 
     let tier_note = match tier {
         Tier::Pass => "",
@@ -947,11 +1006,16 @@ fn build_prompt(
         Tier::Drop => "(Note: this turn was Tier 1 — should not be visible here. Bug if you see it.)\n",
     };
     buf.push_str(tier_note);
+    comp.tier_note = buf.len() - mark;
+    mark = buf.len();
 
     buf.push_str("USER MESSAGE:\n");
     buf.push_str(user_text);
     buf.push_str("\n\nRespond directly. If the message looks like data the user wants you to remember rather than a question, acknowledge briefly and confirm what you noted. If it's a question, answer it using memory above when possible. Be concise.\n");
-    buf
+    comp.user_message = buf.len() - mark;
+
+    comp.total = buf.len();
+    (buf, comp)
 }
 
 fn render_scored(s: &ScoredItem) -> String {

@@ -169,6 +169,15 @@ pub async fn retrieve(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     scored.truncate(k);
+    // Top-5 item IDs let post-hoc log analysis cross-reference with the
+    // memory directory to evaluate "did the right thing get retrieved?".
+    // Item IDs are not sensitive on their own (random UUID-ish strings);
+    // resolving them to content requires the on-disk sidecar.
+    let top_ids: Vec<&str> = scored
+        .iter()
+        .take(5)
+        .map(|s| s.item.sidecar.id.as_str())
+        .collect();
     tracing::debug!(
         n_vector_candidates = vector_scores.len(),
         n_keyword_candidates = keyword_scores.len(),
@@ -177,6 +186,7 @@ pub async fn retrieve(
         top_relevance = scored.first().map(|s| s.relevance),
         top_recency = scored.first().map(|s| s.recency),
         top_importance = scored.first().map(|s| s.importance),
+        top_ids = ?top_ids,
         "retrieve_done"
     );
     Ok(scored)

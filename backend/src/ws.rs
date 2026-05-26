@@ -35,6 +35,7 @@ use futures::{
 };
 use shared::{ClientMessage, Metadata, ReplyMeta, ServerMessage, Tier};
 use std::sync::Arc;
+use tracing::Instrument;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -106,101 +107,31 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 bypass_preprocessor,
                 force_opus,
             } => {
-                let mut bundle = payload.content.clone();
-                if !payload.attachments.is_empty() {
-                    bundle.push_str("\n\n[attachments]\n");
-                    for a in &payload.attachments {
-                        let extracted = crate::attachments::extract_text(a);
-                        bundle.push_str(&format!(
-                            "--- attachment: {:?}{} ({}) ---\n{}\n",
-                            a.kind,
-                            a.name
-                                .as_deref()
-                                .map(|n| format!(" \"{n}\""))
-                                .unwrap_or_default(),
-                            a.mime,
-                            extracted,
-                        ));
-                    }
-                }
-
-                let preprocess_result = if bypass_preprocessor {
-                    tracing::warn!(
-                        bundle_len = bundle.chars().count(),
-                        "HAZMAT BYPASS: user invoked direct-to-assistant path; \
-                         Preprocessor skipped for this message"
-                    );
-                    Ok(PreprocessorResult {
-                        tier: shared::Tier::Pass,
-                        output: bundle.clone(),
-                        redaction_report:
-                            "HAZMAT BYPASS — Preprocessor skipped at user request"
-                                .to_string(),
-                        importance: 0.8,
-                        importance_reason: Some(
-                            "HAZMAT bypass — user explicitly elevated".into(),
-                        ),
-                    })
-                } else {
-                    state
-                        .preprocessor
-                        .preprocess(&bundle, InputProvenance::Personal)
-                        .await
-                };
-
-                let preprocessed = match preprocess_result {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "preprocessor failed");
-                        let note = format!(
-                            "Preprocessor failed at {}. Input was dropped without inspection \
-                             (length: {} chars). Likely causes: out of Claude tokens, CLI not \
-                             found, network timeout, or LLM returned malformed JSON. Underlying \
-                             error: {}",
-                            chrono::Utc::now().to_rfc3339(),
-                            bundle.chars().count(),
-                            e
-                        );
-                        let _ = state
-                            .assistant
-                            .memory
-                            .add(
-                                &note,
-                                crate::memory::ItemKind::PreprocessorError,
-                                0.6,
-                                Some(metadata.clone()),
-                                String::new(),
-                                vec!["error".into(), "preprocessor".into()],
-                            )
-                            .await;
-                        let notice = ServerMessage::StubNotice {
-                            text: format!(
-                                "The Preprocessor failed and your message was dropped without \
-                                 inspection. Reason: {}. I saved a note about this; you can ask me \
-                                 about it later. (If this keeps happening, check your Claude token \
-                                 budget or the backend log.)",
-                                short_err(&e)
-                            ),
-                        };
-                        let _ = send_frame(&mut sender, &notice).await;
-                        continue;
-                    }
-                };
-
-                if preprocessed.tier == Tier::Drop {
-                    let _ = state
-                        .assistant
-                        .memory
-                        .add_stub(&preprocessed.output, preprocessed.redaction_report.clone())
-                        .await;
-                    let notice = ServerMessage::StubNotice {
-                        text: preprocessed.output.clone(),
-                    };
-                    let _ = send_frame(&mut sender, &notice).await;
-                    continue;
-                }
-                run_assistant_turn(&state, &mut sender, preprocessed, metadata, force_opus).await;
+                // Create the turn span up front so EVERY event in the
+                // pipeline — preprocessor, retrieval, assistant LLM call,
+                // marker dispatch — carries the same turn_id. Without
+                // this, preprocess events fire outside any span and you
+                // can't correlate them with the assistant turn.
+                let turn_span = tracing::info_span!(
+                    "turn",
+                    turn_id = %uuid::Uuid::new_v4(),
+                    bypass_preprocessor,
+                    force_opus
+                );
+                handle_user_message(
+                    &state,
+                    &mut sender,
+                    payload,
+                    metadata,
+                    bypass_preprocessor,
+                    force_opus,
+                )
+                .instrument(turn_span)
+                .await;
             }
+
+
+
             ClientMessage::ConfigPayload { payload } => {
                 // Sensitive payload — bypass Preprocessor + memory (Invariant #8).
                 // Dispatch directly to the config protocol handler.
@@ -375,3 +306,118 @@ fn synthetic_metadata() -> Metadata {
         freeform: serde_json::json!({"source": "config_continuation"}),
     }
 }
+
+/// Handle a single user-sent ClientMessage::Message: preprocess (or HAZMAT
+/// bypass), drop if Tier::Drop, otherwise run an assistant turn. Extracted
+/// from the WS loop so the whole pipeline can be wrapped in the per-turn
+/// `tracing::Span` — preprocess events then carry the same turn_id as the
+/// assistant events.
+async fn handle_user_message(
+    state: &AppState,
+    sender: &mut SplitSink<WebSocket, Message>,
+    payload: shared::MessagePayload,
+    metadata: Metadata,
+    bypass_preprocessor: bool,
+    force_opus: bool,
+) {
+    tracing::info!(
+        content_len = payload.content.chars().count(),
+        n_attachments = payload.attachments.len(),
+        bypass_preprocessor,
+        force_opus,
+        "ws_message_received"
+    );
+
+    let mut bundle = payload.content.clone();
+    if !payload.attachments.is_empty() {
+        bundle.push_str("\n\n[attachments]\n");
+        for a in &payload.attachments {
+            let extracted = crate::attachments::extract_text(a);
+            bundle.push_str(&format!(
+                "--- attachment: {:?}{} ({}) ---\n{}\n",
+                a.kind,
+                a.name
+                    .as_deref()
+                    .map(|n| format!(" \"{n}\""))
+                    .unwrap_or_default(),
+                a.mime,
+                extracted,
+            ));
+        }
+    }
+
+    let preprocess_result = if bypass_preprocessor {
+        tracing::warn!(
+            bundle_len = bundle.chars().count(),
+            "hazmat_bypass: preprocessor skipped at user request"
+        );
+        Ok(PreprocessorResult {
+            tier: Tier::Pass,
+            output: bundle.clone(),
+            redaction_report: "HAZMAT BYPASS — Preprocessor skipped at user request"
+                .to_string(),
+            importance: 0.8,
+            importance_reason: Some("HAZMAT bypass — user explicitly elevated".into()),
+        })
+    } else {
+        state
+            .preprocessor
+            .preprocess(&bundle, InputProvenance::Personal)
+            .await
+    };
+
+    let preprocessed = match preprocess_result {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "preprocessor failed");
+            let note = format!(
+                "Preprocessor failed at {}. Input was dropped without inspection \
+                 (length: {} chars). Likely causes: out of Claude tokens, CLI not \
+                 found, network timeout, or LLM returned malformed JSON. Underlying \
+                 error: {}",
+                chrono::Utc::now().to_rfc3339(),
+                bundle.chars().count(),
+                e
+            );
+            let _ = state
+                .assistant
+                .memory
+                .add(
+                    &note,
+                    crate::memory::ItemKind::PreprocessorError,
+                    0.6,
+                    Some(metadata.clone()),
+                    String::new(),
+                    vec!["error".into(), "preprocessor".into()],
+                )
+                .await;
+            let notice = ServerMessage::StubNotice {
+                text: format!(
+                    "The Preprocessor failed and your message was dropped without \
+                     inspection. Reason: {}. I saved a note about this; you can ask \
+                     me about it later. (If this keeps happening, check your Claude \
+                     token budget or the backend log.)",
+                    short_err(&e)
+                ),
+            };
+            let _ = send_frame(sender, &notice).await;
+            return;
+        }
+    };
+
+    if preprocessed.tier == Tier::Drop {
+        let _ = state
+            .assistant
+            .memory
+            .add_stub(&preprocessed.output, preprocessed.redaction_report.clone())
+            .await;
+        let notice = ServerMessage::StubNotice {
+            text: preprocessed.output.clone(),
+        };
+        let _ = send_frame(sender, &notice).await;
+        return;
+    }
+
+    run_assistant_turn(state, sender, preprocessed, metadata, force_opus).await;
+}
+

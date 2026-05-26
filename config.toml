@@ -74,10 +74,20 @@ keyword_candidates = 20
 recent_candidates  = 20
 
 [logging]
-# off | error | warn | info | debug | trace. Or use the full
-# `tracing` env-filter syntax for per-module control:
-#   "info,backend::retrieval=trace,backend::indexer=warn"
-# RUST_LOG env var still overrides this if set.
+# Tracing-subscriber env-filter syntax. Use one of:
+#   off | error | warn | info | debug | trace        — global
+#   info,backend=debug                                — per-crate override
+#   info,backend::retrieval=trace                     — per-module
+#
+# IMPORTANT: setting a bare `debug` or `trace` applies to ALL crates,
+# including dependencies. Tungstenite's per-frame trace logs include
+# raw WebSocket payload bytes (= assistant replies, derived from
+# personal memory). For analysis-grade verbosity, scope to our code:
+#
+#   level = "info,backend=trace"
+#
+# Our backend code is disciplined about not logging raw content;
+# external libraries aren't. RUST_LOG env var still overrides.
 level = "info"
 # json | text. JSON is what you want when feeding logs to analysis tools
 # (or to an AI for product improvement); text is more readable in a terminal.

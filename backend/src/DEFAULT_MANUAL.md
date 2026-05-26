@@ -482,6 +482,29 @@ in which turn IF they also had the memory directory. So: share logs
 freely; share the memory directory only with people you'd hand your
 notebook to.
 
+**Important caveat about `trace` level.** A bare `level = "trace"`
+applies globally — to every dependency too. Tungstenite (our WebSocket
+library) logs every outbound frame at trace with the full byte
+payload. That payload is the assistant's reply, which is derived from
+personal memory. So `level = "trace"` ends up leaking conversation
+content into the log file, defeating the discipline our own code
+holds to.
+
+The right pattern for analysis-grade verbosity is **scope the trace to
+our crate**:
+
+```toml
+[logging]
+level = "info,backend=trace"
+```
+
+env-filter syntax — global stays at info, our `backend` crate goes to
+trace. If the user has logs that were produced under a bare-trace
+config and contains tungstenite frame payloads, treat them like the
+memory directory (don't share casually). The file in question is
+`<memory-dir>/logs/<file_prefix>.YYYY-MM-DD`; delete it or rotate it
+if that content shouldn't persist.
+
 ### Events worth looking for during analysis
 
 - `turn_started` / `turn_complete` (with `duration_ms`) — per-turn
