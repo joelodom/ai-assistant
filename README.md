@@ -1,12 +1,165 @@
 # ai-assistant
 
-A personal AI assistant built around a strict one-way data flow ("the diode").
-Data flows in (emails, notes, calendar, photos); the assistant accumulates
-knowledge over time; the assistant only ever produces outputs — reminders,
-summaries, answers. **It cannot take actions in the outside world.**
+A personal AI assistant with long-term memory that lives on your machine, not
+in someone else's cloud. You hand it your inbox, your notes, your documents.
+It remembers. Later you ask "what am I supposed to be thinking about right
+now?" and it answers — using everything you've ever told it, weighted by
+recency and importance.
 
-See [SPEC.md](SPEC.md) for the full architecture, threat model, and rationale.
-See [CLAUDE.md](CLAUDE.md) for invariants and contribution guidelines.
+It is designed around one **non-negotiable security property**: a strict
+one-way data flow we call **"the diode."**
+
+```
+   you ──data──▶ assistant ──answers──▶ you
+                     │
+                     └── cannot reach the outside world
+```
+
+Data flows **in**: emails, notes, calendar entries, scanned documents, photos,
+free-text. The assistant **accumulates** knowledge over time. It only ever
+produces **outputs back to you**: reminders, summaries, answers, news you
+might care about. **It cannot take actions in the outside world.** It cannot
+send an email on your behalf, change a thermostat, reset a password, move
+money, or call any write-capable API. There is no "let me just integrate
+this one webhook" — the architecture forbids it.
+
+Think of it as a trusted human personal assistant: you hand them your mail,
+they read and remember it, and later you ask them things. They never act on
+your behalf in the world.
+
+## What it's good for
+
+- **A persistent memory layer for an LLM you actually trust with personal
+  data.** ChatGPT, Claude.ai, and similar tools either forget between
+  sessions or store everything in someone else's cloud. This stores
+  everything in plain files in a folder you control.
+- **Replacing the scatter** of Apple Notes + email screenshots + a half-used
+  calendar + sticky notes + "I'll remember this" with one queryable surface
+  that actually does remember.
+- **"What's on my plate?" / "What am I supposed to be thinking about?"** —
+  the assistant uses *now* + *here* + accumulated memory + learned
+  preferences to answer.
+- **Cross-domain reasoning**: "When did I last hear from my accountant?",
+  "What did the inspector say about the roof?", "Did I ever follow up on
+  that interview?" — answers across email, notes, and documents you've
+  handed it.
+- **A second-brain for personal projects**: drop in research notes, paste
+  in conversations, attach PDFs. Ask it questions later in plain English.
+- **Curated news** (opt-in): a background "Scout" worker that infers what
+  you care about from your memory and surfaces relevant news without you
+  asking. Off by default until you've used the system enough that it
+  knows you.
+
+## Who it's NOT for
+
+- People who want an agent that *does* things (books flights, sends email,
+  posts to Slack). That's a different product with a fundamentally
+  different security model.
+- People who want it to run on someone else's servers. The whole point is
+  that the substrate is yours.
+
+## Security model — the short version
+
+Security is the whole reason this design looks the way it does. Five
+properties hold whether you trust the model or not:
+
+### 1. The diode: no outbound actions, ever
+
+The backend is read-in / respond-out only. No code path writes to an
+external system. This is the deepest defense against prompt injection in
+your data: even if a malicious email convinces the model to "send a
+password-reset link to attacker@evil.com," there is no machinery in the
+backend that *can* send an email. The worst an attacker can do via
+ingested data is corrupt the answers you get back. They cannot make the
+assistant act in the world.
+
+This is what we mean by "load-bearing." The diode isn't a policy you can
+relax for convenience — it's an architectural property. The system has no
+HTTP client for outbound writes, no SMTP, no SDKs that mutate state. Web
+search and URL fetching are read-only and are the only outbound traffic.
+
+### 2. The Gate: a sanitizer that sees everything first
+
+Every byte from the outside world — your typing, an ingested email, text
+extracted from a PDF, a web page the Scout fetched — passes through a
+**Sanitizer** ("the Gate") before anything else sees it. The Gate is a
+**separate, ephemeral process per call**: a fresh `claude` subprocess with
+no shared session state, no `--continue`, no history. The raw input lives
+only on one function's stack and inside that one short-lived subprocess.
+When the subprocess exits, the raw input is gone.
+
+The Gate classifies each piece of input into three tiers:
+
+- **Drop entirely** — content that is *only* security-relevant (an OTP
+  email, a password-reset link). The content is destroyed; only a
+  content-free stub note is recorded ("Received and dropped a message that
+  appeared to be a security code").
+- **Redact, then pass** — sensitive but contextually useful content (a
+  bank deposit confirmation). Account numbers and similar
+  directly-actionable identifiers are replaced with placeholders; who/what/
+  when is preserved.
+- **Pass through** — the vast majority of input. Just goes through.
+
+### 3. Threat model: account-takeover attackers, not nation-states
+
+The Gate is tuned to defeat **financially motivated attackers** trying for
+account takeover or direct theft. It actively suppresses anything that
+would directly enable that:
+
+- 2FA / MFA / OTP codes
+- Password reset links and tokens
+- API keys, access tokens, session tokens, recovery codes
+- Full bank account numbers, full card numbers, routing numbers, wire/ACH
+  identifiers
+
+It is **not** trying to suppress every fact a social engineer might find
+useful. Birthdays, vacation dates ("house empty next Tuesday"), kids'
+school names, employer info, calendar events — these get remembered and
+reasoned over, because hobbling the assistant's usefulness to defend
+against social engineering would defeat the point. The threshold is "would
+this one fact directly enable account takeover?" — if yes, drop or redact;
+if no, keep.
+
+### 4. Your data lives on your disk in plain text
+
+There is **no database** and **no cloud storage**. Memory is plain text
+bodies plus small JSON sidecars under a directory you choose:
+
+```
+<memory-dir>/
+  items/2026-05-25/<id>.txt        # the sanitized body
+  items/2026-05-25/<id>.json       # who/when/how-important
+  stubs/<id>.json                  # content-free drop records
+  preferences.json                 # things you've told it to remember about your preferences
+```
+
+You can `cat` your assistant's memory. You can `grep` it. You can back it
+up with `tar`. You can move it to another machine. You can delete a
+specific item by removing two files. The whole format is designed to
+survive the death of this software — you can read the data with `less`
+ten years from now.
+
+All writes are atomic (temp file + fsync + rename), so a crash mid-write
+cannot corrupt items. The backend can be killed, restarted, power-cycled
+at any moment without losing anything except an in-flight request.
+
+### 5. The HAZMAT bypass is opt-in, audited, and never automatic
+
+There is one explicit user-controlled exception to "the Gate sees
+everything": a `☢ Hazmat` checkbox in the client. Tick it and the next
+message skips the Sanitizer and goes straight to the assistant. Use it
+when you've consciously decided the content is safe and you want it
+reasoned over verbatim. Every bypass is logged at WARN, tagged `hazmat`
+in the memory audit trail, and shown with a banner in your local
+transcript so you can never wonder later whether a message went through
+the Gate. **No code path may set the bypass programmatically** — only the
+human-pressed checkbox can flip it.
+
+---
+
+For the full threat model, architecture rationale, and as-built notes,
+see [SPEC.md](SPEC.md). For contribution invariants, see
+[CLAUDE.md](CLAUDE.md).
 
 ---
 
@@ -118,14 +271,26 @@ recent_window = 20
 
 [claude]
 binary = "claude"
+# Default for any role that doesn't override below.
 model = "claude-opus-4-7"
+# Per-role models — chosen to match each component's job:
+#   Sanitizer:  Haiku  — pattern recognition on every message, latency matters.
+#   Assistant:  Sonnet — chat; self-escalates to the escalation model when needed.
+#   Escalation: Opus   — for hard reasoning, used on self- or user-forced escalation.
+#   Curator:    Sonnet — destructive summarization; smarter compression matters.
+#   Scout:      Sonnet — web triage; Opus would be wasted.
+sanitizer_model            = "claude-haiku-4-5"
+assistant_model            = "claude-sonnet-4-6"
+assistant_escalation_model = "claude-opus-4-7"
+curator_model              = "claude-sonnet-4-6"
+scout_model                = "claude-sonnet-4-6"
 timeout_secs = 180
 scout_allowed_tools = ["WebSearch", "WebFetch"]
 
 [scout]
-enabled = false           # opt-in; enable once you've validated the basics
+enabled = false           # opt-in; enable once memory is substantial
 interval_minutes = 10
-topics = ["world news headlines", "technology news"]
+pinned_topics = []        # empty → Scout infers topics from your memory
 
 [curator]
 enabled = true
