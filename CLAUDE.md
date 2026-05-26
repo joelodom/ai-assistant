@@ -15,7 +15,11 @@ project, or when Edit requires a prior built-in Read.
 ## What this is
 
 A personal AI assistant built around a strict one-way data flow ("the diode").
-Source of truth is [SPEC.md](SPEC.md) — read it before changing architecture.
+Source of procedural / architectural truth for the running system is
+`backend/src/DEFAULT_MANUAL.md` (which gets seeded into
+`<memory-dir>/SYSTEM_MANUAL.md` on first run, where the user can edit it).
+The assistant reads sections of this manual on demand via the `READ_MANUAL`
+marker — see "System manual" below.
 
 ```
 client (egui, Mac native) ──WS──> backend ──> Preprocessor ──> Assistant ──> Memory
@@ -40,6 +44,10 @@ client (egui, Mac native) ──WS──> backend ──> Preprocessor ──> A
 - **VectorIndex** — HNSW graph cached on disk; rebuildable from `.vec` sidecars.
 - **Indexer** — mechanical, no-LLM background worker. Replaces the Curator. Backfills
   missing embeddings, compacts the HNSW graph, snapshots stats.
+- **Connectors** — search-only adapters to external personal-data sources
+  (Gmail today; Drive/Calendar later). Triggered by the assistant emitting
+  `SEARCH: <name> <query>` markers. Results always pass through the
+  Preprocessor before reaching memory.
 - **Scout** — opt-in web/news worker.
 
 ## Non-negotiable invariants
@@ -91,6 +99,18 @@ relaxing one, stop and ask.
    fields as `#[serde(default)]`. Removed enum variants must still deserialize
    (use `#[serde(other)]` or keep the variant). Migrations happen lazily, on
    write, not via batch rewrites.
+8. **ConfigPayload traffic bypasses the Preprocessor AND never reaches
+   long-term memory.** Configuration payloads (OAuth credentials, callback
+   codes, etc., sent via `ClientMessage::ConfigPayload`) are mechanical
+   handshakes and secrets, not personal data. They are handled by
+   `backend/src/config_protocol.rs`, which only writes to the connector
+   directory and holds pending OAuth state in process memory with a TTL.
+   This is the only path that bypasses both the Preprocessor and memory.
+
+   **When extending**: if you add a new sensitive runtime input
+   (credentials, tokens, mechanical handshakes), add a new
+   `ConfigPayloadKind` variant and a config_protocol handler — NOT a new
+   bypass somewhere in the main message pipeline.
 
 ## Layout
 
@@ -107,6 +127,8 @@ relaxing one, stop and ask.
   `hnsw/manifest.json`. Rebuilds from `.vec` sidecars on staleness.
 - `backend/src/indexer.rs` — mechanical maintenance worker. No LLM calls.
   Replaces the Curator.
+- `backend/src/connectors/` — search-only adapters (Connector trait,
+  ConnectorRegistry, OAuth machinery, Gmail implementation).
 - `backend/src/scout.rs` — periodic web/news worker (opt-in).
 - `backend/src/claude.rs` — `LlmClient` trait + `ClaudeCliClient` (production)
   + `MockLlmClient` + `FailingLlmClient` (testing).
@@ -127,8 +149,8 @@ canned LLM responses via `MockLlmClient::respond_when(matcher, response)`.
 
 ## Data store
 
-The memory directory is the only persistent state. Override its location with
-`--memory-dir <path>` or `AI_ASSISTANT_MEMORY_DIR=<path>`. Backups are just
+The memory directory is the only persistent state. Set its location in
+`[memory] dir` of the TOML config (pass with `--config <path>`). Backups are just
 `tar czf data.tgz <dir>`. The on-disk format is human-readable text + JSON
 plus small binary `.vec` sidecars; all writes are atomic (temp file + rename)
 so crashes mid-write cannot corrupt items.
@@ -177,6 +199,99 @@ If you add a new path that ingests data (e.g. a new attachment kind, a
 new background ingestor, a future Connector), it MUST default to going
 through the Preprocessor. Only the explicit, user-driven UI affordance gets
 to set the bypass flag — never as a side effect, never automatically.
+
+## System manual (single source of procedural truth)
+
+The assistant has a markdown file it can consult on demand:
+
+- **Bundled default:** `backend/src/DEFAULT_MANUAL.md` (embedded into the
+  binary via `include_str!`).
+- **On disk:** `<memory-dir>/SYSTEM_MANUAL.md`, written from the default
+  on first run. User-editable; we never overwrite it after that.
+- **Loaded by:** `backend/src/manual.rs`. Re-reads from disk on every
+  section lookup so user edits take effect without a restart.
+
+The assistant reads sections via the `READ_MANUAL: <section>` marker
+(see `backend/src/assistant.rs::READ_MANUAL_MARKER`). Bare `READ_MANUAL`
+returns the TOC. Bound at 4 reads per turn. The manual covers:
+architecture, all 8 invariants, marker vocabulary, hybrid retrieval,
+memory store layout, HAZMAT, forget, connector setup (Gmail walk-through
+including Cloud Console), client-driven config, error handling,
+troubleshooting, self-knowledge.
+
+**This is the rule:** when you add or change a feature that affects the
+system's behavior, the marker vocabulary, the wire protocol, a setup
+flow, or the invariants — **update `backend/src/DEFAULT_MANUAL.md` in
+the same change.** It is the canonical source for "how does X work"
+content; everything else (this CLAUDE.md, the README, the assistant's
+own prose) should pull from it rather than duplicate it.
+
+Static procedural content used to live in `SelfKnowledge` memory items
+seeded at startup; that's removed. The `ItemKind::SelfKnowledge` enum
+variant stays for back-compat with items written by earlier versions
+(Invariant #7).
+
+## Connectors (search-only)
+
+Connectors are search-only adapters to external personal-data sources. The
+assistant emits `SEARCH: <name> <query>` markers when it judges the answer
+is likely in one. The WS-driven `Assistant::respond` loop executes each
+search via the registered connector, runs every result through the
+Preprocessor (Invariant #3 — connector data is "outside world" data), and
+ingests non-drop results as `ItemKind::ConnectorFinding` items.
+
+After ingestion the assistant is re-prompted with the now-updated memory.
+Bounded at `max_search_rounds` (default 2) so the loop can't recurse forever.
+
+**Defense in depth.** Each connector is bound to the narrowest possible
+OAuth scope (Gmail uses `gmail.readonly`). The connector trait deliberately
+exposes only `search` — there is no `.send()` or `.delete()` method for a
+bug to call into existence. And even if the connector tried, Google's
+authorization server would 403 because the token is scope-bound at
+issuance.
+
+Setup is **client-driven** (see "Client-driven configuration" below). The
+user tells the assistant they want to set up a connector; the assistant
+walks them through it conversationally, emitting `CONFIG_REQUEST_FILE` and
+`CONFIG_BEGIN_OAUTH` markers that the backend translates into structured
+`ServerMessage::ConfigRequest` frames. The client hosts the OAuth loopback
+listener (so the browser dance works even when the backend is on a
+headless EC2 instance) and launches the browser locally. The backend
+exchanges the resulting code with Google, writes `token.json` atomically,
+and registers the live connector instance.
+
+## Client-driven configuration (Invariant #8)
+
+The backend's CLI has exactly one flag: `--config <path>`. Everything else
+(memory dir, listen address, model choices, retrieval weights, scout
+toggle) lives in the TOML config. Runtime configuration (connector setup,
+OAuth flows, etc.) flows from the client over the WebSocket — see the
+manual section on `client-driven-config`.
+
+Two new wire variants drive this:
+
+- `ClientMessage::ConfigPayload { payload: ConfigPayloadKind }` —
+  sensitive payloads (OAuth client_secret.json contents, callback codes,
+  loopback port handshake). **Invariant #8: these bypass the Preprocessor
+  AND never reach long-term memory.** They are handled by
+  `backend/src/config_protocol.rs`, which writes only to the connector
+  directory and holds pending OAuth state in memory with a 10-min TTL.
+- `ServerMessage::ConfigRequest { request: ConfigRequestKind }` —
+  structured ask for the client to perform a UI action (file picker,
+  browser launch). Driven by the assistant's `CONFIG_REQUEST_FILE` /
+  `CONFIG_BEGIN_OAUTH` markers, which the WS handler intercepts.
+- `ServerMessage::ConfigStatus { connector, ok, message }` — rendered in
+  the client transcript as a system note.
+
+The flow: user types "set up gmail" → assistant emits markers → backend
+sends structured requests → client UI responds → backend handles the
+mechanical bits → continuation turn synthesized via the assistant so the
+conversation moves forward conversationally.
+
+**When extending**: any new configuration capability (enabling Scout, etc.)
+should follow this pattern — assistant marker → ConfigPayload variant →
+config_protocol handler → ConfigStatus + continuation. Do not add CLI
+subcommands.
 
 ## Explicit forget
 

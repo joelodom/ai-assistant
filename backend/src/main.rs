@@ -13,12 +13,16 @@
 //!      files must continue to load. Derived caches (HNSW graph) are
 //!      rebuildable from sidecars.
 //!
-//! Flags (overrides take precedence over config.toml):
-//!   --config <path>         Use this TOML config (else ./config.toml if it exists, else defaults).
-//!   --memory-dir <path>     Store memory in this directory (also AI_ASSISTANT_MEMORY_DIR).
-//!   --addr <ip:port>        Listen address (also AI_ASSISTANT_ADDR).
+//! ONE flag only: `--config <path>` to point at a TOML config file. With
+//! no flag, looks for `./config.toml` in cwd; if absent, uses built-in
+//! defaults. Everything else (memory dir, listen address, model choices,
+//! retrieval weights, scout toggles, etc.) lives in the TOML.
 //!
-//! Env knobs:
+//! All runtime configuration (connector setup, etc.) is driven from the
+//! client via the WebSocket. Just start the backend and talk to the
+//! assistant.
+//!
+//! Env knobs (testing-only; not used in production):
 //!   AI_ASSISTANT_MOCK_CLAUDE=1     Use the canned mock LLM (for offline testing).
 //!   AI_ASSISTANT_MOCK_EMBEDDER=1   Use the deterministic hash-based mock embedder.
 //!   RUST_LOG                       Log filter (default: info).
@@ -30,8 +34,6 @@ use tracing_subscriber::EnvFilter;
 #[derive(Debug, Default)]
 struct CliArgs {
     config_path: Option<PathBuf>,
-    memory_dir_override: Option<PathBuf>,
-    addr_override: Option<String>,
 }
 
 fn parse_args() -> CliArgs {
@@ -40,26 +42,21 @@ fn parse_args() -> CliArgs {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--config" => out.config_path = args.next().map(PathBuf::from),
-            "--memory-dir" => out.memory_dir_override = args.next().map(PathBuf::from),
-            "--addr" => out.addr_override = args.next(),
             "-h" | "--help" => {
-                println!("ai-assistant-backend [--config PATH] [--memory-dir PATH] [--addr IP:PORT]");
+                println!(
+                    "ai-assistant-backend [--config PATH]\n\
+                     \n\
+                     With no --config, looks for ./config.toml in the current directory;\n\
+                     if absent, uses built-in defaults. All other configuration lives in\n\
+                     the TOML. Runtime config (connector setup, etc.) flows from the client\n\
+                     over the WebSocket."
+                );
                 std::process::exit(0);
             }
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(2);
             }
-        }
-    }
-    if out.memory_dir_override.is_none() {
-        if let Ok(v) = std::env::var("AI_ASSISTANT_MEMORY_DIR") {
-            out.memory_dir_override = Some(PathBuf::from(v));
-        }
-    }
-    if out.addr_override.is_none() {
-        if let Ok(v) = std::env::var("AI_ASSISTANT_ADDR") {
-            out.addr_override = Some(v);
         }
     }
     out
@@ -79,13 +76,12 @@ async fn main() -> Result<()> {
             let p = PathBuf::from("./config.toml");
             p.exists().then_some(p)
         });
-    let mut cfg = backend::config::Config::load(cfg_path.as_deref())?;
-    if let Some(d) = cli.memory_dir_override {
-        cfg.memory.dir = d;
+    if let Some(p) = &cfg_path {
+        tracing::info!(config = %p.display(), "loading config");
+    } else {
+        tracing::info!("no config file; using built-in defaults");
     }
-    if let Some(a) = cli.addr_override {
-        cfg.server.addr = a;
-    }
+    let cfg = backend::config::Config::load(cfg_path.as_deref())?;
 
     tracing::info!(
         memory_dir = %cfg.memory.dir.display(),

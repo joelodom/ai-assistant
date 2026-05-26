@@ -10,8 +10,8 @@ use chrono::Local;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use shared::{
-    Attachment, AttachmentKind, ClientMessage, Geolocation, MessagePayload, Metadata,
-    ServerMessage,
+    Attachment, AttachmentKind, ClientMessage, ConfigPayloadKind, ConfigRequestKind, Geolocation,
+    MessagePayload, Metadata, ServerMessage,
 };
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
@@ -203,6 +203,16 @@ impl AssistantApp {
                         });
                     }
                     ServerMessage::Pong => {}
+                    ServerMessage::ConfigRequest { request } => {
+                        self.handle_config_request(request);
+                    }
+                    ServerMessage::ConfigStatus { connector, ok, message } => {
+                        let prefix = if ok { "✓" } else { "✗" };
+                        self.transcript.push(Turn::System {
+                            text: format!("{prefix} [{connector}] {message}"),
+                            ts: now_str(),
+                        });
+                    }
                 },
             }
             ctx.request_repaint();
@@ -263,6 +273,75 @@ impl AssistantApp {
     }
 
     /// Open a native file picker and queue every chosen file as an attachment.
+    /// Backend asked us to do a config step. Dispatch by kind.
+    /// BeginOAuth is handled entirely on the network thread (see net.rs);
+    /// the other two land here.
+    fn handle_config_request(&mut self, req: ConfigRequestKind) {
+        match req {
+            ConfigRequestKind::RequestFile {
+                connector,
+                filename,
+                hint,
+            } => {
+                // Annotate the transcript so the user sees what's being asked.
+                self.transcript.push(Turn::System {
+                    text: format!("📎 [{connector}] {hint}"),
+                    ts: now_str(),
+                });
+                let picked = rfd::FileDialog::new()
+                    .set_title(&format!("Choose {filename} for {connector}"))
+                    .pick_file();
+                let Some(path) = picked else {
+                    self.transcript.push(Turn::System {
+                        text: format!("✗ [{connector}] file selection cancelled."),
+                        ts: now_str(),
+                    });
+                    return;
+                };
+                let contents = match std::fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.transcript.push(Turn::Error {
+                            text: format!("could not read {}: {e}", path.display()),
+                            ts: now_str(),
+                        });
+                        return;
+                    }
+                };
+                let msg = ClientMessage::ConfigPayload {
+                    payload: ConfigPayloadKind::ConnectorClientSecret {
+                        connector: connector.clone(),
+                        contents,
+                    },
+                };
+                let _ = self.ui_tx.send(UiToNet::Send(msg));
+                self.transcript.push(Turn::System {
+                    text: format!("→ [{connector}] sent {} to backend", path.display()),
+                    ts: now_str(),
+                });
+            }
+            ConfigRequestKind::BeginOAuth { connector, scope } => {
+                // The network thread handles BeginOAuth (binds loopback,
+                // spawns listener). Render a transcript note so the user
+                // sees the OAuth dance kicking off.
+                self.transcript.push(Turn::System {
+                    text: format!(
+                        "🔐 [{connector}] starting OAuth handshake (scope: {scope})…"
+                    ),
+                    ts: now_str(),
+                });
+            }
+            ConfigRequestKind::OpenBrowser { url, hint } => {
+                // Browser launch was done by net.rs; this is just the
+                // transcript echo.
+                self.transcript.push(Turn::System {
+                    text: format!("🌐 {hint}\n   {url}"),
+                    ts: now_str(),
+                });
+            }
+        }
+    }
+
     fn pick_files(&mut self) {
         let files = rfd::FileDialog::new()
             .set_title("Attach files")

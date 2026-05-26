@@ -5,6 +5,9 @@
 //!   2. Raw input is ephemeral. The Security Preprocessor is the only thing
 //!      that sees it.
 //!   3. Everything stored is sanitized.
+//!   8. Configuration payloads (`ClientMessage::ConfigPayload`) bypass the
+//!      Preprocessor AND never reach long-term memory. They are handled by
+//!      a dedicated config dispatcher (see SPEC §11.6 / §19).
 
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +37,44 @@ pub enum ClientMessage {
         force_opus: bool,
     },
     Ping,
+    /// Sensitive configuration payload. Routed to the config dispatcher;
+    /// does NOT pass through the Preprocessor and does NOT land in long-term
+    /// memory (Invariant #8).
+    ConfigPayload {
+        payload: ConfigPayloadKind,
+    },
+}
+
+/// Discriminated union of all configuration payloads the client can send.
+/// New variants should ONLY be added with explicit security review — every
+/// variant here bypasses the Preprocessor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConfigPayloadKind {
+    /// User provided the OAuth client_secret.json for a connector. Contents
+    /// are written atomically to `<memory-dir>/connectors/<name>/client_secret.json`.
+    ConnectorClientSecret {
+        connector: String,
+        /// Raw JSON text exactly as the user provided. Backend validates
+        /// the shape (must look like a Google OAuth Desktop client) and
+        /// rejects anything else.
+        contents: String,
+    },
+    /// Client has bound an OAuth loopback listener at this port and is
+    /// ready to receive the authorization redirect from Google. Backend
+    /// uses the port to mint the auth URL.
+    ConnectorLoopbackReady {
+        connector: String,
+        port: u16,
+    },
+    /// Client's loopback listener received the OAuth redirect. Backend
+    /// validates `state` against its pending entry and exchanges the code
+    /// for tokens.
+    ConnectorOAuthCallback {
+        connector: String,
+        state: String,
+        code: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +138,47 @@ pub enum ServerMessage {
     /// Backend-side error surfaced to the user.
     Error { text: String },
     Pong,
+    /// Structured ask for the client to perform a configuration step
+    /// (open a file picker, bind a loopback, launch a browser). Driven by
+    /// the assistant's config markers — see SPEC §19.
+    ConfigRequest { request: ConfigRequestKind },
+    /// Result of a ConfigPayload the client just sent. Rendered in the
+    /// transcript as a system note.
+    ConfigStatus {
+        connector: String,
+        ok: bool,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConfigRequestKind {
+    /// Ask the user to pick a file from disk. The client should respond
+    /// with `ConfigPayload::ConnectorClientSecret`.
+    RequestFile {
+        connector: String,
+        filename: String,
+        /// Human-readable hint to render in the UI (what the file is for,
+        /// where the user gets it).
+        hint: String,
+    },
+    /// Begin an OAuth handshake. The client should bind a 127.0.0.1
+    /// loopback listener and reply with
+    /// `ConfigPayload::ConnectorLoopbackReady`. The backend will then
+    /// build the auth URL and send `OpenBrowser`.
+    BeginOAuth {
+        connector: String,
+        /// Informational only — the actual scope is enforced server-side
+        /// at OAuth time.
+        scope: String,
+    },
+    /// Open this URL in the user's browser. The client should also continue
+    /// listening on the loopback bound in the BeginOAuth step.
+    OpenBrowser {
+        url: String,
+        hint: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

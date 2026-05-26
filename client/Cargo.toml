@@ -23,3 +23,7 @@ egui = "0.27"
 ureq = { version = "2", features = ["json"] }
 rfd = "0.14"
 base64 = "0.22"
+# Config protocol: launching the user's browser for OAuth + parsing the
+# callback URL.
+webbrowser = "0.8"
+urlencoding = "2"

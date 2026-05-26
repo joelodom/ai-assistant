@@ -29,6 +29,11 @@ base64 = "0.22"
 pdf-extract = "0.7"
 sha2.workspace = true
 hnsw_rs = "0.3"
+# Connector machinery: OAuth browser flow + HTTP calls + browser launch.
+oauth2 = "4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+urlencoding = "2"
+webbrowser = "0.8"
 # fastembed is opt-in to keep the default build fast and dependency-light.
 # Production deployments should enable it (`--features fastembed-real`) so
 # Embedder uses real semantic vectors. Without the feature, MockEmbedder is

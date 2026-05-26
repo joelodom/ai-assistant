@@ -157,9 +157,11 @@ only the human-pressed checkbox can flip it.
 
 ---
 
-For the full threat model, architecture rationale, and as-built notes,
-see [SPEC.md](SPEC.md). For contribution invariants, see
-[CLAUDE.md](CLAUDE.md).
+For the in-depth architecture, security argument, and the canonical
+walkthrough the assistant itself uses, see
+`backend/src/DEFAULT_MANUAL.md` (also written to
+`<memory-dir>/SYSTEM_MANUAL.md` on first run; user-editable). For
+contribution invariants, see [CLAUDE.md](CLAUDE.md).
 
 ---
 
@@ -184,15 +186,15 @@ This builds two binaries:
 ### Start the backend
 
 ```bash
-./target/release/ai-assistant-backend                           # uses ./memory
-./target/release/ai-assistant-backend --memory-dir ~/data/work  # different dataset
-AI_ASSISTANT_MEMORY_DIR=/tmp/scratch ./target/release/ai-assistant-backend
+./target/release/ai-assistant-backend                       # uses ./config.toml if present, else defaults
+./target/release/ai-assistant-backend --config my.toml      # explicit config
 ```
 
-Default listen address is `127.0.0.1:8765`. Override with `--addr` or
-`AI_ASSISTANT_ADDR`. By default the **Scout** (web/news worker) is disabled
-and the **Curator** (memory decay worker) is enabled. Edit `config.toml` to
-change either.
+The backend has exactly one flag: `--config <path>`. Everything tunable
+(memory dir, listen address, model choices, scout/indexer toggles,
+retrieval weights) lives in the TOML — see `config.toml` for the
+annotated template. Default listen address is `127.0.0.1:8765`. By
+default the **Scout** is disabled and the **Indexer** is enabled.
 
 Logs go to stderr; tune with `RUST_LOG=debug`.
 
@@ -214,11 +216,12 @@ jot a note), ask it questions, or tell it what to remember or forget.
 ## Different datasets / backup
 
 The memory directory **is** the database. Point the backend at different
-folders to run against different datasets:
+folders by editing `[memory] dir` in your TOML, and pick which TOML to
+use with `--config`:
 
 ```bash
-./target/release/ai-assistant-backend --memory-dir ~/data/personal
-./target/release/ai-assistant-backend --memory-dir ~/data/work
+./target/release/ai-assistant-backend --config personal.toml
+./target/release/ai-assistant-backend --config work.toml
 ```
 
 Backup is just a tarball of that folder:
@@ -254,6 +257,69 @@ AI_ASSISTANT_MOCK_CLAUDE=1 ./target/release/ai-assistant-backend
 
 Messages will get canned responses, but every code path runs and nothing is
 sent to Claude.
+
+---
+
+## Connectors (search your Gmail)
+
+The assistant can search external personal-data sources on demand. v2.1
+ships with **Gmail** (read-only). The assistant emits a `SEARCH: gmail
+<query>` marker when it judges the answer is likely in your inbox; the
+backend runs the search, every result passes through the Preprocessor
+(sanitization + importance scoring), and findings land in memory as
+permanent searchable items.
+
+### Defense in depth
+
+The connector is bound to the `gmail.readonly` OAuth scope. Three
+independent layers prevent abuse:
+
+1. **Google enforces the scope.** Any attempt to send, delete, or modify
+   mail returns 403 — Google's authorization server refuses, regardless
+   of what our code tries.
+2. **The connector trait has no write methods.** There is no `.send()`
+   or `.delete()` — a bug literally cannot call into them.
+3. **Every result passes the Preprocessor.** Malicious content (OTPs,
+   prompt injection) gets dropped or redacted before reaching the
+   assistant or storage.
+
+### Setting up Gmail
+
+Start the backend (no flags needed) and connect with the client:
+
+```bash
+./target/release/ai-assistant-backend
+./target/release/ai-assistant-client
+```
+
+Then tell the assistant:
+
+> set up gmail
+
+That's the whole instruction. The assistant reads its own manual for the
+exact procedure and walks you through it — Cloud Console setup, file
+upload, browser-based OAuth, the "Google hasn't verified this app"
+warning, troubleshooting, and a suggested test query at the end. You're
+having a conversation, not following a wizard.
+
+A few things worth knowing without asking:
+
+- The browser dance happens on **your machine** (the client launches
+  your browser; the client hosts the OAuth loopback). The auth code
+  reaches the backend over the existing trusted WebSocket. This is
+  why it works the same whether the backend runs locally or on a
+  headless EC2 instance.
+- The OAuth scope is hardcoded to `gmail.readonly`. Google enforces
+  it server-side; the connector trait exposes no `.send()` or
+  `.delete()` methods to bug-call; every fetched email passes through
+  the Preprocessor before reaching memory.
+- The token refreshes silently. Revoke at any time at
+  https://myaccount.google.com/permissions.
+
+The walkthrough lives in `backend/src/DEFAULT_MANUAL.md` under the
+`connector-setup-gmail` section. It's seeded into
+`<memory-dir>/SYSTEM_MANUAL.md` on first run, where you can edit it to
+adjust the assistant's behavior for your setup.
 
 ---
 
@@ -360,6 +426,7 @@ old `config.toml` files keep working (forward-compatible reads invariant).
 | Embedder     | backend   | Local fastembed-rs model — text → vector. No network. |
 | VectorIndex  | backend   | HNSW search structure. Derived cache, rebuildable. |
 | Indexer      | backend   | Periodic mechanical worker. Backfill + re-embed + stats. NO LLM. |
+| Connectors   | backend   | Search-only adapters to external sources (Gmail). OAuth, scope-bound. |
 | The Scout    | backend   | Periodic web/news worker (opt-in).                  |
 | Client       | client    | egui chat surface, IP-based geolocation, metadata.  |
 | Protocol     | shared    | Wire types — re-used by both crates.                |

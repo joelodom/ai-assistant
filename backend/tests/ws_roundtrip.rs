@@ -128,7 +128,11 @@ async fn sanitizer_drop_path_emits_stub_notice_and_persists_only_stub() {
         mock.clone(),
         built.memory.clone(),
     ));
-    let state = backend::ws::AppState { preprocessor: sanitizer, assistant };
+    let state = backend::ws::AppState {
+        preprocessor: sanitizer,
+        assistant,
+        config_protocol: built.state.config_protocol.clone(),
+    };
 
     tokio::spawn(async move {
         let app = backend::ws::router(state);
@@ -217,9 +221,9 @@ async fn self_knowledge_is_in_assistant_prompt() {
 
     let built = backend::build_app(cfg).await.unwrap();
 
-    // The Assistant should have SystemFacts wired and SelfKnowledge items
-    // seeded. Verify both visible in the prompt by capturing one assistant
-    // turn through a mock.
+    // The Assistant should have SystemFacts wired and the SYSTEM MANUAL
+    // pointer always-on. Verify both visible in the prompt by capturing
+    // one assistant turn through a mock.
     let mock = backend::claude::MockLlmClient::new();
     let facts = built.state.assistant.system_facts.clone();
     let assistant = std::sync::Arc::new(backend::assistant::Assistant::with_model_and_facts(
@@ -229,7 +233,11 @@ async fn self_knowledge_is_in_assistant_prompt() {
         facts,
     ));
     let sanitizer = std::sync::Arc::new(backend::sanitizer::Sanitizer::new(mock.clone()));
-    let state = backend::ws::AppState { preprocessor: sanitizer, assistant };
+    let state = backend::ws::AppState {
+        preprocessor: sanitizer,
+        assistant,
+        config_protocol: built.state.config_protocol.clone(),
+    };
     tokio::spawn(async move {
         let app = backend::ws::router(state);
         let listener = tokio::net::TcpListener::bind(&addr_str).await.unwrap();
@@ -277,10 +285,11 @@ async fn self_knowledge_is_in_assistant_prompt() {
         }
     }
 
-    // The assistant turn should have included the SYSTEM SELF-KNOWLEDGE block
-    // AND surfaced SelfKnowledge memory items via the recent/search path.
+    // The assistant turn should have included the SYSTEM SELF-KNOWLEDGE
+    // block (runtime config snapshot) AND the SYSTEM MANUAL pointer block
+    // (with the TOC, so the assistant can READ_MANUAL on demand).
     let calls = mock.calls();
-    // The sanitizer prompt also contains the user's text (inside the
+    // The preprocessor prompt also contains the user's text (inside the
     // BEGIN_INPUT markers); distinguish on the assistant-only marker.
     let assistant_call = calls
         .iter()
@@ -293,11 +302,15 @@ async fn self_knowledge_is_in_assistant_prompt() {
     );
     assert!(
         assistant_call.prompt.contains("claude-haiku-4-5"),
-        "assistant prompt should mention the sanitizer's actual model"
+        "assistant prompt should mention the preprocessor's actual model"
     );
     assert!(
-        assistant_call.prompt.contains("SelfKnowledge"),
-        "assistant prompt should surface SelfKnowledge memory items"
+        assistant_call.prompt.contains("SYSTEM MANUAL"),
+        "assistant prompt should include the SYSTEM MANUAL pointer block"
+    );
+    assert!(
+        assistant_call.prompt.contains("READ_MANUAL"),
+        "assistant prompt should advertise the READ_MANUAL marker"
     );
 }
 
@@ -328,7 +341,11 @@ async fn hazmat_bypass_skips_sanitizer_and_tags_memory() {
         None,
         built.state.assistant.system_facts.clone(),
     ));
-    let state = backend::ws::AppState { preprocessor: sanitizer, assistant };
+    let state = backend::ws::AppState {
+        preprocessor: sanitizer,
+        assistant,
+        config_protocol: built.state.config_protocol.clone(),
+    };
     tokio::spawn(async move {
         let app = backend::ws::router(state);
         let listener = tokio::net::TcpListener::bind(&addr_str).await.unwrap();
@@ -441,7 +458,16 @@ async fn sanitizer_failure_drops_input_persists_audit_and_notifies_user() {
         failing.clone(),
         memory.clone(),
     ));
-    let state = backend::ws::AppState { preprocessor: sanitizer, assistant };
+    let registry = std::sync::Arc::new(backend::connectors::ConnectorRegistry::empty());
+    let config_protocol = std::sync::Arc::new(backend::config_protocol::ConfigProtocol::new(
+        memory.root().to_path_buf(),
+        registry,
+    ));
+    let state = backend::ws::AppState {
+        preprocessor: sanitizer,
+        assistant,
+        config_protocol,
+    };
 
     tokio::spawn(async move {
         let app = backend::ws::router(state);
@@ -510,4 +536,157 @@ async fn sanitizer_failure_drops_input_persists_audit_and_notifies_user() {
     }
     assert!(saw_audit, "no audit record found in {memory_dir:?}");
     assert!(!leaked, "raw input leaked despite sanitizer failure");
+}
+
+#[tokio::test]
+async fn config_payload_writes_client_secret_atomically_and_replies_config_status() {
+    // End-to-end exercise of the client-driven config protocol: client
+    // uploads a fake client_secret.json via ConfigPayload, backend writes
+    // it under <memory-dir>/connectors/gmail/, replies ConfigStatus.
+    // Crucially: the payload bypasses the Preprocessor and never lands in
+    // long-term memory (Invariant #8).
+    std::env::set_var("AI_ASSISTANT_MOCK_CLAUDE", "1");
+
+    let td = TempDir::new().unwrap();
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let memory_dir = td.path().to_path_buf();
+    let addr_str = addr.to_string();
+    let mut cfg = backend::config::Config::default();
+    cfg.memory.dir = memory_dir.clone();
+    cfg.server.addr = addr_str.clone();
+    cfg.scout.enabled = false;
+    cfg.indexer.enabled = false;
+    let built = backend::build_app(cfg).await.unwrap();
+
+    tokio::spawn(async move {
+        let app = backend::ws::router(built.state);
+        let listener = tokio::net::TcpListener::bind(&addr_str).await.unwrap();
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let _ = ws.next().await; // drain intro
+
+    let body = r#"{"installed":{"client_id":"abc.apps.googleusercontent.com","client_secret":"shh","auth_uri":"x","token_uri":"y","redirect_uris":["http://127.0.0.1"]}}"#;
+    let msg = ClientMessage::ConfigPayload {
+        payload: shared::ConfigPayloadKind::ConnectorClientSecret {
+            connector: "gmail".into(),
+            contents: body.into(),
+        },
+    };
+    ws.send(Message::Text(serde_json::to_string(&msg).unwrap()))
+        .await
+        .unwrap();
+
+    // Expect at least one ConfigStatus { ok: true } frame for gmail.
+    let mut saw_ok = false;
+    while let Some(frame) = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .ok()
+        .flatten()
+    {
+        let Ok(Message::Text(t)) = frame else { continue };
+        let parsed: ServerMessage = serde_json::from_str(&t).unwrap();
+        if let ServerMessage::ConfigStatus { connector, ok, .. } = &parsed {
+            if connector == "gmail" && *ok {
+                saw_ok = true;
+            }
+        }
+        if matches!(parsed, ServerMessage::ReplyDone { .. }) {
+            // The continuation turn completed; we have everything we need.
+            break;
+        }
+    }
+    assert!(saw_ok, "expected a ConfigStatus ok=true connector=gmail");
+
+    // File on disk.
+    let p = memory_dir.join("connectors/gmail/client_secret.json");
+    assert!(p.exists(), "expected client_secret.json at {}", p.display());
+
+    // Secrets did NOT land in long-term memory.
+    let mut secret_leaked = false;
+    for entry in walkdir::WalkDir::new(memory_dir.join("items"))
+        .into_iter()
+        .flatten()
+    {
+        if entry.file_type().is_file() {
+            if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                if text.contains("abc.apps.googleusercontent.com") || text.contains("shh") {
+                    secret_leaked = true;
+                    eprintln!("leak in {:?}: {text}", entry.path());
+                }
+            }
+        }
+    }
+    assert!(!secret_leaked, "ConfigPayload secrets leaked into items/ memory");
+}
+
+#[tokio::test]
+async fn unknown_config_connector_returns_bad_status_not_panic() {
+    std::env::set_var("AI_ASSISTANT_MOCK_CLAUDE", "1");
+
+    let td = TempDir::new().unwrap();
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let memory_dir = td.path().to_path_buf();
+    let addr_str = addr.to_string();
+    let mut cfg = backend::config::Config::default();
+    cfg.memory.dir = memory_dir.clone();
+    cfg.server.addr = addr_str.clone();
+    cfg.scout.enabled = false;
+    cfg.indexer.enabled = false;
+    let built = backend::build_app(cfg).await.unwrap();
+
+    tokio::spawn(async move {
+        let app = backend::ws::router(built.state);
+        let listener = tokio::net::TcpListener::bind(&addr_str).await.unwrap();
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let _ = ws.next().await; // drain intro
+
+    // Send a loopback-ready for an unconfigured connector. Should error
+    // gracefully — no panic, surfaced as ConfigStatus { ok: false }.
+    let msg = ClientMessage::ConfigPayload {
+        payload: shared::ConfigPayloadKind::ConnectorLoopbackReady {
+            connector: "gmail".into(),
+            port: 5500,
+        },
+    };
+    ws.send(Message::Text(serde_json::to_string(&msg).unwrap()))
+        .await
+        .unwrap();
+
+    let mut saw_bad = false;
+    while let Some(frame) = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .ok()
+        .flatten()
+    {
+        let Ok(Message::Text(t)) = frame else { continue };
+        let parsed: ServerMessage = serde_json::from_str(&t).unwrap();
+        if let ServerMessage::ConfigStatus { ok: false, .. } = parsed {
+            saw_bad = true;
+        }
+        if matches!(parsed, ServerMessage::ReplyDone { .. }) {
+            break;
+        }
+    }
+    assert!(saw_bad, "expected ConfigStatus ok=false for missing client_secret");
 }

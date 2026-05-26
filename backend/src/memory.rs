@@ -100,6 +100,11 @@ pub enum ItemKind {
     /// Tombstone for an item the user explicitly asked to forget. The body
     /// is zeroed (`[forgotten <ts>]`); the sidecar remains for audit.
     ForgottenStub,
+    /// A result fetched from a connector (e.g. Gmail, Drive, Calendar) in
+    /// response to an assistant-initiated SEARCH. Body is the
+    /// Preprocessor-sanitized content; tags include `connector:<name>` and
+    /// the source ID.
+    ConnectorFinding,
 }
 
 /// Legacy decay stage. The Curator used to advance items through these
@@ -520,6 +525,7 @@ impl MemoryStore {
                     ItemKind::UserMessage => "user_message",
                     ItemKind::Ingestion => "ingestion",
                     ItemKind::ScoutFinding => "scout_finding",
+                    ItemKind::ConnectorFinding => "connector_finding",
                     ItemKind::AssistantNote => "assistant_note",
                     ItemKind::PreprocessorStub | ItemKind::SanitizerStub => "preprocessor_stub",
                     ItemKind::PreprocessorError | ItemKind::SanitizerError => "preprocessor_error",

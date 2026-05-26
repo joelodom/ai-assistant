@@ -1,72 +1,73 @@
-# Sample config. All fields are optional; missing fields use built-in defaults.
-# CLI flags (--memory-dir, --addr) override values here.
+# ai-assistant — backend config template
 #
-# Forward-compatible reads (Invariant #7): old keys still work. `[curator]`
-# and `sanitizer_model` are accepted-and-ignored / aliased respectively.
+# This is the ONE file you can give the backend with --config <path>.
+# Every option lives here; the backend has no other flags. With no
+# --config and no ./config.toml present, built-in defaults apply.
+#
+# All sections are optional; omit anything you're fine with default for.
+# Runtime configuration (connector setup, OAuth flows, etc.) is driven
+# from the client over the WebSocket — not via this file.
 
 [server]
+# Where the WebSocket listens. Use 127.0.0.1 for laptop-local; bind a
+# public interface only if you're putting auth in front (e.g. SSH tunnel,
+# reverse proxy with mTLS) — the backend itself has no auth layer.
 addr = "127.0.0.1:8765"
 
 [memory]
+# Root of the data directory. Everything persistent lives here:
+# items/, stubs/, preferences.json, embedding_model.json, hnsw/,
+# connectors/<name>/, SYSTEM_MANUAL.md. Point at different paths to
+# run against different datasets.
 dir = "./memory"
-# Kept for back-compat. Retrieval now folds recency into a single score, so
-# this is no longer load-bearing (still used as a safety floor in a few paths).
+# Soft floor for the "recent items" fallback path in retrieval. Recency
+# is folded into the hybrid score now, so this is rarely load-bearing.
 recent_window = 20
 
 [claude]
+# Path to the `claude` CLI binary. Usually just "claude" if it's on PATH.
 binary = "claude"
 # Default model for any role that doesn't override below.
 model = "claude-opus-4-7"
-# Per-role overrides. Omit a key to inherit `model`.
-#   Preprocessor: runs on every message + scores importance. Haiku is fast
-#                 and reliable. Legacy alias: `sanitizer_model`.
-#   Assistant:    chat. Sonnet by default; self-escalates to the escalation
-#                 model when it judges a question genuinely needs Opus.
-#   Escalation:   target of self-escalation or the `force_opus` toggle.
-#   Scout:        web summarization + triage. Sonnet is plenty.
-preprocessor_model         = "claude-haiku-4-5"
-assistant_model            = "claude-sonnet-4-6"
-assistant_escalation_model = "claude-opus-4-7"
-scout_model                = "claude-sonnet-4-6"
+# Per-role overrides — chosen to match each component's job. Omit to
+# fall back to `model` above. Legacy alias `sanitizer_model` is still
+# accepted for back-compat.
+preprocessor_model         = "claude-haiku-4-5"   # runs on every msg, latency matters
+assistant_model            = "claude-sonnet-4-6"  # chat; self-escalates when needed
+assistant_escalation_model = "claude-opus-4-7"    # target of ESCALATE_TO_OPUS
+scout_model                = "claude-sonnet-4-6"  # web triage
+# Per-call timeout for any `claude` CLI invocation.
 timeout_secs = 180
+# Tools the Scout (and Assistant) may use.
 scout_allowed_tools = ["WebSearch", "WebFetch"]
 
 [scout]
-# Off by default — Scout silently spends tokens in the background.
-# Enable once you've used the assistant enough that there's some memory
-# for Scout to infer interests from.
-enabled = true
-interval_minutes = 20
-# Scout has NO hardcoded topic list. It reads your recent memory + stored
-# preferences each tick and decides what to look for. Falls back to base-rate
-# human interests for your location when memory is thin. Use pinned_topics
-# only when you want a guaranteed sweep that doesn't rely on inference.
+# Periodic web/news worker. Disabled by default — Scout silently spends
+# tokens in the background. Enable once you've used the assistant enough
+# that there's some memory for it to infer interests from.
+enabled = false
+interval_minutes = 10
+# Optional pinned topics. Empty list = Scout infers from memory.
 pinned_topics = []
 
 [indexer]
 # Mechanical maintenance worker. No LLM calls. Backfills missing `.vec`
-# sidecars (so newly arrived items become vector-searchable), detects
-# embedder-model changes and re-embeds, checkpoints the HNSW manifest,
-# logs stats. Replaces the old Curator (which was removed — RAG retrieval
-# makes destructive summarization unnecessary).
+# sidecars, detects embedder-model changes and re-embeds, checkpoints the
+# HNSW manifest. Cheap; leave enabled.
 enabled = true
 interval_minutes = 5
-# How many items to embed per tick. Keeps a bulk Gmail import from
-# hammering the embedder in one burst.
+# Per-tick embedding batch size — keeps a bulk import from hammering
+# the embedder all at once.
 batch_size = 50
 
 [retrieval]
-# Hybrid retrieval scoring:
-#   final = α · relevance + β · recency + γ · importance
-# where relevance = max(vector_cosine, keyword_rank),
-#       recency   = exp(-age_days / half_life_days).
-# Strong-old items still surface (relevance wins). Weak-new items still
-# surface (recency wins). Weak-old items get filtered out. Important items
-# float up.
-alpha           = 0.6
-beta            = 0.25
-gamma           = 0.15
-half_life_days  = 30.0
+# Hybrid score per candidate item:
+#   final = alpha * relevance + beta * recency + gamma * importance
+# relevance = max(vector_cosine, keyword_rank); recency = exp(-age/half_life).
+alpha          = 0.6
+beta           = 0.25
+gamma          = 0.15
+half_life_days = 30.0
 # Candidate pool sizes — over-fetch from each leg before re-ranking.
 vector_candidates  = 50
 keyword_candidates = 20
