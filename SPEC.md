@@ -47,9 +47,9 @@ The user may tighten this scope later. The sanitizer's rules must therefore be e
 
 ---
 
-## 3. Security model — the Sanitizer ("the Gate")
+## 3. Security model — the Sanitizer (later renamed to the Preprocessor; see §16)
 
-The Sanitizer is the **first layer everything passes through** — including the user's own questions and conversational messages, not just ingested data. Most messages pass through untouched; the point is that nothing bypasses the gate.
+The Sanitizer is the **first layer everything passes through** — including the user's own questions and conversational messages, not just ingested data. Most messages pass through untouched; the point is that nothing bypasses it.
 
 ### 3.1 Ephemeral, isolated context (hard requirement)
 - Each sanitization pass runs in its own **isolated, ephemeral context** that is **destroyed immediately after** the pass completes.
@@ -66,7 +66,7 @@ Constraints on the bypass:
 - **Per-message.** Each message decides independently. The flag does not persist on the backend.
 - **Session-scoped at the UI.** The checkbox resets to off on every client restart so a forgotten toggle doesn't carry between sessions.
 - **Audited.** The backend logs `WARN` for every bypass with the message length. The resulting memory item is tagged `hazmat` and carries elevated importance (0.8) so the user can audit later with "show me everything I bypassed the sanitizer for."
-- **Visible.** The client renders the user's outgoing message with a `☢ HAZMAT (sanitizer bypassed) ☢` banner in the local transcript so the user never wonders whether a message went through the Gate.
+- **Visible.** The client renders the user's outgoing message with a `☢ HAZMAT (sanitizer bypassed) ☢` banner in the local transcript so the user never wonders whether a message went through the Sanitizer.
 
 Intended use: pasting a document the user knows is safe and wants reasoned over verbatim, testing assistant behavior on edge-case inputs, or asking the assistant to discuss content where redaction would defeat the purpose. The user is taking on the risk explicitly.
 
@@ -108,13 +108,13 @@ Note that the architecture depicted runs on a cloud server, but initial prototyp
                                                           └──────────────────────────────────────┘
 ```
 
-**Naming (as built):** The working names stuck. The codebase uses *Sanitizer* (a.k.a. the Gate), *Assistant* (the Core / "heavy lifter"), *Curator*, and *Scout*. User-visible UI labels for turn types are: `you` / `assistant` / `gate` (for Sanitizer stub notices) / `system` (for the introduction) / `error`.
+**Naming (as built in v1; superseded in v2 — see §16):** The codebase used *Sanitizer*, *Assistant* (the Core / "heavy lifter"), *Curator*, and *Scout*. In v2 the Sanitizer was renamed to the Security Preprocessor (Preprocessor for short) and the Curator was deleted.
 
 Regardig the background worker, it should probably call the assistant core just to wake it up and let the assistant core do any fetching of news or events that the user is interested in. Fetches of PUBLIC URLs should still go through the sanitizer but the sanitizer should only sanitize the user's personal data, so it should be tagged as probably public. The point of this is that just in case there is an attack where the user's personal data is put on a "public URL" there is still a sanitization on it to hopefully stop the attack.
 
 ### 4.1 Components
 1. **Mac client (Rust, native).** Single unified surface for *both* data ingestion and conversation. Sends every message — data drops and questions alike — through the same channel. Attaches metadata on every message.
-2. **Sanitizer / the Gate (backend, first layer).** As specified in §3. Ephemeral and isolated.
+2. **Sanitizer (backend, first layer).** As specified in §3. Ephemeral and isolated. (v2: renamed to the Security Preprocessor; see §16.)
 3. **Assistant Core (backend).** Receives only sanitized content. Pulls relevant memory, combines with the message and metadata, calls the AI, returns the reply. This is the only component that "talks back" to the user.
 4. **Memory store (backend).** File-based backing store on the EC2 instance (see §6). Holds sanitized text, summaries, and learned preferences.
 5. **Background worker / the Scout (backend).** Periodically (≈ every 10 minutes) does routine web/news queries and folds results into memory so they're ready when the user asks.
@@ -315,3 +315,177 @@ The backend is designed so the whole pipeline can run without spending a single 
 
 - Retention windows / decay thresholds are AI-driven via the **Curator** (see §6, §7). Thresholds are configurable in `config.toml` (`fresh_age_hours`, `aging_age_days`, `stale_age_days`). The Curator advances items through Fresh → Aging → Summarized → Stale and uses Claude to collapse aging items into short summaries; low-importance items decay sooner.
 - The Claude model name is modular — configurable via `[claude].model` in `config.toml`. Default is the latest available Opus.
+
+---
+
+## 16. v2 amendment — RAG, hybrid retrieval, Preprocessor, Indexer, forget
+
+**Status:** v2 architecture, built and tested. **This section supersedes §3, §6, §7, §11, §14, and §15 where they conflict.** The v1 prose above is preserved as design history.
+
+### 16.1 Why v2
+
+v1 worked but did not scale. The Assistant pulled `recent(20) + keyword_search(8)` into the prompt every turn, which:
+
+- Degrades as memory grows (keyword search misses semantically related items; the recent window loses signal in noise).
+- Forced the **Curator** to destructively summarize aging items so the prompt didn't bloat. Curator mistakes were silent and permanent — a buried name or date that turned out to matter later just vanished.
+- Couldn't accommodate the planned scale (years of Gmail, decades of correspondence, Google Drive contents) — see §16.7 on Connectors.
+
+v2 replaces the prompt-bloat-avoidance strategy with retrieval. Bodies stay verbatim on disk; the Assistant only sees a small top-K per turn.
+
+### 16.2 Invariant #7 — forward-compatible reads
+
+Promoted to a named invariant alongside the original six (§11):
+
+> Any version of the backend can read a memory directory written by any earlier version. Derived files (vectors, HNSW graph, indexes, caches) are rebuilt transparently when missing or stale. Source-of-truth files (`.txt` body, `.json` metadata) are preserved verbatim across upgrades; unknown fields are tolerated, missing optional fields default cleanly, removed fields are ignored on load. Orphans (a `.txt` without its `.json`, or vice versa) are quarantined with synthesized minimal metadata, never deleted. Backups may be partial — restoring without a `hnsw/` directory or without `.vec` sidecars is supported and triggers background backfill.
+
+This shapes every v2 design decision: the Indexer can backfill missing pieces, the legacy `DecayStage` field still loads, `sanitizer_*` config keys still load via serde aliases, the old `Sanitizer*` `ItemKind` variants still deserialize.
+
+### 16.3 Component rename: Sanitizer → Preprocessor
+
+The component formerly known as the Sanitizer grew a responsibility (importance scoring), so it was renamed for accuracy.
+
+- **Technical name:** Preprocessor (`backend/src/preprocessor.rs`, `Preprocessor`, `PreprocessorResult`).
+- **Naming:** The technical name is *Preprocessor*. When the security-checkpoint role needs to be emphasized (security framing, formal documentation, threat-model discussions), use the full name *Security Preprocessor*. The earlier nickname "the Gate" is retired.
+- **Back-compat:** `pub mod sanitizer { pub use crate::preprocessor::{...}; }` keeps old import paths working. The wire field `bypass_sanitizer` is accepted as a deserialization alias for the new `bypass_preprocessor`. Config key `sanitizer_model` is accepted as an alias for `preprocessor_model`.
+
+The Preprocessor's JSON contract grew two fields:
+
+```json
+{
+  "tier": "drop" | "redact" | "pass",
+  "output": "...",
+  "redaction_report": "...",
+  "importance": 0.0..1.0,
+  "importance_reason": "one short sentence"
+}
+```
+
+Importance scoring criteria are in the prompt (`backend/src/preprocessor.rs::build_prompt`). The Preprocessor — not a heuristic — owns the importance signal end-to-end.
+
+### 16.4 Embeddings + vector index
+
+A local `Embedder` trait turns sanitized text into f32 vectors:
+
+- **MockEmbedder** (always available) — deterministic 384-dim bag-of-words. Used in tests + when fastembed is not compiled in.
+- **FastembedEmbedder** (feature `fastembed-real`) — wraps the `fastembed` crate. Production deployments enable this for real semantic vectors.
+- Env knob `AI_ASSISTANT_MOCK_EMBEDDER=1` forces the mock at startup.
+
+Embeddings live as binary sidecars (`<id>.vec`, N × f32 packed little-endian) alongside the existing `<id>.txt` and `<id>.json`. They are **source of truth** at the per-item level.
+
+The vector search structure (HNSW or brute-force) lives at `<memory-root>/hnsw/`. The v2 build ships a brute-force in-memory implementation behind the `VectorIndex` API (single-digit ms at the prototype's scale; sub-100ms up to ~100k items). When the corpus grows past that, swap in `hnsw_rs` — the public API doesn't need to change. The `hnsw/` directory is **derived cache, not source of truth**: delete it and the Indexer rebuilds from `.vec` sidecars.
+
+### 16.5 Hybrid retrieval
+
+Replaces the v1 `recent(N) + keyword_search(K)` split with a single scored retrieve:
+
+```
+final_score = α · relevance + β · recency + γ · importance
+
+relevance = max(vector_cosine, keyword_rank)
+recency   = exp(-age_days / half_life)
+importance = sidecar.importance
+```
+
+Defaults in `[retrieval]` of `config.toml`: `α=0.6, β=0.25, γ=0.15, half_life=30d`. Candidate pool unions vector top-K, keyword top-K, and a recent-window fallback (so freshly arrived items are findable before they're embedded by the Indexer).
+
+The user's framework drove this:
+- Strong semantic match, old → still surfaced (relevance wins).
+- Weak match, brand new → still surfaced (recency wins).
+- Weak match, old → filtered out (neither wins).
+- Flagged-important → floats up regardless (importance acts as a floor).
+
+Implementation: `backend/src/retrieval.rs::retrieve`.
+
+### 16.6 Curator removed; Indexer added
+
+The Curator destructively summarized aging items. With RAG, the prompt-bloat problem it solved is gone (retrieval returns top-K regardless of total). Curator was deleted.
+
+In its place: the **Indexer** (`backend/src/indexer.rs`). Mechanical, no-LLM, idempotent, crash-safe. Jobs:
+
+1. Backfill `.vec` sidecars for items that lack one.
+2. Detect embedder-model changes (recorded in `embedding_model.json`) and trigger full re-embed.
+3. Checkpoint the HNSW manifest.
+4. Log stats.
+
+Config: `[indexer] { enabled, interval_minutes, batch_size }`. The Indexer runs every few minutes by default; bulk imports are processed in batches so a Gmail dump doesn't hammer the Embedder all at once.
+
+**Decay is no longer a thing.** Items live verbatim until the user explicitly forgets them.
+
+### 16.7 Explicit forget
+
+The system never silently forgets things. When the user asks ("forget that"), the Assistant emits a marker:
+
+```
+FORGET: <item-id>
+```
+
+The Assistant sees item IDs in the rendered memory block, so it knows what to reference. The WS handler's reply pipeline parses any FORGET line, calls `MemoryStore::forget(id)`:
+
+- Body is replaced with `[forgotten <ts>]`.
+- Sidecar kind becomes `ItemKind::ForgottenStub`.
+- `.vec` sidecar is deleted.
+- HNSW entry is removed.
+- Tags pick up `forgotten` and `forgotten-from:<original-kind>`.
+
+The sidecar metadata stays as forensic audit. Reversible only from backup. Background workers (Indexer, Scout) do NOT delete or rewrite item bodies on their own.
+
+### 16.8 Future: Connectors (designed, not built)
+
+The v2 architecture is shaped to support future Connectors (Gmail, Google Drive, Calendar). A connector trait will:
+
+- Poll its source on an interval, tracking its own watermark in a sidecar.
+- Write raw bytes into a `pending/` queue (just files; restart-safe).
+- A Preprocessor worker pool drains the queue (each call still a fresh subprocess, parallelism is a knob).
+- Each sanitized item flows through the standard Memory + Embedder + Indexer path.
+- The Preprocessor's importance score gives automatic triage on ingest (wedding invitation → high, "your package was delivered" → low).
+
+Connectors are NOT built in v2 — only the foundations they need (Preprocessor importance scoring, RAG retrieval, Indexer batching, forward-compatible reads). Building a specific connector (with OAuth, API specifics) is its own discrete step.
+
+### 16.9 Wire protocol changes
+
+Only one field rename, with serde alias for back-compat:
+
+```json
+{
+  "type": "message",
+  "payload": { ... },
+  "metadata": { ... },
+  "bypass_preprocessor": false,   // was "bypass_sanitizer"; alias accepts both
+  "force_opus": false
+}
+```
+
+`ServerMessage` is unchanged.
+
+### 16.10 On-disk layout (v2)
+
+```
+<memory-dir>/
+  items/YYYY-MM-DD/<id>.txt        # sanitized body — source of truth
+  items/YYYY-MM-DD/<id>.json       # metadata: kind, importance, importance_reason,
+                                   #          sha256, tags, redaction_report, state
+  items/YYYY-MM-DD/<id>.vec        # N × f32 packed LE — source of truth
+  stubs/<id>.json                  # content-free drop records
+  preferences.json                 # standing preferences
+  embedding_model.json             # active embedder name + dim (drives invalidation)
+  hnsw/graph.bin                   # derived cache: HNSW search graph (future)
+  hnsw/manifest.json               # derived cache: which items are indexed
+```
+
+`sha256` and `importance_reason` are optional fields — sidecars written by v1 (without them) load cleanly.
+
+### 16.11 Testability (v2)
+
+Two mocks now: `AI_ASSISTANT_MOCK_CLAUDE=1` and `AI_ASSISTANT_MOCK_EMBEDDER=1`. `cargo test --workspace` runs 63 unit tests + 5 integration tests — covers: vector roundtrip, hybrid scoring (strong-old, weak-new, weak-old buried, importance boost), embedder failure fallback to keyword+recency, forget tombstoning, Indexer backfill, model-change re-embed, legacy sidecar formats loading, legacy `sanitizer_*` kinds loading, legacy `[curator]` section loading, the existing HAZMAT/sanitizer-error/SelfKnowledge integration tests.
+
+### 16.12 What did NOT change
+
+- The diode (invariant 1): no outbound actions.
+- Preprocessor ephemerality (invariant 2): each call still a fresh `claude` subprocess.
+- Preprocessor-sees-everything default + HAZMAT opt-in (invariant 3).
+- Tier-1 drop never stored (invariant 4).
+- Store contains sanitized data only (invariant 5).
+- Restart safety (invariant 6).
+- Atomic writes for everything.
+- Memory directory = the database; backup = tarball.
+- `claude` CLI as the LLM substrate.

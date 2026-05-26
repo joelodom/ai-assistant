@@ -1,11 +1,16 @@
 # Sample config. All fields are optional; missing fields use built-in defaults.
 # CLI flags (--memory-dir, --addr) override values here.
+#
+# Forward-compatible reads (Invariant #7): old keys still work. `[curator]`
+# and `sanitizer_model` are accepted-and-ignored / aliased respectively.
 
 [server]
 addr = "127.0.0.1:8765"
 
 [memory]
 dir = "./memory"
+# Kept for back-compat. Retrieval now folds recency into a single score, so
+# this is no longer load-bearing (still used as a safety floor in a few paths).
 recent_window = 20
 
 [claude]
@@ -13,16 +18,15 @@ binary = "claude"
 # Default model for any role that doesn't override below.
 model = "claude-opus-4-7"
 # Per-role overrides. Omit a key to inherit `model`.
-#   Sanitizer: runs on every message; Haiku is fast and reliable for OTP /
-#              account-number pattern recognition + structured JSON output.
-#   Assistant: inherits `model` (smartest available) — does memory-aware reasoning.
-#   Curator:   destructive summarization. Mistakes are silent and permanent —
-#              err toward smarter compression. Sonnet is the right balance.
-#   Scout:     web summarization + triage. Sonnet is plenty; Opus is wasted.
-sanitizer_model            = "claude-haiku-4-5"
-assistant_model            = "claude-sonnet-4-6"   # default chat model
-assistant_escalation_model = "claude-opus-4-7"     # Sonnet self-escalates / force_opus
-curator_model              = "claude-sonnet-4-6"
+#   Preprocessor: runs on every message + scores importance. Haiku is fast
+#                 and reliable. Legacy alias: `sanitizer_model`.
+#   Assistant:    chat. Sonnet by default; self-escalates to the escalation
+#                 model when it judges a question genuinely needs Opus.
+#   Escalation:   target of self-escalation or the `force_opus` toggle.
+#   Scout:        web summarization + triage. Sonnet is plenty.
+preprocessor_model         = "claude-haiku-4-5"
+assistant_model            = "claude-sonnet-4-6"
+assistant_escalation_model = "claude-opus-4-7"
 scout_model                = "claude-sonnet-4-6"
 timeout_secs = 180
 scout_allowed_tools = ["WebSearch", "WebFetch"]
@@ -39,9 +43,31 @@ interval_minutes = 20
 # only when you want a guaranteed sweep that doesn't rely on inference.
 pinned_topics = []
 
-[curator]
+[indexer]
+# Mechanical maintenance worker. No LLM calls. Backfills missing `.vec`
+# sidecars (so newly arrived items become vector-searchable), detects
+# embedder-model changes and re-embeds, checkpoints the HNSW manifest,
+# logs stats. Replaces the old Curator (which was removed — RAG retrieval
+# makes destructive summarization unnecessary).
 enabled = true
-interval_minutes = 60
-fresh_age_hours = 48
-aging_age_days = 14
-stale_age_days = 90
+interval_minutes = 5
+# How many items to embed per tick. Keeps a bulk Gmail import from
+# hammering the embedder in one burst.
+batch_size = 50
+
+[retrieval]
+# Hybrid retrieval scoring:
+#   final = α · relevance + β · recency + γ · importance
+# where relevance = max(vector_cosine, keyword_rank),
+#       recency   = exp(-age_days / half_life_days).
+# Strong-old items still surface (relevance wins). Weak-new items still
+# surface (recency wins). Weak-old items get filtered out. Important items
+# float up.
+alpha           = 0.6
+beta            = 0.25
+gamma           = 0.15
+half_life_days  = 30.0
+# Candidate pool sizes — over-fetch from each leg before re-ranking.
+vector_candidates  = 50
+keyword_candidates = 20
+recent_candidates  = 20

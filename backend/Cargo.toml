@@ -27,6 +27,18 @@ walkdir = "2"
 async-trait = "0.1"
 base64 = "0.22"
 pdf-extract = "0.7"
+sha2.workspace = true
+hnsw_rs = "0.3"
+# fastembed is opt-in to keep the default build fast and dependency-light.
+# Production deployments should enable it (`--features fastembed-real`) so
+# Embedder uses real semantic vectors. Without the feature, MockEmbedder is
+# used (deterministic hash-based vectors — fine for tests + architecture
+# correctness, but not semantic).
+fastembed = { version = "4", optional = true }
+
+[features]
+default = []
+fastembed-real = ["dep:fastembed"]
 
 [dev-dependencies]
 tokio-tungstenite = "0.21"

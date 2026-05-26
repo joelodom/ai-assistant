@@ -153,22 +153,20 @@ impl MockLlmClient {
     }
 
     fn default_response(prompt: &str) -> String {
-        // Sanitizer prompt looks for `SANITIZER_TASK` marker (we control it
-        // in sanitizer.rs). Return canonical Tier 3 JSON.
-        if prompt.contains("SANITIZER_TASK") {
-            // Echo the input back as Tier 3 (pass) by default.
-            // The sanitizer prompt embeds the raw input between BEGIN/END markers.
+        // Preprocessor prompt looks for `PREPROCESSOR_TASK` (legacy:
+        // `SANITIZER_TASK`). Echo the input as Tier "pass" with a neutral
+        // importance score.
+        if prompt.contains("PREPROCESSOR_TASK") || prompt.contains("SANITIZER_TASK") {
             let echoed = extract_between(prompt, "<<<BEGIN_INPUT>>>", "<<<END_INPUT>>>")
                 .unwrap_or_else(|| "".to_string());
             serde_json::json!({
                 "tier": "pass",
                 "output": echoed.trim(),
-                "redaction_report": ""
+                "redaction_report": "",
+                "importance": 0.5,
+                "importance_reason": "mock default — no real scoring"
             })
             .to_string()
-        } else if prompt.contains("CURATOR_TASK") {
-            // Generic single-line summary.
-            "[mock] collapsed summary of an aging memory item.".to_string()
         } else if prompt.contains("SCOUT_TASK") {
             "[mock] No fresh items today.".to_string()
         } else {

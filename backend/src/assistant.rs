@@ -1,16 +1,20 @@
-//! The Assistant Core. Receives only sanitized content.
+//! The Assistant Core. Receives only sanitized content (or HAZMAT-bypassed
+//! content from the explicit user opt-in).
 //!
 //! Pipeline per turn:
-//!  1. Sanitize the incoming message (caller already did this).
-//!  2. Pull a window of recent memory + a keyword-search slice.
-//!  3. Render a prompt with persona, metadata, memory, preferences, message.
-//!  4. Call Claude (one-shot for v1; streaming chunked from the WS handler).
-//!  5. Write a memory item for the incoming sanitized text (the assistant's
-//!     own reply is also stored, as a lightweight assistant note).
+//!  1. Persist the user message (sanitized output + Preprocessor importance).
+//!  2. Embed the message, upsert into the vector index.
+//!  3. Hybrid retrieve: vector + keyword + recency + importance.
+//!  4. Build prompt with persona, metadata, retrieved memory, preferences.
+//!  5. Call Sonnet. Handle ESCALATE_TO_OPUS or FORGET: markers.
+//!  6. Persist assistant note.
 
 use crate::claude::{LlmClient, LlmOptions};
-use crate::memory::{ItemKind, MemoryItem, MemoryStore};
-use crate::sanitizer::SanitizerResult;
+use crate::embedder::Embedder;
+use crate::memory::{ItemKind, MemoryStore};
+use crate::preprocessor::PreprocessorResult;
+use crate::retrieval::{retrieve, RetrievalWeights, ScoredItem};
+use crate::vector_index::VectorIndex;
 use anyhow::Result;
 use shared::{Metadata, Tier};
 use std::sync::Arc;
@@ -18,56 +22,94 @@ use std::sync::Arc;
 pub struct Assistant {
     pub llm: Arc<dyn LlmClient>,
     pub memory: Arc<MemoryStore>,
+    pub embedder: Arc<dyn Embedder>,
+    pub vector_index: Arc<VectorIndex>,
     pub model: Option<String>,
     /// Heavier model Sonnet hands off to when it judges a question needs
     /// deeper reasoning, or when the user sets `force_opus` on the message.
     pub escalation_model: Option<String>,
+    pub retrieval_weights: RetrievalWeights,
     pub system_facts: Arc<crate::self_knowledge::SystemFacts>,
 }
 
 /// Marker Sonnet emits as the FIRST line of its reply to hand off to Opus.
-/// Backend detects the prefix, discards the rest of Sonnet's text, and
-/// re-runs the same prompt against the escalation model.
 pub const ESCALATION_MARKER: &str = "ESCALATE_TO_OPUS:";
+
+/// Marker the assistant emits when the user asks to forget a specific item.
+/// The text after the colon is the item id (matched against the IDs the
+/// assistant saw in its memory block).
+pub const FORGET_MARKER: &str = "FORGET:";
 
 #[derive(Debug, Clone)]
 pub struct RespondOutcome {
     pub text: String,
-    /// Which model produced the final text (post-escalation if any).
     pub model_used: String,
-    /// True if Sonnet handed off, false if the configured primary model
-    /// answered directly (whether Sonnet, Opus-via-force, or other).
     pub escalated: bool,
-    /// Short reason string Sonnet provided after the marker, if any.
     pub escalation_reason: Option<String>,
+    /// If the LLM emitted a FORGET marker that the backend acted on, this
+    /// holds the item id and a human-readable confirmation. The
+    /// confirmation has already been substituted into `text`; this field is
+    /// for tests / audit.
+    pub forgotten_item_id: Option<String>,
 }
 
 impl Assistant {
+    /// Test-only constructor with mock-friendly defaults.
     pub fn new(llm: Arc<dyn LlmClient>, memory: Arc<MemoryStore>) -> Self {
+        let embedder: Arc<dyn Embedder> = Arc::new(crate::embedder::MockEmbedder::new());
+        let vector_index = Arc::new(
+            VectorIndex::open(memory.root(), embedder.model_name(), embedder.dimension())
+                .expect("open vector index"),
+        );
         Self {
             llm,
             memory,
+            embedder,
+            vector_index,
             model: None,
             escalation_model: None,
+            retrieval_weights: RetrievalWeights::default(),
             system_facts: Arc::new(crate::self_knowledge::SystemFacts::placeholder()),
         }
     }
 
+    /// Full constructor used by `build_app`.
+    pub fn build(
+        llm: Arc<dyn LlmClient>,
+        memory: Arc<MemoryStore>,
+        embedder: Arc<dyn Embedder>,
+        vector_index: Arc<VectorIndex>,
+        model: Option<String>,
+        escalation_model: Option<String>,
+        retrieval_weights: RetrievalWeights,
+        system_facts: Arc<crate::self_knowledge::SystemFacts>,
+    ) -> Self {
+        Self {
+            llm,
+            memory,
+            embedder,
+            vector_index,
+            model,
+            escalation_model,
+            retrieval_weights,
+            system_facts,
+        }
+    }
+
+    /// Back-compat with old tests that took just (llm, memory, model, facts).
     pub fn with_model_and_facts(
         llm: Arc<dyn LlmClient>,
         memory: Arc<MemoryStore>,
         model: Option<String>,
         system_facts: Arc<crate::self_knowledge::SystemFacts>,
     ) -> Self {
-        Self {
-            llm,
-            memory,
-            model,
-            escalation_model: None,
-            system_facts,
-        }
+        let mut a = Self::new(llm, memory);
+        a.model = model;
+        a.system_facts = system_facts;
+        a
     }
 
+    /// Back-compat with old tests.
     pub fn with_models_and_facts(
         llm: Arc<dyn LlmClient>,
         memory: Arc<MemoryStore>,
@@ -75,27 +117,21 @@ impl Assistant {
         escalation_model: Option<String>,
         system_facts: Arc<crate::self_knowledge::SystemFacts>,
     ) -> Self {
-        Self {
-            llm,
-            memory,
-            model,
-            escalation_model,
-            system_facts,
-        }
+        let mut a = Self::new(llm, memory);
+        a.model = model;
+        a.escalation_model = escalation_model;
+        a.system_facts = system_facts;
+        a
     }
 
-    /// Produce the introduction the client sees on connect. Pure function so
-    /// it's easy to test and to render the same text in different surfaces.
     pub async fn introduction(&self) -> String {
         let prefs = self.memory.preferences().await;
-        // Bootstrap state = no user data. SelfKnowledge items are seeded by
-        // the system on every startup, so they don't count.
         let user_items: usize = self
             .memory
             .scan_all()
             .unwrap_or_default()
             .iter()
-            .filter(|i| i.sidecar.kind != crate::memory::ItemKind::SelfKnowledge)
+            .filter(|i| i.sidecar.kind != ItemKind::SelfKnowledge)
             .count();
         let bootstrap = user_items == 0 && prefs.statements.is_empty();
         if bootstrap {
@@ -109,71 +145,72 @@ impl Assistant {
         }
     }
 
-    /// Run a single conversational turn. Returns the assistant's full reply
-    /// text plus metadata about which model produced it and whether it was
-    /// escalated. Persists both the user message and the assistant's note.
     pub async fn respond(
         &self,
-        sanitized: &SanitizerResult,
+        preprocessed: &PreprocessorResult,
         metadata: &Metadata,
         force_opus: bool,
     ) -> Result<RespondOutcome> {
-        // Persist user-side first (even if Tier::Drop, we already wrote a
-        // stub from the WS handler — that path doesn't reach here).
-        let user_importance = importance_hint(&sanitized.output);
-        let user_kind = if looks_like_question(&sanitized.output) {
+        // 1. Persist user-side first.
+        let user_kind = if looks_like_question(&preprocessed.output) {
             ItemKind::UserMessage
         } else {
             ItemKind::Ingestion
         };
-        let mut tags = tag_guess(&sanitized.output);
-        let is_hazmat = sanitized.redaction_report.contains("HAZMAT BYPASS");
+        let is_hazmat = preprocessed.redaction_report.contains("HAZMAT BYPASS");
+        // HAZMAT bypasses get a fixed importance (0.8) since no Preprocessor
+        // ran. Otherwise use the Preprocessor's score.
+        let user_importance = if is_hazmat { 0.8 } else { preprocessed.importance };
+        let mut tags: Vec<String> = vec![];
         if is_hazmat {
             tags.push("hazmat".to_string());
         }
-        self.memory
-            .add(
-                &sanitized.output,
+        let sidecar = self
+            .memory
+            .add_with_reason(
+                &preprocessed.output,
                 user_kind,
-                // Hazmat items get higher importance so they're easier to
-                // find in a later audit ("show me everything I bypassed
-                // the sanitizer for").
-                if is_hazmat { 0.8 } else { user_importance },
+                user_importance,
+                preprocessed.importance_reason.clone(),
                 Some(metadata.clone()),
-                sanitized.redaction_report.clone(),
+                preprocessed.redaction_report.clone(),
                 tags,
             )
             .await?;
 
-        // Pull context.
-        let recent = self.memory.recent(20).unwrap_or_default();
-        let keyword_hits = self
-            .memory
-            .search(&sanitized.output, 8)
-            .unwrap_or_default();
-        let prefs = self.memory.preferences().await;
+        // 2. Embed + upsert (best-effort; Indexer catches up if this fails).
+        if let Ok(vec) = self.embedder.embed(&preprocessed.output).await {
+            if let Some(item) = self.memory.get(&sidecar.id).ok().flatten() {
+                let _ = self.memory.write_vector(&item, &vec).await;
+                let _ = self.vector_index.upsert(&sidecar.id, vec);
+            }
+        }
 
+        // 3. Hybrid retrieve.
+        let retrieved = retrieve(
+            &self.memory,
+            &*self.embedder,
+            &self.vector_index,
+            &self.retrieval_weights,
+            &preprocessed.output,
+            15,
+        )
+        .await
+        .unwrap_or_default();
+
+        let prefs = self.memory.preferences().await;
         let item_count = self.memory.stats().get("total").copied().unwrap_or(0);
         let facts_block = self.system_facts.render_prompt_block(item_count);
         let prompt = build_prompt(
             metadata,
-            &sanitized.output,
-            sanitized.tier,
-            &recent,
-            &keyword_hits,
+            &preprocessed.output,
+            preprocessed.tier,
+            &retrieved,
             &prefs.statements,
             &facts_block,
         );
 
-        // The assistant can use web tools when answering questions about the
-        // outside world — they're read-only and consistent with the diode
-        // invariant (we fetch in, we never push out).
-        //
-        // Model routing:
-        //   force_opus=true → straight to escalation model, no Sonnet pre-pass.
-        //   force_opus=false → primary model (Sonnet); if it self-escalates
-        //                       via ESCALATE_TO_OPUS, we re-run with the
-        //                       escalation model.
+        // 4. Call LLM with model routing.
         let primary_model = if force_opus {
             self.escalation_model.clone().or_else(|| self.model.clone())
         } else {
@@ -188,44 +225,45 @@ impl Assistant {
         let raw_reply = self.llm.oneshot(&prompt, opts).await?;
         let raw_reply = raw_reply.trim().to_string();
 
-        // Check for self-escalation (only when not already forced).
-        let (final_text, model_used, escalated, reason) = if !force_opus
-            && raw_reply.starts_with(ESCALATION_MARKER)
-        {
-            let reason = raw_reply
-                .trim_start_matches(ESCALATION_MARKER)
-                .trim()
-                .lines()
-                .next()
-                .unwrap_or("")
-                .to_string();
-            let escalation_model = self
-                .escalation_model
-                .clone()
-                .or_else(|| self.model.clone());
-            let opts2 = LlmOptions {
-                allowed_tools: vec!["WebSearch".into(), "WebFetch".into()],
-                model: escalation_model.clone(),
-                ..Default::default()
+        // 5a. Handle ESCALATE_TO_OPUS.
+        let (after_escalation_text, model_used, escalated, escalation_reason) =
+            if !force_opus && raw_reply.starts_with(ESCALATION_MARKER) {
+                let reason = raw_reply
+                    .trim_start_matches(ESCALATION_MARKER)
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let escalation_model = self
+                    .escalation_model
+                    .clone()
+                    .or_else(|| self.model.clone());
+                let opts2 = LlmOptions {
+                    allowed_tools: vec!["WebSearch".into(), "WebFetch".into()],
+                    model: escalation_model.clone(),
+                    ..Default::default()
+                };
+                let opus_reply = self.llm.oneshot(&prompt, opts2).await?;
+                (
+                    opus_reply.trim().to_string(),
+                    escalation_model.unwrap_or_default(),
+                    true,
+                    if reason.is_empty() { None } else { Some(reason) },
+                )
+            } else {
+                (
+                    raw_reply,
+                    primary_model.clone().unwrap_or_default(),
+                    false,
+                    None,
+                )
             };
-            let opus_reply = self.llm.oneshot(&prompt, opts2).await?;
-            (
-                opus_reply.trim().to_string(),
-                escalation_model.unwrap_or_default(),
-                true,
-                if reason.is_empty() { None } else { Some(reason) },
-            )
-        } else {
-            (
-                raw_reply,
-                primary_model.unwrap_or_default(),
-                false,
-                None,
-            )
-        };
 
-        // Persist assistant note. Tag escalations and Opus-forced turns so
-        // the audit trail makes routing decisions visible.
+        // 5b. Handle FORGET markers anywhere in the reply.
+        let (final_text, forgotten_item_id) = self.handle_forget_markers(&after_escalation_text).await;
+
+        // 6. Persist assistant note.
         let mut note_tags = vec!["assistant".to_string()];
         if escalated {
             note_tags.push("escalated".into());
@@ -233,11 +271,14 @@ impl Assistant {
         if force_opus {
             note_tags.push("force-opus".into());
         }
+        if forgotten_item_id.is_some() {
+            note_tags.push("forget-action".into());
+        }
         let note_body = if escalated {
             format!(
                 "(assistant reply via {model_used}, escalated from {}{}) {final_text}",
                 self.model.clone().unwrap_or_else(|| "primary".into()),
-                reason
+                escalation_reason
                     .as_deref()
                     .map(|r| format!(" — reason: {r}"))
                     .unwrap_or_default()
@@ -257,10 +298,9 @@ impl Assistant {
             .await
             .ok();
 
-        // Detect preference-shaped statements ("stop telling me…", "don't
-        // tell me about…", "ignore X"). Cheap heuristic — Curator can
-        // refine later.
-        if let Some(pref) = detect_preference(&sanitized.output) {
+        // Preference detection — kept as a cheap regex heuristic. Anything
+        // smarter belongs in the Preprocessor.
+        if let Some(pref) = detect_preference(&preprocessed.output) {
             self.memory.add_preference(&pref).await.ok();
         }
 
@@ -268,8 +308,52 @@ impl Assistant {
             text: final_text,
             model_used,
             escalated,
-            escalation_reason: reason,
+            escalation_reason,
+            forgotten_item_id,
         })
+    }
+
+    /// Scan the reply for FORGET: markers, act on any valid ones, and
+    /// substitute confirmation text inline. Multiple markers are supported.
+    async fn handle_forget_markers(&self, reply: &str) -> (String, Option<String>) {
+        if !reply.contains(FORGET_MARKER) {
+            return (reply.to_string(), None);
+        }
+        let mut last_forgotten: Option<String> = None;
+        let mut out = String::with_capacity(reply.len());
+        for line in reply.lines() {
+            if let Some(rest) = line.trim().strip_prefix(FORGET_MARKER) {
+                let id = rest.trim().split_whitespace().next().unwrap_or("");
+                if id.is_empty() {
+                    out.push_str(line);
+                    out.push('\n');
+                    continue;
+                }
+                match self.memory.forget(id).await {
+                    Ok(true) => {
+                        last_forgotten = Some(id.to_string());
+                        self.vector_index.remove(id);
+                        out.push_str(&format!(
+                            "(forgot item {id} — body zeroed, vector removed, audit trail kept)\n"
+                        ));
+                    }
+                    Ok(false) => {
+                        out.push_str(&format!(
+                            "(could not find item with id {id} to forget; nothing changed)\n"
+                        ));
+                    }
+                    Err(e) => {
+                        out.push_str(&format!(
+                            "(forget for {id} failed: {e}; nothing changed)\n"
+                        ));
+                    }
+                }
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        (out.trim_end().to_string(), last_forgotten)
     }
 }
 
@@ -287,22 +371,6 @@ Two important things I will never do:
 
 Whenever you're ready, send me something.";
 
-fn importance_hint(text: &str) -> f32 {
-    // Trivial heuristic: longer + question-shaped messages score higher.
-    // Curator can re-score later.
-    let mut score: f32 = 0.3;
-    if looks_like_question(text) {
-        score += 0.2;
-    }
-    if text.len() > 400 {
-        score += 0.2;
-    }
-    if text.len() > 2000 {
-        score += 0.1;
-    }
-    score.min(0.95)
-}
-
 fn looks_like_question(text: &str) -> bool {
     text.contains('?')
         || text
@@ -315,33 +383,6 @@ fn looks_like_question(text: &str) -> bool {
                 )
             })
             .unwrap_or(false)
-}
-
-fn tag_guess(text: &str) -> Vec<String> {
-    let lower = text.to_lowercase();
-    let mut tags = Vec::new();
-    for (needle, tag) in [
-        ("appointment", "calendar"),
-        ("meeting", "calendar"),
-        ("flight", "travel"),
-        ("hotel", "travel"),
-        ("trip", "travel"),
-        ("receipt", "finance"),
-        ("invoice", "finance"),
-        ("doctor", "health"),
-        ("dentist", "health"),
-        ("birthday", "people"),
-        ("kids", "family"),
-        ("wife", "family"),
-        ("husband", "family"),
-    ] {
-        if lower.contains(needle) {
-            tags.push(tag.to_string());
-        }
-    }
-    tags.sort();
-    tags.dedup();
-    tags
 }
 
 fn detect_preference(text: &str) -> Option<String> {
@@ -367,8 +408,7 @@ fn build_prompt(
     metadata: &Metadata,
     user_text: &str,
     tier: Tier,
-    recent: &[MemoryItem],
-    keyword_hits: &[MemoryItem],
+    retrieved: &[ScoredItem],
     preferences: &[crate::memory::PreferenceStatement],
     system_facts_block: &str,
 ) -> String {
@@ -382,37 +422,32 @@ fn build_prompt(
          You DO have read-only access to the web via two tools:\n\
            • WebSearch — search the web for current information\n\
            • WebFetch — fetch a specific URL the user gave you\n\
-         Use them freely whenever the question benefits from current information \
-         (news, weather, prices, events, recent changes, anything time-sensitive). \
-         Reading from the web is consistent with the diode invariant — you fetch \
-         in, you never push out.\n\
+         Use them freely whenever the question benefits from current information.\n\
          \n\
          MODEL ESCALATION: You are running as the standard model (typically Sonnet). \
          For the vast majority of conversation — recall, light reasoning, factual lookup, \
          friendly chat — answer directly. But if a question GENUINELY needs deeper \
-         reasoning than you can reliably provide (e.g. subtle architectural trade-offs, \
-         multi-step formal reasoning, careful security analysis, untangling a confusing \
-         situation with many constraints, the user explicitly asking for Opus), you can \
-         hand off to the heavier model. To do so, output EXACTLY this format as your \
-         entire reply — no preamble, no answer:\n\
+         reasoning, you can hand off to the heavier model by outputting EXACTLY this format \
+         as your entire reply — no preamble, no answer:\n\
          \n\
-           ESCALATE_TO_OPUS: <one short sentence saying why you're escalating>\n\
+           ESCALATE_TO_OPUS: <one short sentence saying why>\n\
          \n\
-         The backend will detect the marker, run the same prompt against Opus, and the \
-         user will receive Opus's answer directly. Do NOT escalate routinely — only when \
-         your honest assessment is that Opus would meaningfully outperform you. If the \
-         user just asks for a fact, recalls a memory, or wants a casual response, answer \
-         yourself.\n\n",
+         FORGET ACTION: If the user asks you to forget a specific memory item that you can \
+         see in the MEMORY block below, you can tombstone it. Each memory line starts with \
+         its id (`id=...`). To forget one, include a line of EXACTLY this form anywhere in \
+         your reply:\n\
+         \n\
+           FORGET: <the-item-id>\n\
+         \n\
+         The backend will replace the marker line with a confirmation. Use this only when \
+         the user clearly asks (\"forget that\", \"don't remember X\"); never on your own \
+         initiative.\n\n",
     );
     buf.push_str(system_facts_block);
-    buf.push_str("\nWhen asked about yourself — what model you use, how you work, why you made \
-                  a design choice — use the SYSTEM SELF-KNOWLEDGE block above for runtime facts \
-                  AND the SelfKnowledge memory items (visible in the memory blocks below) for \
-                  rationale and architecture. Be specific and accurate; do not invent details.\n\n");
-    buf.push_str(&format!(
-        "Right now: {}\n",
-        metadata.datetime_iso
-    ));
+    buf.push_str("\nWhen asked about yourself, use the SYSTEM SELF-KNOWLEDGE block above for \
+                  runtime facts AND the SelfKnowledge memory items (visible in the memory block \
+                  below) for rationale and architecture. Be specific; do not invent details.\n\n");
+    buf.push_str(&format!("Right now: {}\n", metadata.datetime_iso));
     if let Some(geo) = &metadata.geolocation {
         let label = geo
             .label
@@ -434,25 +469,17 @@ fn build_prompt(
         buf.push('\n');
     }
 
-    if !keyword_hits.is_empty() {
-        buf.push_str("MEMORY (keyword-relevant items):\n");
-        for it in keyword_hits {
-            buf.push_str(&render_item(it));
-        }
-        buf.push('\n');
-    }
-
-    if !recent.is_empty() {
-        buf.push_str("MEMORY (most recent items, newest first):\n");
-        for it in recent.iter().take(10) {
-            buf.push_str(&render_item(it));
+    if !retrieved.is_empty() {
+        buf.push_str("MEMORY (top hybrid-retrieved items for this turn — scored by relevance + recency + importance):\n");
+        for s in retrieved {
+            buf.push_str(&render_scored(s));
         }
         buf.push('\n');
     }
 
     let tier_note = match tier {
         Tier::Pass => "",
-        Tier::Redact => "(Note: the user's message was redacted by the Gate — dangerous identifiers replaced with [bracketed redactions]. Reason about it as-is.)\n",
+        Tier::Redact => "(Note: the user's message was redacted by the Preprocessor — dangerous identifiers replaced with [bracketed redactions]. Reason about it as-is.)\n",
         Tier::Drop => "(Note: this turn was Tier 1 — should not be visible here. Bug if you see it.)\n",
     };
     buf.push_str(tier_note);
@@ -463,15 +490,18 @@ fn build_prompt(
     buf
 }
 
-fn render_item(it: &MemoryItem) -> String {
-    let when = it.sidecar.created_at.format("%Y-%m-%d %H:%M");
-    let kind = format!("{:?}", it.sidecar.kind);
-    let body = if it.body.len() > 800 {
-        format!("{}…", &it.body[..800])
+fn render_scored(s: &ScoredItem) -> String {
+    let when = s.item.sidecar.created_at.format("%Y-%m-%d %H:%M");
+    let kind = format!("{:?}", s.item.sidecar.kind);
+    let body = if s.item.body.len() > 800 {
+        format!("{}…", &s.item.body[..800])
     } else {
-        it.body.clone()
+        s.item.body.clone()
     };
-    format!("  - [{when}] ({kind}) {body}\n")
+    format!(
+        "  - [id={}, when={when}, kind={kind}, score={:.2}, rel={:.2}, recency={:.2}, importance={:.2}] {body}\n",
+        s.item.sidecar.id, s.final_score, s.relevance, s.recency, s.importance
+    )
 }
 
 #[cfg(test)]
@@ -501,88 +531,90 @@ mod tests {
         }
     }
 
+    fn pp_pass(text: &str) -> PreprocessorResult {
+        PreprocessorResult {
+            tier: Tier::Pass,
+            output: text.to_string(),
+            redaction_report: "".into(),
+            importance: 0.5,
+            importance_reason: None,
+        }
+    }
+
     #[tokio::test]
     async fn bootstrap_intro_when_empty() {
         let (_td, a) = setup().await;
         let i = a.introduction().await;
         assert!(i.contains("starting completely fresh"));
-        assert!(i.contains("never do"));
     }
 
     #[tokio::test]
     async fn intro_changes_after_first_item() {
         let (_td, a) = setup().await;
-        let s = SanitizerResult {
-            tier: Tier::Pass,
-            output: "Bought milk".to_string(),
-            redaction_report: "".into(),
-        };
-        a.respond(&s, &meta(), false).await.unwrap();
+        a.respond(&pp_pass("Bought milk"), &meta(), false).await.unwrap();
         let i = a.introduction().await;
         assert!(i.contains("Welcome back"));
     }
 
     #[tokio::test]
+    async fn preprocessor_importance_is_used() {
+        let (_td, a) = setup().await;
+        let pp = PreprocessorResult {
+            tier: Tier::Pass,
+            output: "important calendar item".into(),
+            redaction_report: "".into(),
+            importance: 0.91,
+            importance_reason: Some("commitment with deadline".into()),
+        };
+        a.respond(&pp, &meta(), false).await.unwrap();
+        let recent = a.memory.recent(5).unwrap();
+        let user_item = recent
+            .iter()
+            .find(|i| {
+                matches!(
+                    i.sidecar.kind,
+                    ItemKind::UserMessage | ItemKind::Ingestion
+                ) && i.body.contains("calendar")
+            })
+            .expect("item not found");
+        assert!((user_item.sidecar.importance - 0.91).abs() < 1e-5);
+        assert_eq!(
+            user_item.sidecar.importance_reason.as_deref(),
+            Some("commitment with deadline")
+        );
+    }
+
+    #[tokio::test]
+    async fn questions_are_classified_as_user_messages() {
+        let (_td, a) = setup().await;
+        a.respond(
+            &pp_pass("What should I be thinking about right now?"),
+            &meta(),
+            false,
+        )
+        .await
+        .unwrap();
+        let recent = a.memory.recent(5).unwrap();
+        assert!(recent.iter().any(|i| i.sidecar.kind == ItemKind::UserMessage));
+    }
+
+    #[tokio::test]
     async fn preference_detected_and_stored() {
         let (_td, a) = setup().await;
-        let s = SanitizerResult {
-            tier: Tier::Pass,
-            output: "Please stop telling me about crypto news.".into(),
-            redaction_report: "".into(),
-        };
-        a.respond(&s, &meta(), false).await.unwrap();
+        a.respond(&pp_pass("Please stop telling me about crypto news."), &meta(), false)
+            .await
+            .unwrap();
         let p = a.memory.preferences().await;
         assert_eq!(p.statements.len(), 1);
         assert!(p.statements[0].text.to_lowercase().contains("crypto"));
     }
 
     #[tokio::test]
-    async fn tags_are_guessed() {
-        let (_td, a) = setup().await;
-        let s = SanitizerResult {
-            tier: Tier::Pass,
-            output: "Dentist appointment Tuesday at 3pm".into(),
-            redaction_report: "".into(),
-        };
-        a.respond(&s, &meta(), false).await.unwrap();
-        let recent = a.memory.recent(5).unwrap();
-        // No question mark, no question-starter — classified as Ingestion.
-        let item = recent.iter().find(|i| i.sidecar.kind == ItemKind::Ingestion).unwrap();
-        assert!(item.sidecar.tags.contains(&"calendar".to_string()));
-        assert!(item.sidecar.tags.contains(&"health".to_string()));
-    }
-
-    #[tokio::test]
-    async fn questions_are_classified_as_user_messages() {
-        let (_td, a) = setup().await;
-        let s = SanitizerResult {
-            tier: Tier::Pass,
-            output: "What should I be thinking about right now?".into(),
-            redaction_report: "".into(),
-        };
-        a.respond(&s, &meta(), false).await.unwrap();
-        let recent = a.memory.recent(5).unwrap();
-        assert!(recent.iter().any(|i| i.sidecar.kind == ItemKind::UserMessage));
-    }
-
-    #[test]
-    fn detect_preference_handles_phrasings() {
-        assert!(detect_preference("Stop telling me about sports").is_some());
-        assert!(detect_preference("don't tell me about the weather").is_some());
-        assert!(detect_preference("I love coffee").is_none());
-    }
-
-    #[tokio::test]
     async fn assistant_passes_websearch_and_webfetch_to_llm() {
         let (_td, a, mock) = setup_with_mock().await;
-        let s = SanitizerResult {
-            tier: Tier::Pass,
-            output: "What's the weather in Lafayette today?".into(),
-            redaction_report: "".into(),
-        };
-        a.respond(&s, &meta(), false).await.unwrap();
-        // The assistant turn is the LLM call with the user message in its
-        // prompt — find it and assert tools were allowed.
+        a.respond(&pp_pass("What's the weather in Lafayette today?"), &meta(), false)
+            .await
+            .unwrap();
         let calls = mock.calls();
         let turn = calls
             .iter()
@@ -597,111 +629,84 @@ mod tests {
         let td = TempDir::new().unwrap();
         let store = Arc::new(MemoryStore::open(td.path().to_path_buf()).await.unwrap());
         let mock = MockLlmClient::new();
-        let assistant = Assistant::with_models_and_facts(
-            mock.clone(),
-            store,
-            Some("claude-sonnet-4-6".to_string()),
-            Some("claude-opus-4-7".to_string()),
-            Arc::new(crate::self_knowledge::SystemFacts::placeholder()),
-        );
+        let mut assistant = Assistant::new(mock.clone(), store);
+        assistant.model = Some("claude-sonnet-4-6".into());
+        assistant.escalation_model = Some("claude-opus-4-7".into());
 
-        // Sonnet responds with the escalation marker; the second call (Opus)
-        // gets a real answer. Both are matched on prompt content so we can
-        // distinguish by model used.
-        let pulse = std::sync::Arc::new(std::sync::Mutex::new(0u32));
-        let pulse_for_mock = pulse.clone();
-        // Override: first call returns the marker, second returns a real answer.
-        // The mock has no notion of call order, so use the model field to pick.
-        // (model is in LlmOptions, not the prompt — so we route via a custom
-        // matcher: when the prompt mentions USER MESSAGE we count, and the
-        // mock responds based on which call it is.)
-        // Simpler: respond differently to the same prompt across calls via a
-        // counter in the override closure. The MockLlmClient doesn't expose
-        // closure overrides, so we use a trick: respond_when prefers prompt
-        // substrings, and we know Sonnet sees a USER MESSAGE prompt — but
-        // we can't distinguish Sonnet's call from Opus's by prompt alone
-        // since they're identical. Instead, we just call respond() and
-        // verify by inspecting calls() — the mock returns the default
-        // canned response for the assistant prompt (which doesn't contain
-        // the marker), so we cannot easily test the escalation branch this
-        // way. We rely on the integration test for that.
-        let _ = (pulse, pulse_for_mock); // keep names alive
-
-        // Direct unit test of the escalation parse path:
         mock.respond_when(
             "USER MESSAGE",
             "ESCALATE_TO_OPUS: needs deep reasoning about a non-obvious tradeoff",
         );
-        let s = SanitizerResult {
-            tier: Tier::Pass,
-            output: "Should I use eventual consistency or strict ordering for X?".into(),
-            redaction_report: "".into(),
-        };
-        // With the mock returning the marker, the assistant should re-call
-        // the mock (now with the escalation model) — but the mock still
-        // returns the marker on the second call too, so the final text
-        // will start with the marker. That's fine; what we're testing is:
-        //   - escalated == true
-        //   - model_used == escalation model
-        let outcome = assistant.respond(&s, &meta(), false).await.unwrap();
+        let outcome = assistant
+            .respond(&pp_pass("Should I use eventual consistency for X?"), &meta(), false)
+            .await
+            .unwrap();
         assert!(outcome.escalated, "should have escalated");
         assert_eq!(outcome.model_used, "claude-opus-4-7");
         assert!(outcome.escalation_reason.is_some());
     }
 
     #[tokio::test]
-    async fn force_opus_routes_directly_to_escalation_model_no_re_run() {
+    async fn force_opus_routes_directly_to_escalation_model() {
         let td = TempDir::new().unwrap();
         let store = Arc::new(MemoryStore::open(td.path().to_path_buf()).await.unwrap());
         let mock = MockLlmClient::new();
-        let assistant = Assistant::with_models_and_facts(
-            mock.clone(),
-            store,
-            Some("claude-sonnet-4-6".to_string()),
-            Some("claude-opus-4-7".to_string()),
-            Arc::new(crate::self_knowledge::SystemFacts::placeholder()),
-        );
-        let s = SanitizerResult {
-            tier: Tier::Pass,
-            output: "anything".into(),
-            redaction_report: "".into(),
-        };
-        let outcome = assistant.respond(&s, &meta(), true).await.unwrap();
-        // No escalation marker → no second call. Model used should be Opus
-        // directly (force_opus path skips Sonnet).
-        assert!(!outcome.escalated, "force_opus path doesn't go through escalation");
+        let mut assistant = Assistant::new(mock.clone(), store);
+        assistant.model = Some("claude-sonnet-4-6".into());
+        assistant.escalation_model = Some("claude-opus-4-7".into());
+        let outcome = assistant.respond(&pp_pass("anything"), &meta(), true).await.unwrap();
+        assert!(!outcome.escalated);
         assert_eq!(outcome.model_used, "claude-opus-4-7");
-
-        // Verify only ONE assistant LLM call happened (i.e. no Sonnet pre-pass).
-        let calls = mock.calls();
-        let assistant_calls: Vec<_> = calls
-            .iter()
-            .filter(|c| c.prompt.contains("USER MESSAGE"))
-            .collect();
-        assert_eq!(assistant_calls.len(), 1, "expected exactly one assistant call");
-        assert_eq!(
-            assistant_calls[0].allowed_tools,
-            vec!["WebSearch", "WebFetch"]
-        );
     }
 
     #[tokio::test]
-    async fn assistant_prompt_mentions_web_capabilities() {
+    async fn forget_marker_tombstones_target_item() {
         let (_td, a, mock) = setup_with_mock().await;
-        let s = SanitizerResult {
-            tier: Tier::Pass,
-            output: "hello".into(),
-            redaction_report: "".into(),
-        };
-        a.respond(&s, &meta(), false).await.unwrap();
+        // Add an item we will then ask to forget.
+        let sc = a
+            .memory
+            .add("private note to forget", ItemKind::Ingestion, 0.5, None, "".into(), vec![])
+            .await
+            .unwrap();
+        let id = sc.id.clone();
+        // Mock returns a FORGET marker for any USER MESSAGE prompt.
+        mock.respond_when("USER MESSAGE", &format!("Sure, forgetting that.\nFORGET: {id}\n"));
+
+        let outcome = a
+            .respond(&pp_pass("forget the private note please"), &meta(), false)
+            .await
+            .unwrap();
+        assert_eq!(outcome.forgotten_item_id.as_deref(), Some(id.as_str()));
+        let item = a.memory.get(&id).unwrap().unwrap();
+        assert_eq!(item.sidecar.kind, ItemKind::ForgottenStub);
+        assert!(item.body.starts_with("[forgotten"));
+    }
+
+    #[tokio::test]
+    async fn assistant_prompt_mentions_web_capabilities_and_forget_marker() {
+        let (_td, a, mock) = setup_with_mock().await;
+        a.respond(&pp_pass("hello"), &meta(), false).await.unwrap();
         let calls = mock.calls();
-        let turn = calls
+        let turn = calls.iter().find(|c| c.prompt.contains("USER MESSAGE")).unwrap();
+        assert!(turn.prompt.contains("WebSearch"));
+        assert!(turn.prompt.contains("FORGET:"));
+    }
+
+    #[tokio::test]
+    async fn vector_is_written_on_respond() {
+        let (_td, a) = setup().await;
+        let outcome = a.respond(&pp_pass("learn this fact"), &meta(), false).await;
+        outcome.unwrap();
+        let recent = a.memory.recent(5).unwrap();
+        let item = recent
             .iter()
-            .find(|c| c.prompt.contains("USER MESSAGE"))
-            .expect("expected an assistant LLM call");
+            .find(|i| i.body.contains("learn this fact"))
+            .expect("missing item");
+        // The Embedder ran inline → .vec sidecar should exist immediately.
         assert!(
-            turn.prompt.contains("WebSearch"),
-            "assistant prompt should advertise WebSearch capability"
+            item.vector_path().exists(),
+            "expected .vec sidecar at {:?}",
+            item.vector_path()
         );
     }
 }

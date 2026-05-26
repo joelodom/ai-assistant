@@ -83,12 +83,12 @@ pub struct AssistantApp {
 
     show_settings: bool,
 
-    /// HAZMAT toggle: when true, the next message bypasses the Sanitizer.
+    /// HAZMAT toggle: when true, the next message bypasses the Security Preprocessor.
     /// Sticky within a session (does not auto-clear after send) so the user
     /// can run a sequence of bypass messages, but always resets to false
     /// on app startup. A bright red indicator in the UI makes the state
     /// impossible to miss.
-    bypass_sanitizer: bool,
+    bypass_preprocessor: bool,
 
     /// Force the assistant to route directly to the heavier model (Opus),
     /// skipping the default Sonnet pre-pass.
@@ -144,7 +144,7 @@ impl AssistantApp {
             input_buf: String::new(),
             pending_attachments: Vec::new(),
             show_settings: false,
-            bypass_sanitizer: false,
+            bypass_preprocessor: false,
             force_opus: false,
             applied_scale: prefs.ui_scale,
             prefs,
@@ -234,15 +234,15 @@ impl AssistantApp {
             return;
         }
         let attachments = std::mem::take(&mut self.pending_attachments);
-        let hazmat = self.bypass_sanitizer;
+        let hazmat = self.bypass_preprocessor;
         let force_opus = self.force_opus;
         // Mark hazmat / opus in the local transcript so the user sees what
         // routing applied — they should never wonder later whether a message
-        // went through the Gate or which model handled it.
+        // went through the Preprocessor or which model handled it.
         let body = render_user_outgoing(&text, &attachments);
         let display = match (hazmat, force_opus) {
             (true, true) => format!("☢ HAZMAT 🧠 OPUS\n{body}"),
-            (true, false) => format!("☢ HAZMAT (sanitizer bypassed)\n{body}"),
+            (true, false) => format!("☢ HAZMAT (Preprocessor bypassed)\n{body}"),
             (false, true) => format!("🧠 OPUS (forced)\n{body}"),
             (false, false) => body,
         };
@@ -256,7 +256,7 @@ impl AssistantApp {
                 attachments,
             },
             metadata: self.current_metadata(),
-            bypass_sanitizer: hazmat,
+            bypass_preprocessor: hazmat,
             force_opus,
         };
         let _ = self.ui_tx.send(UiToNet::Send(msg));
@@ -603,19 +603,19 @@ impl eframe::App for AssistantApp {
                         self.pick_files();
                     }
                     // HAZMAT toggle. Red when on; impossible to miss.
-                    let hazmat_label = if self.bypass_sanitizer {
-                        egui::RichText::new("☢ HAZMAT ON — bypassing sanitizer ☢")
+                    let hazmat_label = if self.bypass_preprocessor {
+                        egui::RichText::new("☢ HAZMAT ON — bypassing the Preprocessor ☢")
                             .color(egui::Color32::from_rgb(255, 60, 60))
                             .strong()
                     } else {
-                        egui::RichText::new("☢ Hazmat (bypass sanitizer)")
+                        egui::RichText::new("☢ HAZMAT (bypass the Preprocessor)")
                             .color(egui::Color32::from_rgb(200, 140, 80))
                     };
-                    ui.checkbox(&mut self.bypass_sanitizer, hazmat_label)
+                    ui.checkbox(&mut self.bypass_preprocessor, hazmat_label)
                         .on_hover_text(
-                            "DANGEROUS: when on, the next messages skip the Sanitizer (the Gate) \
+                            "DANGEROUS: when on, the next messages skip the Security Preprocessor \
                              and go directly to the Assistant. Use only when you know what you're \
-                             doing — the Sanitizer protects you from leaking secrets (2FA codes, \
+                             doing — the Preprocessor protects you from leaking secrets (2FA codes, \
                              reset links, account numbers) into long-term memory. The bypass is \
                              tagged in the memory audit trail. Toggle off when done.",
                         );
@@ -640,7 +640,7 @@ impl eframe::App for AssistantApp {
                         self.pending_attachments.len(),
                     ));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let send_label = if self.bypass_sanitizer {
+                        let send_label = if self.bypass_preprocessor {
                             egui::RichText::new("Send (HAZMAT)  ⌘↵")
                                 .color(egui::Color32::from_rgb(255, 80, 80))
                                 .strong()

@@ -2,7 +2,8 @@
 //!
 //! Invariants (do not relax):
 //!   1. No outbound actions, ever. Backend reads in / responds out only.
-//!   2. Raw input is ephemeral. Sanitizer is the only thing that sees it.
+//!   2. Raw input is ephemeral. The Security Preprocessor is the only thing
+//!      that sees it.
 //!   3. Everything stored is sanitized.
 
 use serde::{Deserialize, Serialize};
@@ -13,14 +14,19 @@ pub enum ClientMessage {
     Message {
         payload: MessagePayload,
         metadata: Metadata,
-        /// HAZMAT escape hatch. When true, the Sanitizer is skipped entirely
-        /// and this message goes directly to the Assistant. Use only when
-        /// the user has consciously chosen to bypass for a specific input
-        /// (e.g. they want the raw text reasoned over verbatim). The backend
-        /// logs a WARN and tags the resulting memory item with "hazmat" so
-        /// the bypass is auditable.
-        #[serde(default)]
-        bypass_sanitizer: bool,
+        /// HAZMAT escape hatch. When true, the Security Preprocessor is
+        /// skipped entirely and this message goes directly to the Assistant.
+        /// Use only when the user has consciously chosen to bypass for a
+        /// specific input (e.g. they want the raw text reasoned over
+        /// verbatim). The backend logs a WARN and tags the resulting memory
+        /// item with "hazmat" so the bypass is auditable.
+        ///
+        /// Wire field is `bypass_preprocessor`; the older name
+        /// `bypass_sanitizer` is accepted as a deserialization alias for
+        /// back-compat with older clients (forward-compatible reads
+        /// invariant).
+        #[serde(default, alias = "bypass_sanitizer")]
+        bypass_preprocessor: bool,
         /// When true, skip the default Sonnet path and route the Assistant
         /// call directly to the configured escalation model (Opus). Used
         /// when the user knows the question deserves the heavier model.

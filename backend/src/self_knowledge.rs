@@ -4,41 +4,40 @@
 //!
 //! Two layers:
 //!   1. **Static memory items**, seeded on startup. These describe stable
-//!      facts: the diode architecture, the Sanitizer's role, why each model
-//!      was chosen, what the assistant CAN'T do. They live as ordinary
-//!      `SelfKnowledge` items in memory so the assistant finds them through
-//!      its normal recent/search pipeline. Idempotent via a stable
-//!      `self:<slug>` tag.
+//!      facts: the diode, the Security Preprocessor, RAG architecture, what the assistant
+//!      CAN'T do. They live as ordinary `SelfKnowledge` items in memory
+//!      so the assistant finds them through its normal retrieval pipeline.
+//!      Idempotent via a stable `self:<slug>` tag.
 //!   2. **Runtime facts block**, recomputed per turn. Captures things that
 //!      change with config or runtime state — current models per role,
-//!      intervals, memory directory, item count. Injected into the
-//!      assistant's prompt.
-//!
-//! The assistant is free to add its own `SelfKnowledge` items during a
-//! conversation (e.g. "I made decision X today, here's why"); seeding only
-//! covers the developer-authored baseline.
+//!      intervals, embedding model, retrieval weights.
 
-use crate::config::{ClaudeCfg, CuratorCfg, MemoryCfg, ScoutCfg, ServerCfg};
+use crate::config::{ClaudeCfg, IndexerCfg, MemoryCfg, ScoutCfg, ServerCfg};
 use crate::memory::{ItemKind, MemoryStore};
+use crate::retrieval::RetrievalWeights;
 use anyhow::Result;
 use std::path::PathBuf;
 
-/// Runtime-snapshot facts the assistant gets in its prompt every turn. Cheap
-/// to construct; we rebuild fresh per turn so changes to config (after
-/// restart) are reflected immediately.
 #[derive(Debug, Clone)]
 pub struct SystemFacts {
-    pub sanitizer_model: String,
+    pub preprocessor_model: String,
     pub assistant_model: String,
-    pub curator_model: String,
+    pub assistant_escalation_model: String,
     pub scout_model: String,
-    pub curator_enabled: bool,
-    pub curator_interval_minutes: u64,
+    pub indexer_enabled: bool,
+    pub indexer_interval_minutes: u64,
+    pub indexer_batch_size: usize,
     pub scout_enabled: bool,
     pub scout_interval_minutes: u64,
     pub scout_pinned_topics: Vec<String>,
     pub memory_dir: PathBuf,
     pub server_addr: String,
+    pub embedding_model: String,
+    pub embedding_dim: usize,
+    pub retrieval_alpha: f32,
+    pub retrieval_beta: f32,
+    pub retrieval_gamma: f32,
+    pub retrieval_half_life_days: f32,
     pub build_version: String,
 }
 
@@ -46,71 +45,91 @@ impl SystemFacts {
     pub fn from_cfg(
         claude: &ClaudeCfg,
         memory: &MemoryCfg,
-        curator: &CuratorCfg,
+        indexer: &IndexerCfg,
         scout: &ScoutCfg,
         server: &ServerCfg,
+        retrieval: &RetrievalWeights,
+        embedding_model: &str,
+        embedding_dim: usize,
     ) -> Self {
         Self {
-            sanitizer_model: claude.model_for_sanitizer(),
+            preprocessor_model: claude.model_for_preprocessor(),
             assistant_model: claude.model_for_assistant(),
-            curator_model: claude.model_for_curator(),
+            assistant_escalation_model: claude.model_for_assistant_escalation(),
             scout_model: claude.model_for_scout(),
-            curator_enabled: curator.enabled,
-            curator_interval_minutes: curator.interval_minutes,
+            indexer_enabled: indexer.enabled,
+            indexer_interval_minutes: indexer.interval_minutes,
+            indexer_batch_size: indexer.batch_size,
             scout_enabled: scout.enabled,
             scout_interval_minutes: scout.interval_minutes,
             scout_pinned_topics: scout.pinned_topics.clone(),
             memory_dir: memory.dir.clone(),
             server_addr: server.addr.clone(),
+            embedding_model: embedding_model.to_string(),
+            embedding_dim,
+            retrieval_alpha: retrieval.alpha,
+            retrieval_beta: retrieval.beta,
+            retrieval_gamma: retrieval.gamma,
+            retrieval_half_life_days: retrieval.half_life_days,
             build_version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
 
-    /// Used in tests and as a default before runtime config is wired in.
     pub fn placeholder() -> Self {
         Self {
-            sanitizer_model: "(unset)".into(),
+            preprocessor_model: "(unset)".into(),
             assistant_model: "(unset)".into(),
-            curator_model: "(unset)".into(),
+            assistant_escalation_model: "(unset)".into(),
             scout_model: "(unset)".into(),
-            curator_enabled: false,
-            curator_interval_minutes: 0,
+            indexer_enabled: false,
+            indexer_interval_minutes: 0,
+            indexer_batch_size: 0,
             scout_enabled: false,
             scout_interval_minutes: 0,
             scout_pinned_topics: vec![],
             memory_dir: PathBuf::from("(unset)"),
             server_addr: "(unset)".into(),
+            embedding_model: "(unset)".into(),
+            embedding_dim: 0,
+            retrieval_alpha: 0.6,
+            retrieval_beta: 0.25,
+            retrieval_gamma: 0.15,
+            retrieval_half_life_days: 30.0,
             build_version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
 
-    /// Render a compact block to drop into the assistant's prompt. The
-    /// assistant uses this to answer questions like "what model are you
-    /// using?", "how often does the curator run?", "where is my data?".
     pub fn render_prompt_block(&self, memory_item_count: usize) -> String {
         let mut s = String::from("SYSTEM SELF-KNOWLEDGE (current runtime configuration — accurate as of this turn):\n");
         s.push_str(&format!("  • Build version: {}\n", self.build_version));
         s.push_str(&format!(
-            "  • Sanitizer (the Gate) model: {}\n",
-            self.sanitizer_model
+            "  • Security Preprocessor model: {}\n",
+            self.preprocessor_model
         ));
-        s.push_str(&format!("  • Assistant (Core) model: {}\n", self.assistant_model));
+        s.push_str(&format!("  • Assistant (Core) primary model: {}\n", self.assistant_model));
+        s.push_str(&format!("  • Assistant escalation model: {}\n", self.assistant_escalation_model));
         s.push_str(&format!(
-            "  • Curator model: {}  ({}, every {} min)\n",
-            self.curator_model,
-            if self.curator_enabled { "enabled" } else { "disabled" },
-            self.curator_interval_minutes,
-        ));
-        s.push_str(&format!(
-            "  • Scout model: {}  ({}, every {} min; topics inferred from memory{})\n",
+            "  • Scout model: {}  ({}, every {} min)\n",
             self.scout_model,
             if self.scout_enabled { "enabled" } else { "disabled" },
             self.scout_interval_minutes,
-            if self.scout_pinned_topics.is_empty() {
-                String::new()
-            } else {
-                format!("; pinned: {}", self.scout_pinned_topics.join(", "))
-            },
+        ));
+        s.push_str(&format!(
+            "  • Indexer: {}, every {} min, batch {} (mechanical, no LLM)\n",
+            if self.indexer_enabled { "enabled" } else { "disabled" },
+            self.indexer_interval_minutes,
+            self.indexer_batch_size,
+        ));
+        s.push_str(&format!(
+            "  • Embedder: {} ({}-dim)\n",
+            self.embedding_model, self.embedding_dim
+        ));
+        s.push_str(&format!(
+            "  • Retrieval weights: α(relevance)={:.2}, β(recency)={:.2}, γ(importance)={:.2}, half-life={} days\n",
+            self.retrieval_alpha,
+            self.retrieval_beta,
+            self.retrieval_gamma,
+            self.retrieval_half_life_days,
         ));
         s.push_str(&format!("  • Memory directory: {}\n", self.memory_dir.display()));
         s.push_str(&format!("  • Memory item count: {}\n", memory_item_count));
@@ -120,8 +139,6 @@ impl SystemFacts {
 }
 
 /// Developer-authored baseline self-knowledge. Stable across restarts.
-/// Each entry is (slug, body). Slug becomes the tag `self:<slug>` so we can
-/// find + update existing copies idempotently.
 fn baseline() -> Vec<(&'static str, String)> {
     vec![
         (
@@ -136,116 +153,109 @@ fn baseline() -> Vec<(&'static str, String)> {
         ),
         (
             "architecture",
-            "I am composed of four components running on a backend server:\n\
-             1. **Sanitizer (\"the Gate\")** — the first layer every message passes through, including \
-                the user's own questions. Three-tier: drop (security-only messages like 2FA codes), \
-                redact (sensitive but useful messages, like a deposit confirmation), or pass.\n\
-             2. **Assistant Core** — the only component the user actually talks to. Reads relevant \
-                memory, calls the LLM, returns a reply. Has read-only web access (WebSearch, WebFetch).\n\
-             3. **Curator** — runs periodically. Walks memory, ages items, summarizes aging items, \
-                collapses stale ones. Decay is by importance, not a fixed calendar.\n\
-             4. **Scout** — runs periodically (when enabled). Browses the web for the user's topics \
-                of interest, funnels findings through the Sanitizer, files them in memory.\n\
-             A native Mac client connects via WebSocket and provides a single chat surface for both \
-             data ingestion and conversation."
+            "I am composed of these components running on a backend server:\n\
+             1. **Security Preprocessor** (Preprocessor for short) — the first layer every message \
+                passes through. Three-tier classification (drop / redact / pass), in-line redaction, \
+                AND an importance score on [0, 1] that the retrieval system uses for ranking.\n\
+             2. **Assistant Core** — the only component the user talks to. Reads relevant memory \
+                via hybrid retrieval (vector + keyword + recency + importance), calls the LLM, \
+                returns a reply. Has read-only web access (WebSearch, WebFetch).\n\
+             3. **Embedder** — a local model (fastembed-rs) that turns sanitized text into \
+                vectors. Runs in-process, no external API calls.\n\
+             4. **Vector Index (HNSW)** — fast nearest-neighbor search. The graph file is a \
+                derived cache; the source of truth is the per-item `.vec` sidecars.\n\
+             5. **Indexer** — periodic mechanical worker (no LLM). Backfills missing `.vec` \
+                sidecars, compacts the HNSW graph, snapshots stats. Replaces the old Curator, \
+                which destructively summarized memory items.\n\
+             6. **Scout** — opt-in periodic web/news worker.\n\
+             A native Mac client connects via WebSocket."
+                .to_string(),
+        ),
+        (
+            "rag-retrieval",
+            "I use hybrid retrieval to decide which memory items to surface for each turn. The \
+             score for each candidate item is:\n\
+             \n\
+             final = α · relevance + β · recency + γ · importance\n\
+             \n\
+             where relevance = max(vector_cosine, keyword_rank), recency = exp(-age_days / \
+             half_life), and importance is the score the Preprocessor assigned at ingest time. \
+             Default weights are α=0.6, β=0.25, γ=0.15 with half_life=30 days; configurable in \
+             [retrieval] of config.toml.\n\
+             \n\
+             This means: a very strong semantic match from a year ago will still surface; a weak \
+             match from yesterday will still surface; a weak match from a year ago will be \
+             filtered out; a flagged-important item floats up regardless."
                 .to_string(),
         ),
         (
             "hazmat-bypass",
             "There is an explicit user-controlled escape hatch called HAZMAT mode. When the user \
-             ticks the \"☢ Hazmat (bypass sanitizer)\" checkbox in the client and sends a \
-             message, the Sanitizer is skipped entirely for that message and the raw content \
-             goes directly to the Assistant. This is a deliberate, opt-in violation of the \
-             usual \"Sanitizer sees everything\" rule, intended for cases where the user knows \
-             the content is safe and doesn't want it filtered (e.g. they're testing the \
-             assistant, or pasting a document they want reasoned over verbatim). Backend logs a \
-             WARN for every bypass. Memory items written from a bypass carry the `hazmat` tag \
-             and an elevated importance score (0.8) so they're easy to audit later — the user \
-             can ask \"show me everything I bypassed the sanitizer for\" and the assistant can \
-             find them. The bypass does NOT persist: each message requires the checkbox to be \
-             on at send time, and the checkbox is reset to off whenever the client restarts."
+             ticks the \"☢ HAZMAT\" checkbox in the client and sends a message, the Security \
+             Preprocessor is skipped entirely for that message and the raw content goes directly \
+             to the Assistant. The wire field is `bypass_preprocessor` (the older name `bypass_sanitizer` \
+             is accepted as a deserialization alias). Memory items written from a bypass carry \
+             the `hazmat` tag and an elevated importance (0.8). NO code path may set the bypass \
+             flag programmatically — only the human-pressed checkbox can."
                 .to_string(),
         ),
         (
-            "ephemeral-sanitizer",
-            "Critical security property: every time the Sanitizer runs, it gets a brand-new \
-             subprocess with NO shared session state. The raw input only lives on the request \
-             stack and inside that one subprocess; when the subprocess exits, the raw input is \
-             gone. It is never written to disk, never logged, never reaches the Assistant Core \
-             or long-term memory. Only the Sanitizer's structured output (a tier classification, \
-             a sanitized version of the message, and a non-sensitive redaction report) moves \
-             downstream. This is why I cannot \"remember exactly what you said\" if the Gate \
-             redacted parts of it — the original is gone."
+            "explicit-forget",
+            "I never silently forget things. The user can ask me to forget a specific memory \
+             (\"forget that\"), and I emit a `FORGET:` marker to the backend. The backend then \
+             tombstones the item: its body becomes `[forgotten <timestamp>]`, its kind becomes \
+             `ForgottenStub`, its `.vec` sidecar is deleted, and it's removed from the HNSW \
+             index. The sidecar metadata stays as audit. Reversible only from backup. Background \
+             workers do NOT delete or rewrite item bodies on their own."
+                .to_string(),
+        ),
+        (
+            "ephemeral-preprocessor",
+            "Critical security property: every time the Security Preprocessor runs, it gets a \
+             brand-new subprocess with NO shared session state. The raw input only lives on \
+             the request stack and inside that one subprocess; when the subprocess exits, the \
+             raw input is gone. It is never written to disk, never logged, never reaches the \
+             Assistant Core, the Embedder, or long-term memory. Only the Preprocessor's \
+             structured output (tier classification, sanitized text, redaction report, \
+             importance score) moves downstream."
+                .to_string(),
+        ),
+        (
+            "preprocessor-model-choice",
+            "The Preprocessor uses Claude Haiku 4.5 by default. Reasoning: it runs on EVERY \
+             message, so latency compounds; its job is pattern recognition (OTP codes, reset \
+             links, account numbers) plus structured JSON output (with an importance score) — \
+             both well within Haiku's capabilities. Configurable via `[claude].preprocessor_model` \
+             (the legacy field `sanitizer_model` is also accepted)."
                 .to_string(),
         ),
         (
             "assistant-model-routing",
-            "The Assistant defaults to Claude Sonnet 4.6 — fast and strong enough for the \
-             vast majority of conversation. There are two ways to invoke the heavier model \
-             (Opus 4.7):\n\
-             \n\
-             1. Self-escalation: Sonnet can hand off when it judges a question genuinely \
-                needs deeper reasoning. It does this by replying with exactly \
-                `ESCALATE_TO_OPUS: <short reason>` as its entire response. The backend \
-                detects the marker, re-runs the same prompt against Opus, and the user \
-                receives Opus's answer. Memory items from escalated turns are tagged \
-                `escalated` so the audit trail makes routing visible. Sonnet is instructed \
-                to escalate only when Opus would meaningfully outperform — not for routine \
-                recall, light reasoning, or casual chat.\n\
-             2. User-forced: the client exposes a \"🧠 Opus\" checkbox. When ticked, the \
-                message goes with `force_opus=true`; the backend skips Sonnet entirely \
-                and routes straight to Opus. Memory is tagged `force-opus`.\n\
-             \n\
-             The user-visible reply includes a \"🧠 Handing off to <model> for deeper \
-             reasoning\" preamble when an escalation happens, so the user knows which \
-             model produced the answer. Configurable via `[claude].assistant_model` and \
-             `[claude].assistant_escalation_model` in `config.toml`."
+            "The Assistant defaults to Claude Sonnet 4.6. Two ways to invoke the heavier Opus 4.7:\n\
+             1. Self-escalation: Sonnet replies with exactly `ESCALATE_TO_OPUS: <reason>` as its \
+                entire response. The backend detects the marker, re-runs the same prompt against \
+                Opus, and the user receives Opus's answer.\n\
+             2. User-forced: the client exposes a \"🧠 Opus\" checkbox. When ticked, the message \
+                goes with `force_opus=true`; the backend skips Sonnet and routes straight to \
+                Opus."
                 .to_string(),
         ),
         (
-            "sanitizer-model-choice",
-            "The Sanitizer uses Claude Haiku 4.5 by default. Reasoning: the Sanitizer runs on \
-             EVERY message, so latency compounds; its job is pattern recognition (OTP codes, \
-             reset links, account numbers) plus structured JSON output — both well within \
-             Haiku's capabilities; and the threat model is defending against well-known patterns \
-             of direct account takeover, not novel social engineering. A user worried about \
-             subtle attacks can bump it to Sonnet via `[claude].sanitizer_model` in `config.toml`."
+            "indexer-design",
+            "The Indexer is a small periodic mechanical worker. It does NOT call the LLM, does \
+             NOT destructively rewrite memory items, does NOT delete things on its own. Its \
+             jobs: (1) find items missing a `.vec` sidecar and embed them via the local \
+             Embedder; (2) detect embedding-model changes and trigger a re-embed; (3) \
+             checkpoint the HNSW manifest; (4) log stats. It runs every few minutes; the \
+             interval and batch size are in `[indexer]` of config.toml."
                 .to_string(),
         ),
         (
             "scout-design-choices",
-            "The Scout is OPT-IN (disabled by default). Reasons: it spends tokens silently in \
-             the background on a ~10 min interval, and on a fresh install with no memory it \
-             can't yet infer what the user cares about. Enable via `[scout].enabled = true` in \
-             `config.toml` once the assistant has accumulated enough memory to be useful. \
-             The model is Claude Sonnet 4.6 — web summarization and triage is well within \
-             Sonnet's range; Opus would be wasted spend.\n\
-             \n\
-             The Scout has NO hardcoded topic list. Each tick it reads the user's recent memory \
-             and stored preferences, infers what the user cares about, and searches accordingly. \
-             If memory is thin, it falls back to base-rate human interests for the user's \
-             location (major news, severe-weather alerts, broadly relevant science/tech) and \
-             marks those bullets with \"[base rate — limited memory]\" so the user knows. \
-             Time-sensitive items (severe weather, breaking news affecting the user's region) \
-             are always included regardless of inferred interests. The user can pin specific \
-             topics via `[scout].pinned_topics` if they want a guaranteed sweep that doesn't \
-             rely on inference, but normally you'd just tell the assistant (\"keep an eye on \
-             Boston Celtics news\") and the preference + memory pipeline picks it up next tick. \
-             Findings go through the Sanitizer (with PublicWeb provenance) before landing in \
-             memory."
-                .to_string(),
-        ),
-        (
-            "curator-model-choice",
-            "The Curator uses Claude Sonnet 4.6 by default — NOT Haiku, even though it's a \
-             summarization task. Reasoning: the Curator is the only component that destructively \
-             rewrites memory items (the summary replaces the original body). Its mistakes are \
-             silent and permanent — a buried name or offhand date that turns out to matter later \
-             just vanishes. Sanitizer mistakes are noisy (the user notices an over-redaction and \
-             re-sends), Assistant mistakes are correctable in the next turn, but Curator mistakes \
-             are unrecoverable. The Curator runs every 60 min in the background, so latency \
-             isn't load-bearing the way it is for the Sanitizer. Override via \
-             `[claude].curator_model`."
+            "The Scout is OPT-IN (disabled by default). On enable, each tick it reads recent \
+             memory + stored preferences, infers what the user cares about, and searches the \
+             web. Findings go through the Preprocessor (with PublicWeb provenance) before \
+             landing in memory."
                 .to_string(),
         ),
         (
@@ -256,59 +266,54 @@ fn baseline() -> Vec<(&'static str, String)> {
              - 2FA / MFA / OTP codes\n\
              - Password reset links and tokens\n\
              - API keys, access tokens, session tokens, recovery codes\n\
-             - Full bank account numbers, card numbers, routing numbers, wire/ACH/ETF identifiers\n\
+             - Full bank account numbers, card numbers, routing numbers, wire/ACH identifiers\n\
              It IS OK to remember and reason about: birthdays, family schedules, vacation dates, \
-             \"house empty next Tuesday\" implications, job interviews, calendar events, names of \
-             banks/companies, types of events (\"a deposit was confirmed\"), and rough dollar \
-             amounts when not tied to an actionable identifier."
+             job interviews, calendar events, names of banks/companies, rough dollar amounts \
+             when not tied to an actionable identifier."
                 .to_string(),
         ),
         (
-            "memory-decay",
-            "I do not keep everything forever. The Curator runs periodically and walks all \
-             memory items: Fresh items (recent) are kept in full. Aging items get summarized \
-             into a short paragraph that preserves names, dates, and key facts but drops bulk. \
-             Stale items (very old, low importance) collapse to a one-line pointer or get \
-             dropped. Decay is driven by importance × age, not a fixed schedule, so important \
-             items (a major life event) outlast trivial bulk (a privacy-policy email). Photos \
-             eventually become text summaries; the pixels are discarded."
+            "no-automatic-decay",
+            "I do not silently forget things. There is no Curator anymore — the old design \
+             destructively summarized aging items, which meant any small fact that turned out \
+             to matter later might just vanish. With RAG retrieval, large memory doesn't \
+             pollute the prompt (the assistant only sees the top-K retrieved items per turn), \
+             so the original motivation for decay is gone."
                 .to_string(),
         ),
         (
             "how-to-use-me",
             "Hand me anything you want me to remember — paste an email, jot a note, drop a \
-             calendar entry, describe a document. If your message doesn't contain a question, \
-             I treat it as data to keep. Ask me anything about your life that I might know from \
-             what you've given me, or about the world (I'll search the web when helpful). Tell \
-             me to forget things (\"stop telling me about crypto news\") and I'll save that as \
-             a persistent preference. Acknowledge things (\"I finished that task\") and I'll \
-             update item state."
+             calendar entry, describe a document. If your message doesn't contain a question, I \
+             treat it as data. Ask me anything about your life or the world. Tell me to forget \
+             things and I'll save that as a preference; ask me to forget a specific memory and \
+             I'll tombstone it."
                 .to_string(),
         ),
         (
             "error-handling",
-            "When the Sanitizer fails (out of tokens, malformed JSON, network error), I drop the \
-             input WITHOUT inspecting it — preserving the ephemerality guarantee — and write an \
-             audit record (kind=sanitizer_error) so I can tell the user what happened. When the \
-             Assistant Core fails (after the Sanitizer succeeded), the user's already-sanitized \
-             message is in memory; I add an assistant_error record paired with it. You can ask \
-             \"have you had any errors recently?\" and I'll find these records."
+            "When the Preprocessor fails (out of tokens, malformed JSON, network error), I drop \
+             the input WITHOUT inspecting it — preserving the ephemerality guarantee — and write \
+             an audit record (kind=preprocessor_error). When the Assistant fails after a \
+             successful preprocess, the user's sanitized message is in memory; I add an \
+             `assistant_error` record paired with it."
                 .to_string(),
         ),
         (
             "where-data-lives",
-            "Everything I remember lives in a single directory on disk (the \"memory directory\"). \
-             Each item is a plain-text body file plus a small JSON sidecar of metadata. All writes \
-             go through a temp-file-then-rename atomic pattern so a crash mid-write cannot corrupt \
-             items. The backup procedure is `tar czf data.tgz <memory-dir>`. The backend can be \
-             pointed at a different directory with `--memory-dir <path>` or `AI_ASSISTANT_MEMORY_DIR`."
+            "Everything I remember lives in a single directory on disk. Each item is a plain-text \
+             body file, a small JSON sidecar of metadata, and a tiny `.vec` binary sidecar \
+             holding its embedding vector. Stubs (drop notices) live in a separate `stubs/` \
+             directory. A `hnsw/` directory holds the vector search index — but that's a \
+             DERIVED CACHE, rebuildable from the `.vec` sidecars; you can delete it without \
+             losing data. All writes are atomic (temp file + rename). Backup is just `tar czf \
+             data.tgz <memory-dir>`. Restores work even when partial — the Indexer rebuilds \
+             whatever's missing."
                 .to_string(),
         ),
     ]
 }
 
-/// Idempotently write/update the baseline self-knowledge items. Safe to call
-/// on every startup; runs once and skips items that are already current.
 pub async fn seed_baseline(memory: &MemoryStore) -> Result<()> {
     let existing = memory.scan_all().unwrap_or_default();
     for (slug, body) in baseline() {
@@ -317,9 +322,7 @@ pub async fn seed_baseline(memory: &MemoryStore) -> Result<()> {
             .iter()
             .find(|it| it.sidecar.kind == ItemKind::SelfKnowledge && it.sidecar.tags.contains(&tag));
         match existing_for_slug {
-            Some(item) if item.body == body => {
-                // Up to date; nothing to do.
-            }
+            Some(item) if item.body == body => { /* already current */ }
             Some(item) => {
                 memory.update_item(item, Some(&body), |_| {}).await?;
             }
@@ -368,26 +371,11 @@ mod tests {
     }
 
     #[test]
-    fn runtime_block_lists_each_role_model() {
-        let f = SystemFacts {
-            sanitizer_model: "claude-haiku-4-5".into(),
-            assistant_model: "claude-opus-4-7".into(),
-            curator_model: "claude-haiku-4-5".into(),
-            scout_model: "claude-opus-4-7".into(),
-            curator_enabled: true,
-            curator_interval_minutes: 60,
-            scout_enabled: false,
-            scout_interval_minutes: 10,
-            scout_pinned_topics: vec!["tech news".into()],
-            memory_dir: PathBuf::from("./memory"),
-            server_addr: "127.0.0.1:8765".into(),
-            build_version: "0.1.0".into(),
-        };
+    fn runtime_block_lists_embedder_and_retrieval() {
+        let f = SystemFacts::placeholder();
         let s = f.render_prompt_block(42);
-        assert!(s.contains("claude-haiku-4-5"));
-        assert!(s.contains("Sanitizer"));
-        assert!(s.contains("Curator"));
-        assert!(s.contains("Scout"));
+        assert!(s.contains("Embedder"));
+        assert!(s.contains("Retrieval weights"));
         assert!(s.contains("42"));
     }
 }

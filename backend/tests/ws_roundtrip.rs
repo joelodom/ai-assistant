@@ -21,7 +21,7 @@ async fn full_roundtrip_with_mock_llm() {
     cfg.memory.dir = memory_dir;
     cfg.server.addr = addr_str.clone();
     cfg.scout.enabled = false;
-    cfg.curator.enabled = false;
+    cfg.indexer.enabled = false;
 
     tokio::spawn(async move {
         let built = backend::build_app(cfg).await.unwrap();
@@ -30,7 +30,7 @@ async fn full_roundtrip_with_mock_llm() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
 
     let url = format!("ws://{addr}/ws");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url)
@@ -63,7 +63,7 @@ async fn full_roundtrip_with_mock_llm() {
             geolocation: None,
             freeform: serde_json::Value::Null,
         },
-        bypass_sanitizer: false,
+        bypass_preprocessor: false,
         force_opus: false,
     };
     ws.send(Message::Text(serde_json::to_string(&msg).unwrap()))
@@ -113,29 +113,29 @@ async fn sanitizer_drop_path_emits_stub_notice_and_persists_only_stub() {
     cfg.memory.dir = memory_dir.clone();
     cfg.server.addr = addr_str.clone();
     cfg.scout.enabled = false;
-    cfg.curator.enabled = false;
+    cfg.indexer.enabled = false;
 
     // Build app, override the LLM with a mock that forces Tier::Drop for the
     // sanitizer prompt.
     let built = backend::build_app(cfg).await.unwrap();
     let mock = backend::claude::MockLlmClient::new();
     mock.respond_when(
-        "SANITIZER_TASK",
-        r#"{"tier":"drop","output":"Received and dropped a security message.","redaction_report":"likely 2FA"}"#,
+        "PREPROCESSOR_TASK",
+        r#"{"tier":"drop","output":"Received and dropped a security message.","redaction_report":"likely 2FA","importance":0.0}"#,
     );
     let sanitizer = std::sync::Arc::new(backend::sanitizer::Sanitizer::new(mock.clone()));
     let assistant = std::sync::Arc::new(backend::assistant::Assistant::new(
         mock.clone(),
         built.memory.clone(),
     ));
-    let state = backend::ws::AppState { sanitizer, assistant };
+    let state = backend::ws::AppState { preprocessor: sanitizer, assistant };
 
     tokio::spawn(async move {
         let app = backend::ws::router(state);
         let listener = tokio::net::TcpListener::bind(&addr_str).await.unwrap();
         axum::serve(listener, app).await.unwrap();
     });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
 
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
@@ -156,7 +156,7 @@ async fn sanitizer_drop_path_emits_stub_notice_and_persists_only_stub() {
             geolocation: None,
             freeform: serde_json::Value::Null,
         },
-        bypass_sanitizer: false,
+        bypass_preprocessor: false,
         force_opus: false,
     };
     ws.send(Message::Text(serde_json::to_string(&msg).unwrap()))
@@ -211,7 +211,7 @@ async fn self_knowledge_is_in_assistant_prompt() {
     cfg.memory.dir = memory_dir.clone();
     cfg.server.addr = addr_str.clone();
     cfg.scout.enabled = false;
-    cfg.curator.enabled = false;
+    cfg.indexer.enabled = false;
     // Confirm Haiku really is the sanitizer default.
     assert_eq!(cfg.claude.model_for_sanitizer(), "claude-haiku-4-5");
 
@@ -229,13 +229,13 @@ async fn self_knowledge_is_in_assistant_prompt() {
         facts,
     ));
     let sanitizer = std::sync::Arc::new(backend::sanitizer::Sanitizer::new(mock.clone()));
-    let state = backend::ws::AppState { sanitizer, assistant };
+    let state = backend::ws::AppState { preprocessor: sanitizer, assistant };
     tokio::spawn(async move {
         let app = backend::ws::router(state);
         let listener = tokio::net::TcpListener::bind(&addr_str).await.unwrap();
         axum::serve(listener, app).await.unwrap();
     });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
 
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
@@ -255,7 +255,7 @@ async fn self_knowledge_is_in_assistant_prompt() {
                 geolocation: None,
                 freeform: serde_json::Value::Null,
             },
-            bypass_sanitizer: false,
+            bypass_preprocessor: false,
             force_opus: false,
         })
         .unwrap(),
@@ -316,7 +316,7 @@ async fn hazmat_bypass_skips_sanitizer_and_tags_memory() {
     cfg.memory.dir = memory_dir.clone();
     cfg.server.addr = addr_str.clone();
     cfg.scout.enabled = false;
-    cfg.curator.enabled = false;
+    cfg.indexer.enabled = false;
     let built = backend::build_app(cfg).await.unwrap();
 
     // Wire our own mock so we can inspect the calls.
@@ -328,13 +328,13 @@ async fn hazmat_bypass_skips_sanitizer_and_tags_memory() {
         None,
         built.state.assistant.system_facts.clone(),
     ));
-    let state = backend::ws::AppState { sanitizer, assistant };
+    let state = backend::ws::AppState { preprocessor: sanitizer, assistant };
     tokio::spawn(async move {
         let app = backend::ws::router(state);
         let listener = tokio::net::TcpListener::bind(&addr_str).await.unwrap();
         axum::serve(listener, app).await.unwrap();
     });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
 
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
@@ -355,7 +355,7 @@ async fn hazmat_bypass_skips_sanitizer_and_tags_memory() {
             geolocation: None,
             freeform: serde_json::Value::Null,
         },
-        bypass_sanitizer: true,
+        bypass_preprocessor: true,
         force_opus: false,
     };
     ws.send(Message::Text(serde_json::to_string(&msg).unwrap()))
@@ -428,7 +428,7 @@ async fn sanitizer_failure_drops_input_persists_audit_and_notifies_user() {
     cfg.memory.dir = memory_dir.clone();
     cfg.server.addr = addr_str.clone();
     cfg.scout.enabled = false;
-    cfg.curator.enabled = false;
+    cfg.indexer.enabled = false;
     let memory = std::sync::Arc::new(
         backend::memory::MemoryStore::open(cfg.memory.dir.clone()).await.unwrap()
     );
@@ -441,14 +441,14 @@ async fn sanitizer_failure_drops_input_persists_audit_and_notifies_user() {
         failing.clone(),
         memory.clone(),
     ));
-    let state = backend::ws::AppState { sanitizer, assistant };
+    let state = backend::ws::AppState { preprocessor: sanitizer, assistant };
 
     tokio::spawn(async move {
         let app = backend::ws::router(state);
         let listener = tokio::net::TcpListener::bind(&addr_str).await.unwrap();
         axum::serve(listener, app).await.unwrap();
     });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
 
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
         .await
@@ -467,7 +467,7 @@ async fn sanitizer_failure_drops_input_persists_audit_and_notifies_user() {
             geolocation: None,
             freeform: serde_json::Value::Null,
         },
-        bypass_sanitizer: false,
+        bypass_preprocessor: false,
         force_opus: false,
     };
     ws.send(Message::Text(serde_json::to_string(&msg).unwrap()))
@@ -486,7 +486,7 @@ async fn sanitizer_failure_drops_input_persists_audit_and_notifies_user() {
     let parsed: ServerMessage = serde_json::from_str(&txt).unwrap();
     match parsed {
         ServerMessage::StubNotice { text } => {
-            assert!(text.contains("Gate"), "stub: {text}");
+            assert!(text.contains("Preprocessor"), "stub: {text}");
             assert!(text.contains("dropped"), "stub: {text}");
         }
         other => panic!("expected StubNotice on sanitizer failure, got {other:?}"),
@@ -498,7 +498,7 @@ async fn sanitizer_failure_drops_input_persists_audit_and_notifies_user() {
     for entry in walkdir::WalkDir::new(&memory_dir).into_iter().flatten() {
         if entry.file_type().is_file() {
             if let Ok(text) = std::fs::read_to_string(entry.path()) {
-                if text.contains("Sanitizer failed") {
+                if text.contains("Preprocessor failed") || text.contains("Sanitizer failed") {
                     saw_audit = true;
                 }
                 if text.contains("secret personal data") {

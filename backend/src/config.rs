@@ -1,3 +1,14 @@
+//! Runtime configuration. Read from `config.toml` if present, else use
+//! built-in defaults. All fields are `#[serde(default)]` and tolerate
+//! unknown keys (Invariant #7: forward-compatible reads — old config files
+//! continue to load).
+//!
+//! The legacy `[curator]` section is accepted on load and ignored — the
+//! Curator has been removed in favor of the Indexer, which is configured
+//! under `[indexer]`. Same story for `sanitizer_model` (now
+//! `preprocessor_model`).
+
+use crate::retrieval::RetrievalWeights;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -8,7 +19,13 @@ pub struct Config {
     pub memory: MemoryCfg,
     pub claude: ClaudeCfg,
     pub scout: ScoutCfg,
-    pub curator: CuratorCfg,
+    pub indexer: IndexerCfg,
+    pub retrieval: RetrievalWeights,
+    /// Legacy section. Accepted on load and ignored — the Curator is gone.
+    /// Kept as a typed-but-unused field so old TOML files with a `[curator]`
+    /// section still deserialize cleanly.
+    #[serde(default, alias = "curator")]
+    pub _legacy_curator: Option<toml::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,7 +38,9 @@ pub struct ServerCfg {
 #[serde(default)]
 pub struct MemoryCfg {
     pub dir: PathBuf,
-    /// How many recent items to surface to the assistant by default.
+    /// How many recent items to surface (kept for back-compat — retrieval
+    /// now folds recency into a single score, but this is still used as a
+    /// safety floor in some paths).
     pub recent_window: usize,
 }
 
@@ -29,28 +48,25 @@ pub struct MemoryCfg {
 #[serde(default)]
 pub struct ClaudeCfg {
     pub binary: String,
-    /// Default model for roles that don't override. The roles below
-    /// individually override when set; leaving them None means "use `model`".
     pub model: String,
-    /// Sanitizer runs on every turn and does tight pattern-recognition +
-    /// structured JSON output — Haiku is fast and reliable for this.
-    pub sanitizer_model: Option<String>,
-    /// Assistant Core does memory-aware reasoning. Default is Sonnet (fast +
-    /// strong); when Sonnet judges a question needs deeper reasoning, it
-    /// self-escalates to `assistant_escalation_model` (or the user can force
-    /// via the `force_opus` message flag).
+    /// Security Preprocessor model. Runs on every turn; latency matters.
+    /// Accepts the legacy field name `sanitizer_model` for back-compat.
+    #[serde(alias = "sanitizer_model")]
+    pub preprocessor_model: Option<String>,
+    /// Assistant Core does memory-aware reasoning. Default Sonnet, with
+    /// self-escalation to the escalation model when needed.
     pub assistant_model: Option<String>,
-    /// Model used when Sonnet self-escalates or the user forces Opus.
-    /// Defaults to the configured `model` (typically Opus 4.7).
+    /// Escalation target when Sonnet self-escalates or the user forces Opus.
     pub assistant_escalation_model: Option<String>,
-    /// Curator summarizes aging items — Haiku is plenty.
-    pub curator_model: Option<String>,
-    /// Scout browses the web and synthesizes findings.
+    /// Scout: web summarization + triage.
     pub scout_model: Option<String>,
     /// Per-call timeout in seconds.
     pub timeout_secs: u64,
-    /// Tools to allow the Scout and Assistant (sanitizer never gets tools).
+    /// Tools to allow the Scout and Assistant.
     pub scout_allowed_tools: Vec<String>,
+    /// Legacy: ignored. The Curator no longer exists.
+    #[serde(default)]
+    pub curator_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,25 +74,17 @@ pub struct ClaudeCfg {
 pub struct ScoutCfg {
     pub enabled: bool,
     pub interval_minutes: u64,
-    /// Optional explicit topics the user wants the Scout to always watch.
-    /// Normally empty — the Scout infers topics from the user's memory and
-    /// preferences each tick. Use this only when you want to pin a topic
-    /// you don't trust the inference to surface (e.g. a niche industry
-    /// newsletter the user reads but rarely mentions).
     pub pinned_topics: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct CuratorCfg {
+pub struct IndexerCfg {
     pub enabled: bool,
     pub interval_minutes: u64,
-    /// Items younger than this are always Fresh.
-    pub fresh_age_hours: u64,
-    /// Items older than fresh but younger than this can be summarized.
-    pub aging_age_days: u64,
-    /// Items older than this can be collapsed to a one-liner.
-    pub stale_age_days: u64,
+    /// How many items to embed per tick. Keeps a bulk Gmail import from
+    /// hammering the embedder in a single burst.
+    pub batch_size: usize,
 }
 
 impl Default for Config {
@@ -86,7 +94,9 @@ impl Default for Config {
             memory: MemoryCfg::default(),
             claude: ClaudeCfg::default(),
             scout: ScoutCfg::default(),
-            curator: CuratorCfg::default(),
+            indexer: IndexerCfg::default(),
+            retrieval: RetrievalWeights::default(),
+            _legacy_curator: None,
         }
     }
 }
@@ -113,34 +123,29 @@ impl Default for ClaudeCfg {
         Self {
             binary: "claude".to_string(),
             model: "claude-opus-4-7".to_string(),
-            sanitizer_model: Some("claude-haiku-4-5".to_string()),
-            // Sonnet by default: faster + cheaper than Opus, and strong
-            // enough for the vast majority of conversation. When a question
-            // genuinely needs Opus-grade reasoning, Sonnet self-escalates
-            // via the ESCALATE_TO_OPUS marker. The user can also force
-            // Opus via the client toggle (force_opus on a per-message basis).
+            // Preprocessor runs on every turn and does pattern recognition +
+            // structured JSON output — Haiku is fast and reliable.
+            preprocessor_model: Some("claude-haiku-4-5".to_string()),
+            // Assistant default: Sonnet. Self-escalates via ESCALATE_TO_OPUS
+            // when it judges Opus would meaningfully outperform.
             assistant_model: Some("claude-sonnet-4-6".to_string()),
             assistant_escalation_model: Some("claude-opus-4-7".to_string()),
-            // Sonnet, not Haiku: the Curator destructively rewrites items
-            // (the summary replaces the original body). Its mistakes are
-            // silent and permanent, so we err toward smarter compression
-            // over speed. The Curator runs in the background every 60 min;
-            // latency isn't load-bearing the way it is for the Sanitizer.
-            curator_model: Some("claude-sonnet-4-6".to_string()),
-            // Sonnet, not Opus: Scout summarizes news/web findings into a
-            // short bulleted list. That's a tractable extraction-and-
-            // summarization task — Opus is wasted spend here. Sonnet
-            // handles web-tool use and triage cleanly.
+            // Scout: web summarization. Sonnet is plenty.
             scout_model: Some("claude-sonnet-4-6".to_string()),
             timeout_secs: 180,
             scout_allowed_tools: vec!["WebSearch".to_string(), "WebFetch".to_string()],
+            curator_model: None,
         }
     }
 }
 
 impl ClaudeCfg {
+    pub fn model_for_preprocessor(&self) -> String {
+        self.preprocessor_model.clone().unwrap_or_else(|| self.model.clone())
+    }
+    /// Back-compat alias.
     pub fn model_for_sanitizer(&self) -> String {
-        self.sanitizer_model.clone().unwrap_or_else(|| self.model.clone())
+        self.model_for_preprocessor()
     }
     pub fn model_for_assistant(&self) -> String {
         self.assistant_model.clone().unwrap_or_else(|| self.model.clone())
@@ -150,9 +155,6 @@ impl ClaudeCfg {
             .clone()
             .unwrap_or_else(|| self.model.clone())
     }
-    pub fn model_for_curator(&self) -> String {
-        self.curator_model.clone().unwrap_or_else(|| self.model.clone())
-    }
     pub fn model_for_scout(&self) -> String {
         self.scout_model.clone().unwrap_or_else(|| self.model.clone())
     }
@@ -161,29 +163,21 @@ impl ClaudeCfg {
 impl Default for ScoutCfg {
     fn default() -> Self {
         Self {
-            // Off by default — Scout silently spends tokens in the background.
-            // Enable once you've used the assistant enough that there's
-            // some memory for the Scout to infer interests from.
             enabled: false,
             interval_minutes: 10,
-            // Empty by default. Scout reads recent memory + preferences each
-            // tick and infers what to watch for. When memory is sparse it
-            // falls back to base-rate human interests (major news, weather,
-            // severe-weather alerts). Pin a topic here only if you want a
-            // guaranteed sweep that doesn't rely on inference.
             pinned_topics: vec![],
         }
     }
 }
 
-impl Default for CuratorCfg {
+impl Default for IndexerCfg {
     fn default() -> Self {
         Self {
+            // On by default — purely mechanical, no LLM cost. Backfills
+            // missing .vec sidecars in the background.
             enabled: true,
-            interval_minutes: 60,
-            fresh_age_hours: 48,
-            aging_age_days: 14,
-            stale_age_days: 90,
+            interval_minutes: 5,
+            batch_size: 50,
         }
     }
 }
@@ -197,5 +191,53 @@ impl Config {
             }
             _ => Ok(Self::default()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_curator_section_loads_and_is_ignored() {
+        // Invariant #7: old config files still load.
+        let legacy = r#"
+[server]
+addr = "127.0.0.1:8765"
+
+[claude]
+binary = "claude"
+model = "claude-opus-4-7"
+sanitizer_model = "claude-haiku-4-5"
+curator_model = "claude-sonnet-4-6"
+
+[curator]
+enabled = true
+interval_minutes = 60
+fresh_age_hours = 48
+aging_age_days = 14
+stale_age_days = 90
+"#;
+        let cfg: Config = toml::from_str(legacy).unwrap();
+        assert_eq!(cfg.claude.model_for_preprocessor(), "claude-haiku-4-5");
+        assert!(cfg.claude.curator_model.is_some());
+        assert!(cfg._legacy_curator.is_some());
+    }
+
+    #[test]
+    fn default_config_has_indexer_enabled() {
+        let cfg = Config::default();
+        assert!(cfg.indexer.enabled);
+    }
+
+    #[test]
+    fn default_retrieval_weights_sane() {
+        let cfg = Config::default();
+        let r = &cfg.retrieval;
+        assert!(r.alpha > 0.0 && r.alpha < 1.0);
+        assert!(r.beta > 0.0 && r.beta < 1.0);
+        assert!(r.gamma > 0.0 && r.gamma < 1.0);
+        assert!((r.alpha + r.beta + r.gamma - 1.0).abs() < 0.01);
+        assert!(r.half_life_days > 0.0);
     }
 }

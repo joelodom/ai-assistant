@@ -1,7 +1,8 @@
 //! WebSocket front door.
 //!
 //! Flow per inbound user message:
-//!   1. Push it through the Sanitizer (Personal provenance).
+//!   1. (Unless HAZMAT bypass) push through the Security Preprocessor,
+//!      with Personal provenance.
 //!   2. Tier::Drop → write stub, send `stub_notice`, do not invoke Assistant.
 //!   3. Tier::Redact or Tier::Pass → invoke Assistant, stream reply back.
 //!
@@ -9,7 +10,7 @@
 //! so a brand-new user sees who/what this is and is ready to send data.
 
 use crate::assistant::Assistant;
-use crate::sanitizer::{InputProvenance, Sanitizer, SanitizerResult};
+use crate::preprocessor::{InputProvenance, Preprocessor, PreprocessorResult};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -26,7 +27,7 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub sanitizer: Arc<Sanitizer>,
+    pub preprocessor: Arc<Preprocessor>,
     pub assistant: Arc<Assistant>,
 }
 
@@ -41,7 +42,6 @@ async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-/// Single-line, user-friendly tail of an error chain.
 fn short_err(e: &anyhow::Error) -> String {
     let s = e.to_string();
     s.lines().next().unwrap_or(&s).to_string()
@@ -54,7 +54,6 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
 
-    // Introduction up front.
     let intro_text = state.assistant.introduction().await;
     let intro = ServerMessage::ReplyDone {
         text: Some(intro_text),
@@ -95,7 +94,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             ClientMessage::Message {
                 payload,
                 metadata,
-                bypass_sanitizer,
+                bypass_preprocessor,
                 force_opus,
             } => {
                 let mut bundle = payload.content.clone();
@@ -116,38 +115,41 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 }
 
-                let sanitize_result = if bypass_sanitizer {
+                let preprocess_result = if bypass_preprocessor {
                     tracing::warn!(
                         bundle_len = bundle.chars().count(),
                         "HAZMAT BYPASS: user invoked direct-to-assistant path; \
-                         Sanitizer skipped for this message"
+                         Preprocessor skipped for this message"
                     );
-                    Ok(SanitizerResult {
+                    Ok(PreprocessorResult {
                         tier: shared::Tier::Pass,
                         output: bundle.clone(),
                         redaction_report:
-                            "HAZMAT BYPASS — Sanitizer skipped at user request"
+                            "HAZMAT BYPASS — Preprocessor skipped at user request"
                                 .to_string(),
+                        // HAZMAT inputs get fixed-high importance — see
+                        // assistant.rs for the override path.
+                        importance: 0.8,
+                        importance_reason: Some(
+                            "HAZMAT bypass — user explicitly elevated".into(),
+                        ),
                     })
                 } else {
                     state
-                        .sanitizer
-                        .sanitize(&bundle, InputProvenance::Personal)
+                        .preprocessor
+                        .preprocess(&bundle, InputProvenance::Personal)
                         .await
                 };
 
-                let sanitized = match sanitize_result {
+                let preprocessed = match preprocess_result {
                     Ok(s) => s,
                     Err(e) => {
-                        tracing::warn!(error = %e, "sanitizer failed");
-                        // Persist an audit record so we can investigate later.
-                        // Note: we record the *length* of dropped input but
-                        // not its content — the ephemerality invariant still
-                        // holds for the raw text itself.
+                        tracing::warn!(error = %e, "preprocessor failed");
                         let note = format!(
-                            "Sanitizer failed at {}. Input was dropped without inspection (length: {} chars). \
-                             Likely causes: out of Claude tokens, CLI not found, network timeout, or LLM \
-                             returned malformed JSON. Underlying error: {}",
+                            "Preprocessor failed at {}. Input was dropped without inspection \
+                             (length: {} chars). Likely causes: out of Claude tokens, CLI not \
+                             found, network timeout, or LLM returned malformed JSON. Underlying \
+                             error: {}",
                             chrono::Utc::now().to_rfc3339(),
                             bundle.chars().count(),
                             e
@@ -157,18 +159,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .memory
                             .add(
                                 &note,
-                                crate::memory::ItemKind::SanitizerError,
+                                crate::memory::ItemKind::PreprocessorError,
                                 0.6,
                                 Some(metadata.clone()),
                                 String::new(),
-                                vec!["error".into(), "sanitizer".into()],
+                                vec!["error".into(), "preprocessor".into()],
                             )
                             .await;
                         let notice = ServerMessage::StubNotice {
                             text: format!(
-                                "The Gate (sanitizer) failed and your message was dropped without inspection. \
-                                 Reason: {}. I saved a note about this; you can ask me about it later. \
-                                 (If this keeps happening, check your Claude token budget or the backend log.)",
+                                "The Preprocessor failed and your message was dropped without \
+                                 inspection. Reason: {}. I saved a note about this; you can ask me \
+                                 about it later. (If this keeps happening, check your Claude token \
+                                 budget or the backend log.)",
                                 short_err(&e)
                             ),
                         };
@@ -179,25 +182,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 };
 
-                match sanitized.tier {
+                match preprocessed.tier {
                     Tier::Drop => {
-                        // Persist the stub, never the content.
                         let _ = state
                             .assistant
                             .memory
-                            .add_stub(&sanitized.output, sanitized.redaction_report.clone())
+                            .add_stub(&preprocessed.output, preprocessed.redaction_report.clone())
                             .await;
                         let notice = ServerMessage::StubNotice {
-                            text: sanitized.output.clone(),
+                            text: preprocessed.output.clone(),
                         };
                         let _ = sender.send(Message::Text(serde_json::to_string(&notice).unwrap())).await;
                     }
                     Tier::Redact | Tier::Pass => {
-                        match state.assistant.respond(&sanitized, &metadata, force_opus).await {
+                        match state.assistant.respond(&preprocessed, &metadata, force_opus).await {
                             Ok(outcome) => {
-                                // If the assistant escalated (Sonnet handed
-                                // off to Opus), tell the user before
-                                // streaming the final answer.
                                 if outcome.escalated {
                                     let prefix = if let Some(r) = &outcome.escalation_reason {
                                         format!("🧠 Handing off to {} for deeper reasoning — {}\n\n", outcome.model_used, r)
@@ -209,10 +208,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         .send(Message::Text(serde_json::to_string(&frame).unwrap()))
                                         .await;
                                 }
-                                // We have the full reply text already. The
-                                // frame protocol supports chunks, so split
-                                // on paragraph boundaries to feel live; if
-                                // there are no breaks, send as one chunk.
                                 let reply = &outcome.text;
                                 let chunks: Vec<&str> = if reply.contains("\n\n") {
                                     reply.split("\n\n").collect()
@@ -227,7 +222,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                         .send(Message::Text(serde_json::to_string(&frame).unwrap()))
                                         .await;
                                 }
-                                let mut tier_summary = match sanitized.tier {
+                                let mut tier_summary = match preprocessed.tier {
                                     Tier::Redact => "redact".to_string(),
                                     Tier::Pass => "pass".to_string(),
                                     Tier::Drop => "drop".to_string(),
@@ -238,6 +233,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 }
                                 if force_opus {
                                     tier_summary.push_str(" · force_opus");
+                                }
+                                if outcome.forgotten_item_id.is_some() {
+                                    tier_summary.push_str(" · forget-action");
                                 }
                                 let done = ServerMessage::ReplyDone {
                                     text: None,
@@ -252,13 +250,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "assistant failed");
-                                // The user message was already persisted by
-                                // Assistant::respond before the LLM call, so
-                                // we just need a paired error record.
                                 let note = format!(
-                                    "Assistant failed at {}. The user's preceding message is in memory \
-                                     (search recent for context). Likely causes: out of Claude tokens, \
-                                     CLI not found, network timeout. Underlying error: {}",
+                                    "Assistant failed at {}. The user's preceding message is in \
+                                     memory (search recent for context). Likely causes: out of \
+                                     Claude tokens, CLI not found, network timeout. Underlying \
+                                     error: {}",
                                     chrono::Utc::now().to_rfc3339(),
                                     e
                                 );
@@ -276,9 +272,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     .await;
                                 let err = ServerMessage::Error {
                                     text: format!(
-                                        "I hit an error generating a response: {}. I saved a note so I'll \
-                                         remember this happened — you can ask about it later. (Common cause: \
-                                         the Claude CLI is rate-limited or out of tokens.)",
+                                        "I hit an error generating a response: {}. I saved a note so \
+                                         I'll remember this happened — you can ask about it later. \
+                                         (Common cause: the Claude CLI is rate-limited or out of \
+                                         tokens.)",
                                         short_err(&e)
                                     ),
                                 };

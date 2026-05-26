@@ -78,17 +78,17 @@ relax for convenience — it's an architectural property. The system has no
 HTTP client for outbound writes, no SMTP, no SDKs that mutate state. Web
 search and URL fetching are read-only and are the only outbound traffic.
 
-### 2. The Gate: a sanitizer that sees everything first
+### 2. The Security Preprocessor: a checkpoint that sees everything first
 
 Every byte from the outside world — your typing, an ingested email, text
-extracted from a PDF, a web page the Scout fetched — passes through a
-**Sanitizer** ("the Gate") before anything else sees it. The Gate is a
-**separate, ephemeral process per call**: a fresh `claude` subprocess with
-no shared session state, no `--continue`, no history. The raw input lives
-only on one function's stack and inside that one short-lived subprocess.
-When the subprocess exits, the raw input is gone.
+extracted from a PDF, a web page the Scout fetched — passes through the
+**Security Preprocessor** (Preprocessor for short) before anything else sees
+it. The Preprocessor is a **separate, ephemeral process per call**: a fresh
+`claude` subprocess with no shared session state, no `--continue`, no
+history. The raw input lives only on one function's stack and inside that
+one short-lived subprocess. When the subprocess exits, the raw input is gone.
 
-The Gate classifies each piece of input into three tiers:
+The Preprocessor classifies each piece of input into three tiers:
 
 - **Drop entirely** — content that is *only* security-relevant (an OTP
   email, a password-reset link). The content is destroyed; only a
@@ -102,7 +102,7 @@ The Gate classifies each piece of input into three tiers:
 
 ### 3. Threat model: account-takeover attackers, not nation-states
 
-The Gate is tuned to defeat **financially motivated attackers** trying for
+The Preprocessor is tuned to defeat **financially motivated attackers** trying for
 account takeover or direct theft. It actively suppresses anything that
 would directly enable that:
 
@@ -145,15 +145,15 @@ at any moment without losing anything except an in-flight request.
 
 ### 5. The HAZMAT bypass is opt-in, audited, and never automatic
 
-There is one explicit user-controlled exception to "the Gate sees
-everything": a `☢ Hazmat` checkbox in the client. Tick it and the next
-message skips the Sanitizer and goes straight to the assistant. Use it
+There is one explicit user-controlled exception to "the Preprocessor sees
+everything": a `☢ HAZMAT` checkbox in the client. Tick it and the next
+message skips the Preprocessor and goes straight to the assistant. Use it
 when you've consciously decided the content is safe and you want it
 reasoned over verbatim. Every bypass is logged at WARN, tagged `hazmat`
 in the memory audit trail, and shown with a banner in your local
 transcript so you can never wonder later whether a message went through
-the Gate. **No code path may set the bypass programmatically** — only the
-human-pressed checkbox can flip it.
+the Preprocessor. **No code path may set the bypass programmatically** —
+only the human-pressed checkbox can flip it.
 
 ---
 
@@ -257,6 +257,41 @@ sent to Claude.
 
 ---
 
+## How recall works (RAG, hybrid retrieval)
+
+The assistant doesn't load all your memory into the model every turn — at
+years-of-data scale that wouldn't work. Instead, each turn it hybrid-retrieves
+the top-K most relevant items and only those go into the prompt.
+
+The score per candidate item is:
+
+```
+final = α · relevance + β · recency + γ · importance
+```
+
+where `relevance = max(vector_cosine, keyword_rank)`, `recency = exp(-age_days
+/ half_life)`, and `importance` is the score the Preprocessor assigned at ingest time.
+Defaults: `α=0.6, β=0.25, γ=0.15, half_life=30d` — configurable in
+`config.toml [retrieval]`.
+
+This means a very strong semantic match from a year ago still surfaces, a
+weak match from yesterday still surfaces, and a weak match from a year ago
+gets filtered out. Important items (a wedding invitation, a deposition date)
+float up regardless.
+
+Embedding is local — a small fastembed-rs model runs in-process, no calls
+to a remote embeddings API. The vectors live as `.vec` sidecars next to your
+text bodies; the HNSW search index is a derived cache that gets rebuilt from
+the sidecars if missing.
+
+The system never silently forgets things. The old "Curator" that
+destructively summarized aging memory has been removed; items live verbatim
+until you explicitly ask the assistant to forget a specific one ("forget
+that"), at which point the item is tombstoned (body zeroed, vector removed,
+audit metadata kept).
+
+---
+
 ## Config
 
 `config.toml` (optional — built-in defaults match the example):
@@ -267,22 +302,21 @@ addr = "127.0.0.1:8765"
 
 [memory]
 dir = "./memory"
-recent_window = 20
 
 [claude]
 binary = "claude"
 # Default for any role that doesn't override below.
 model = "claude-opus-4-7"
 # Per-role models — chosen to match each component's job:
-#   Sanitizer:  Haiku  — pattern recognition on every message, latency matters.
-#   Assistant:  Sonnet — chat; self-escalates to the escalation model when needed.
-#   Escalation: Opus   — for hard reasoning, used on self- or user-forced escalation.
-#   Curator:    Sonnet — destructive summarization; smarter compression matters.
-#   Scout:      Sonnet — web triage; Opus would be wasted.
-sanitizer_model            = "claude-haiku-4-5"
+#   Preprocessor: Haiku  — pattern recognition + importance scoring on every
+#                          message; latency matters. (legacy alias:
+#                          `sanitizer_model`)
+#   Assistant:    Sonnet — chat; self-escalates to the escalation model.
+#   Escalation:   Opus   — used on self- or user-forced escalation.
+#   Scout:        Sonnet — web triage.
+preprocessor_model         = "claude-haiku-4-5"
 assistant_model            = "claude-sonnet-4-6"
 assistant_escalation_model = "claude-opus-4-7"
-curator_model              = "claude-sonnet-4-6"
 scout_model                = "claude-sonnet-4-6"
 timeout_secs = 180
 scout_allowed_tools = ["WebSearch", "WebFetch"]
@@ -292,26 +326,40 @@ enabled = false           # opt-in; enable once memory is substantial
 interval_minutes = 10
 pinned_topics = []        # empty → Scout infers topics from your memory
 
-[curator]
+[indexer]
+# Mechanical maintenance worker (no LLM). Backfills missing `.vec` sidecars,
+# detects embedder-model changes and re-embeds, checkpoints the HNSW
+# manifest. Replaces the old Curator.
 enabled = true
-interval_minutes = 60
-fresh_age_hours = 48
-aging_age_days = 14
-stale_age_days = 90
+interval_minutes = 5
+batch_size = 50
+
+[retrieval]
+alpha          = 0.6
+beta           = 0.25
+gamma          = 0.15
+half_life_days = 30.0
+vector_candidates  = 50
+keyword_candidates = 20
+recent_candidates  = 20
 ```
 
 CLI overrides win over the file; the file wins over built-in defaults.
+Legacy keys (`sanitizer_model`, `[curator]`) still load via serde aliases —
+old `config.toml` files keep working (forward-compatible reads invariant).
 
 ---
 
 ## What does what
 
-| Component  | Crate     | Role                                                |
-|-----------:|-----------|-----------------------------------------------------|
-| The Gate   | backend   | Sanitizer. Three-tier classification, ephemeral.    |
-| The Core   | backend   | Assistant. Reads memory, replies, persists turns.   |
-| Memory     | backend   | File-based store, atomic writes, decay metadata.    |
-| The Scout  | backend   | Periodic web/news worker (opt-in).                  |
-| Curator    | backend   | Periodic memory decay/summarization worker.         |
-| Client     | client    | egui chat surface, IP-based geolocation, metadata.  |
-| Protocol   | shared    | Wire types — re-used by both crates.                |
+| Component    | Crate     | Role                                                |
+|-------------:|-----------|-----------------------------------------------------|
+| Preprocessor | backend   | Security Preprocessor. Three-tier classification + importance scoring. Ephemeral. |
+| The Core     | backend   | Assistant. Hybrid retrieval, replies, persists turns. |
+| Memory       | backend   | File-based store. Atomic writes. `.vec` sidecars. Explicit forget. |
+| Embedder     | backend   | Local fastembed-rs model — text → vector. No network. |
+| VectorIndex  | backend   | HNSW search structure. Derived cache, rebuildable. |
+| Indexer      | backend   | Periodic mechanical worker. Backfill + re-embed + stats. NO LLM. |
+| The Scout    | backend   | Periodic web/news worker (opt-in).                  |
+| Client       | client    | egui chat surface, IP-based geolocation, metadata.  |
+| Protocol     | shared    | Wire types — re-used by both crates.                |
