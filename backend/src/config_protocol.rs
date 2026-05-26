@@ -84,6 +84,21 @@ impl ConfigProtocol {
 
     /// Entry point: dispatch on payload kind.
     pub async fn handle(&self, payload: ConfigPayloadKind) -> Result<ConfigResponse> {
+        // Logging discipline: payload kinds + connector names are SAFE to
+        // log; the actual contents (secrets, tokens, codes) are NEVER
+        // logged.
+        let (kind_name, connector) = match &payload {
+            ConfigPayloadKind::ConnectorClientSecret { connector, .. } => {
+                ("connector_client_secret", connector.clone())
+            }
+            ConfigPayloadKind::ConnectorLoopbackReady { connector, .. } => {
+                ("connector_loopback_ready", connector.clone())
+            }
+            ConfigPayloadKind::ConnectorOAuthCallback { connector, .. } => {
+                ("connector_oauth_callback", connector.clone())
+            }
+        };
+        tracing::info!(kind = kind_name, %connector, "config_payload_received");
         match payload {
             ConfigPayloadKind::ConnectorClientSecret {
                 connector,

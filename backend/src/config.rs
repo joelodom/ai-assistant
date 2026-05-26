@@ -21,11 +21,36 @@ pub struct Config {
     pub scout: ScoutCfg,
     pub indexer: IndexerCfg,
     pub retrieval: RetrievalWeights,
+    pub logging: LoggingCfg,
     /// Legacy section. Accepted on load and ignored — the Curator is gone.
     /// Kept as a typed-but-unused field so old TOML files with a `[curator]`
     /// section still deserialize cleanly.
     #[serde(default, alias = "curator")]
     pub _legacy_curator: Option<toml::Value>,
+}
+
+/// Logging configuration. The TOML controls the default level; `RUST_LOG`
+/// env var still overrides if set (standard `tracing_subscriber::EnvFilter`
+/// behavior).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoggingCfg {
+    /// `off | error | warn | info | debug | trace`. Also accepts the
+    /// full env-filter directive syntax (e.g. `info,backend::retrieval=trace`).
+    pub level: String,
+    /// `json` (machine-parseable, for analysis) or `text` (human-readable).
+    pub format: String,
+    /// Write logs to stdout.
+    pub stdout: bool,
+    /// Write logs to a rotating file (daily, one file per UTC day, no
+    /// automatic deletion — left for the user).
+    pub file: bool,
+    /// Directory for log files. None → `<memory-dir>/logs`. The directory
+    /// is created if missing.
+    pub dir: Option<PathBuf>,
+    /// Filename prefix for the rotating log files. The active file is
+    /// `<prefix>.YYYY-MM-DD`; a new file opens at midnight UTC.
+    pub file_prefix: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,7 +121,21 @@ impl Default for Config {
             scout: ScoutCfg::default(),
             indexer: IndexerCfg::default(),
             retrieval: RetrievalWeights::default(),
+            logging: LoggingCfg::default(),
             _legacy_curator: None,
+        }
+    }
+}
+
+impl Default for LoggingCfg {
+    fn default() -> Self {
+        Self {
+            level: "info".to_string(),
+            format: "json".to_string(),
+            stdout: true,
+            file: true,
+            dir: None,
+            file_prefix: "ai-assistant.log".to_string(),
         }
     }
 }

@@ -73,6 +73,7 @@ pub struct ScoredItem {
 
 /// Hybrid retrieval. Returns the top-`k` scored items. Always excludes
 /// ForgottenStub tombstones.
+#[tracing::instrument(skip_all, fields(query_len = query.len(), k))]
 pub async fn retrieve(
     memory: &MemoryStore,
     embedder: &dyn Embedder,
@@ -168,6 +169,16 @@ pub async fn retrieve(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     scored.truncate(k);
+    tracing::debug!(
+        n_vector_candidates = vector_scores.len(),
+        n_keyword_candidates = keyword_scores.len(),
+        n_returned = scored.len(),
+        top_score = scored.first().map(|s| s.final_score),
+        top_relevance = scored.first().map(|s| s.relevance),
+        top_recency = scored.first().map(|s| s.recency),
+        top_importance = scored.first().map(|s| s.importance),
+        "retrieve_done"
+    );
     Ok(scored)
 }
 

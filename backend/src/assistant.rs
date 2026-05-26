@@ -212,12 +212,25 @@ impl Assistant {
         }
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            turn_id = %uuid::Uuid::new_v4(),
+            tier = ?preprocessed.tier,
+            force_opus,
+            input_len = preprocessed.output.chars().count(),
+            importance = preprocessed.importance,
+        )
+    )]
     pub async fn respond(
         &self,
         preprocessed: &PreprocessorResult,
         metadata: &Metadata,
         force_opus: bool,
     ) -> Result<RespondOutcome> {
+        let turn_start = std::time::Instant::now();
+        tracing::info!("turn_started");
+
         // 1. Persist user-side first.
         let user_kind = if looks_like_question(&preprocessed.output) {
             ItemKind::UserMessage
@@ -242,12 +255,21 @@ impl Assistant {
                 tags,
             )
             .await?;
+        tracing::debug!(
+            item_id = %sidecar.id,
+            kind = ?user_kind,
+            importance = user_importance,
+            hazmat = is_hazmat,
+            "user_item_persisted"
+        );
 
         // 2. Embed + upsert.
         if let Ok(vec) = self.embedder.embed(&preprocessed.output).await {
+            let dim = vec.len();
             if let Some(item) = self.memory.get(&sidecar.id).ok().flatten() {
                 let _ = self.memory.write_vector(&item, &vec).await;
                 let _ = self.vector_index.upsert(&sidecar.id, vec);
+                tracing::trace!(item_id = %sidecar.id, dim, "user_item_embedded");
             }
         }
 
@@ -299,6 +321,16 @@ impl Assistant {
                 &excerpts_block,
             );
 
+            tracing::debug!(
+                n_retrieved = retrieved.len(),
+                top_score = retrieved.first().map(|s| s.final_score),
+                prompt_len = prompt.len(),
+                model = ?current_model,
+                search_rounds,
+                n_manual_excerpts = manual_excerpts.len(),
+                "llm_call_starting"
+            );
+            let llm_start = std::time::Instant::now();
             let opts = LlmOptions {
                 allowed_tools: vec!["WebSearch".into(), "WebFetch".into()],
                 model: current_model.clone(),
@@ -306,6 +338,12 @@ impl Assistant {
             };
             let raw = self.llm.oneshot(&prompt, opts).await?;
             let reply = raw.trim().to_string();
+            tracing::debug!(
+                reply_len = reply.len(),
+                model = ?current_model,
+                duration_ms = llm_start.elapsed().as_millis() as u64,
+                "llm_call_done"
+            );
 
             // Check ESCALATE first — it short-circuits the rest of the
             // reply per the marker's contract.
@@ -317,8 +355,15 @@ impl Assistant {
                     .next()
                     .unwrap_or("")
                     .to_string();
+                let reason_len = reason.len();
                 escalation_reason = if reason.is_empty() { None } else { Some(reason) };
                 let esc = self.escalation_model.clone().or_else(|| self.model.clone());
+                tracing::info!(
+                    reason_len,
+                    from_model = ?self.model,
+                    to_model = ?esc,
+                    "escalation_triggered"
+                );
                 current_model = esc;
                 escalated = true;
                 continue;
@@ -331,18 +376,31 @@ impl Assistant {
                 && manual_excerpts.len() < self.max_manual_reads
             {
                 let budget = self.max_manual_reads - manual_excerpts.len();
+                let requested: Vec<String> = manual_requests
+                    .iter()
+                    .take(budget)
+                    .map(|s| if s.is_empty() { "<TOC>".to_string() } else { s.clone() })
+                    .collect();
+                tracing::info!(
+                    sections = ?requested,
+                    budget,
+                    "manual_reads_requested"
+                );
                 for section in manual_requests.into_iter().take(budget) {
                     let (display_name, body) = if section.is_empty() {
                         ("table-of-contents".to_string(), self.manual.render_toc())
                     } else {
                         match self.manual.read_section(&section) {
                             Some(b) => (section.clone(), b),
-                            None => (
-                                section.clone(),
-                                format!(
-                                    "(no such section: \"{section}\". Use READ_MANUAL with no args to see the TOC.)"
-                                ),
-                            ),
+                            None => {
+                                tracing::warn!(section = %section, "manual_section_not_found");
+                                (
+                                    section.clone(),
+                                    format!(
+                                        "(no such section: \"{section}\". Use READ_MANUAL with no args to see the TOC.)"
+                                    ),
+                                )
+                            }
                         }
                     };
                     manual_reads_log.push(display_name.clone());
@@ -355,6 +413,13 @@ impl Assistant {
             let searches = parse_search_markers(&reply);
             if !searches.is_empty() && search_rounds < self.max_search_rounds {
                 search_rounds += 1;
+                let connectors: Vec<&str> = searches.iter().map(|(c, _)| c.as_str()).collect();
+                tracing::info!(
+                    connectors = ?connectors,
+                    n_searches = searches.len(),
+                    round = search_rounds,
+                    "search_round_starting"
+                );
                 for (conn_name, query) in searches {
                     let summary = self
                         .execute_search(&conn_name, &query, metadata)
@@ -365,6 +430,11 @@ impl Assistant {
             }
 
             // No more markers (or hit a cap). This is the final reply.
+            tracing::debug!(
+                final_model = ?current_model,
+                final_reply_len = reply.len(),
+                "final_reply_received"
+            );
             break reply;
         };
 
@@ -421,6 +491,16 @@ impl Assistant {
             self.memory.add_preference(&pref).await.ok();
         }
 
+        tracing::info!(
+            duration_ms = turn_start.elapsed().as_millis() as u64,
+            model_used,
+            escalated,
+            forgot = forgotten_item_id.is_some(),
+            n_searches = search_log.len(),
+            n_manual_reads = manual_reads_log.len(),
+            n_config_requests = config_requests.len(),
+            "turn_complete"
+        );
         Ok(RespondOutcome {
             text: final_text,
             config_requests,
@@ -438,25 +518,31 @@ impl Assistant {
     /// non-drop results land in memory, embedded, and indexed.
     /// Returns a one-line summary suitable for surfacing in the user-
     /// visible preamble.
+    #[tracing::instrument(skip(self, metadata), fields(connector = connector_name, query_len = query.len()))]
     async fn execute_search(
         &self,
         connector_name: &str,
         query: &str,
         metadata: &Metadata,
     ) -> String {
+        let started = std::time::Instant::now();
         let Some(connector) = self.connectors.get(connector_name) else {
+            tracing::warn!("connector_not_found");
             return format!("(no such connector: {connector_name})");
         };
         if !connector.is_available() {
+            tracing::warn!("connector_not_configured");
             return format!(
-                "({connector_name} not configured — run `ai-assistant-backend connect {connector_name}`)"
+                "({connector_name} not configured — set it up via the client per the manual)"
             );
         }
         let results = match connector.search(query, 10).await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(error = %e, connector_name, query, "connector search failed");
-                return format!("(search {connector_name} \"{query}\" failed: {e})");
+                // NOTE: log error string and connector — NOT the user's query
+                // verbatim. query_len is in the span fields.
+                tracing::warn!(error = %e, "connector_search_failed");
+                return format!("(search {connector_name} failed: {e})");
             }
         };
         let total = results.len();
@@ -536,6 +622,13 @@ impl Assistant {
                 }
             }
         }
+        tracing::info!(
+            total,
+            kept,
+            dropped,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "connector_search_done"
+        );
         format!(
             "🔍 {connector_name}: searched \"{query}\" → {total} results, kept {kept}, dropped {dropped}"
         )
@@ -864,15 +957,24 @@ fn build_prompt(
 fn render_scored(s: &ScoredItem) -> String {
     let when = s.item.sidecar.created_at.format("%Y-%m-%d %H:%M");
     let kind = format!("{:?}", s.item.sidecar.kind);
-    let body = if s.item.body.len() > 800 {
-        format!("{}…", &s.item.body[..800])
-    } else {
-        s.item.body.clone()
-    };
+    let body = truncate_chars(&s.item.body, 800);
     format!(
         "  - [id={}, when={when}, kind={kind}, score={:.2}, rel={:.2}, recency={:.2}, importance={:.2}] {body}\n",
         s.item.sidecar.id, s.final_score, s.relevance, s.recency, s.importance
     )
+}
+
+/// Truncate a UTF-8 string to at most `max_chars` characters, suffixing
+/// with "…" if anything was cut. Char-boundary-safe (never slices through
+/// a multi-byte codepoint). Use this instead of `&s[..n]` whenever `n`
+/// is a length budget — body text may contain em-dashes, emoji, accented
+/// letters, anything multi-byte.
+pub fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut iter = s.char_indices();
+    match iter.nth(max_chars) {
+        Some((end_byte, _)) => format!("{}…", &s[..end_byte]),
+        None => s.to_string(),
+    }
 }
 
 #[cfg(test)]

@@ -66,8 +66,8 @@ impl Scout {
         // Include the 30 most recent items (newest first), truncated.
         let recent_slice: Vec<_> = user_items.iter().rev().take(30).collect();
         for item in &recent_slice {
-            let body = if item.body.len() > 300 {
-                format!("{}…", &item.body[..300])
+            let body = if item.body.chars().count() > 300 {
+                crate::assistant::truncate_chars(&item.body, 300)
             } else {
                 item.body.clone()
             };

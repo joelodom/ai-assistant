@@ -231,6 +231,29 @@ seeded at startup; that's removed. The `ItemKind::SelfKnowledge` enum
 variant stays for back-compat with items written by earlier versions
 (Invariant #7).
 
+## Logging
+
+The backend uses `tracing` with structured JSON output by default. Two
+destinations available simultaneously: stdout and a daily-rotated file at
+`<memory-dir>/logs/<file_prefix>.YYYY-MM-DD`. New file opens at midnight
+UTC; old files are never auto-deleted. Configured in `[logging]` of the
+TOML; `RUST_LOG` env var overrides the level if set.
+
+**Discipline (invariant-adjacent):** never log raw user input, sanitized
+message bodies, memory item contents, OAuth secrets, search queries
+verbatim. Lengths, counts, structured metadata (tier, importance,
+model_used, durations, marker dispatch counts), and item IDs are fine.
+This is enforced by convention, not code — when adding new tracing
+calls, log `foo_len = foo.chars().count()` and `kind = ?some_enum`
+patterns, never `foo` directly.
+
+Per-turn spans are tagged with a UUID `turn_id` so all events from one
+user message group together (just `grep` or `jq` by turn_id). The
+default level INFO covers the lifecycle; DEBUG adds intermediate stages;
+TRACE adds per-event detail. For product-analysis work, run at TRACE
+(see joel.toml as an example) and the manual's `logging-and-analysis`
+section.
+
 ## Connectors (search-only)
 
 Connectors are search-only adapters to external personal-data sources. The

@@ -83,6 +83,15 @@ impl Preprocessor {
         raw: &str,
         provenance: InputProvenance,
     ) -> Result<PreprocessorResult> {
+        let started = std::time::Instant::now();
+        // Discipline: log LENGTH not content. The raw input is exactly what
+        // the Preprocessor exists to filter; it must not appear in logs.
+        tracing::debug!(
+            input_len = raw.chars().count(),
+            provenance = ?provenance,
+            model = ?self.model,
+            "preprocess_start"
+        );
         let prompt = build_prompt(raw, provenance);
         let opts = LlmOptions {
             allowed_tools: vec![],
@@ -90,7 +99,16 @@ impl Preprocessor {
             ..Default::default()
         };
         let raw_response = self.llm.oneshot(&prompt, opts).await?;
-        parse_response(&raw_response)
+        let result = parse_response(&raw_response)?;
+        tracing::info!(
+            tier = ?result.tier,
+            importance = result.importance,
+            output_len = result.output.chars().count(),
+            redaction_report_len = result.redaction_report.len(),
+            duration_ms = started.elapsed().as_millis() as u64,
+            "preprocess_done"
+        );
+        Ok(result)
     }
 
     /// Back-compat alias for `preprocess`. Old call sites using `.sanitize(...)`

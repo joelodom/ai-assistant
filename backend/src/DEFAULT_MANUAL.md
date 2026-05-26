@@ -29,6 +29,8 @@ Sections (request via `READ_MANUAL: <section-name>`):
 - **error-handling** — what happens when the LLM fails, what to tell the user.
 - **troubleshooting** — common user-facing problems and how to resolve them.
 - **self-knowledge** — what to do when the user asks about you.
+- **logging-and-analysis** — where logs live, what's safe to share, and what
+  events to look for when analyzing system behavior.
 
 ## architecture
 
@@ -427,3 +429,82 @@ the Assistant Core of this specific system; the underlying model is
 whatever `assistant_model` shows in the runtime block. Pronouns: first
 person ("I read your inbox when you ask me to") for the system, not
 for the underlying LLM.
+
+## logging-and-analysis
+
+The backend logs structured events at every important stage —
+preprocessor decisions, retrieval scores, marker dispatch, LLM call
+latencies, search results, OAuth flow events, errors. The intent: the
+user (or an AI brought in to analyze) can read the logs and figure out
+what happened, why, and what to improve.
+
+### Where logs live
+
+- **stdout**: the terminal you launched the backend in. Live.
+- **rotating file**: `<memory-dir>/logs/<file_prefix>.YYYY-MM-DD`
+  (defaults: `<memory-dir>/logs/ai-assistant.log.YYYY-MM-DD`).
+  A new file opens at midnight UTC; old files are NEVER auto-deleted —
+  the user removes them when they choose.
+- Both destinations are independently toggleable via `[logging]
+  stdout = ...` / `file = ...`. Format (`json` or `text`) is also a
+  config knob. `RUST_LOG` env var overrides the configured level.
+
+If a user asks "where are my logs," point them at
+`<memory-dir>/logs/`. If they want to share for analysis, suggest the
+day's JSON file is the right thing — it's self-contained, structured,
+and machine-parseable.
+
+### What's safe to log (and what isn't)
+
+Logging discipline is invariant-adjacent. The system does NOT log:
+
+- Raw user input or sanitized message bodies (only `input_len`,
+  `output_len` — character counts).
+- Memory item bodies, sidecar contents, search queries verbatim.
+- OAuth secrets: `client_secret`, access tokens, refresh tokens,
+  authorization codes.
+
+It DOES log:
+
+- Lengths and counts (`input_len`, `n_retrieved`, `n_searches`).
+- Structured metadata: tier classification, importance score, model
+  used, escalation decisions, marker dispatch, connector name,
+  durations in milliseconds.
+- Item IDs (safe — they're random UUIDs; they reveal nothing about
+  content unless cross-referenced with the on-disk sidecar).
+- Spans tagged with a per-turn UUID so events from one user message
+  group together.
+
+If a user asks whether logs are safe to share with a third party for
+analysis: the structured events themselves don't contain personal data.
+Item IDs might let a third party correlate which items were involved
+in which turn IF they also had the memory directory. So: share logs
+freely; share the memory directory only with people you'd hand your
+notebook to.
+
+### Events worth looking for during analysis
+
+- `turn_started` / `turn_complete` (with `duration_ms`) — per-turn
+  envelope; correlate via the `turn_id` span field.
+- `preprocess_done` (`tier`, `importance`) — what the Gate decided.
+- `retrieve_done` (`n_returned`, `top_score`, `top_relevance`,
+  `top_recency`, `top_importance`) — was the right memory surfaced?
+- `llm_call_starting` / `llm_call_done` (`model`, `prompt_len`,
+  `duration_ms`) — where time is going.
+- `escalation_triggered` — when Sonnet decided Opus was needed.
+- `manual_reads_requested` / `manual_section_not_found` — was the
+  manual helpful? Did the assistant ask for a section that doesn't
+  exist?
+- `search_round_starting` / `connector_search_done` (`total`, `kept`,
+  `dropped`) — what came back from external sources.
+- `gmail_search_done` (`n_listed`, `n_fetched`, `n_failed`,
+  `duration_ms`) — Gmail API performance.
+- `config_payload_received` (`kind`, `connector`) — setup flow events.
+- `preprocessor_error` / `assistant_error` (in memory items too) —
+  failures with full context.
+
+When the user wants to "improve the product," start by sampling
+`turn_complete` events and looking at the distribution of
+`duration_ms`, escalation rate, search rate, and manual_reads count.
+Outliers (slow turns, frequent escalations to Opus, manual sections
+that don't exist) are the leverage points.

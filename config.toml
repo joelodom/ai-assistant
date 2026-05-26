@@ -72,3 +72,22 @@ half_life_days = 30.0
 vector_candidates  = 50
 keyword_candidates = 20
 recent_candidates  = 20
+
+[logging]
+# off | error | warn | info | debug | trace. Or use the full
+# `tracing` env-filter syntax for per-module control:
+#   "info,backend::retrieval=trace,backend::indexer=warn"
+# RUST_LOG env var still overrides this if set.
+level = "info"
+# json | text. JSON is what you want when feeding logs to analysis tools
+# (or to an AI for product improvement); text is more readable in a terminal.
+format = "json"
+# Write to stdout (live terminal) AND/OR a daily-rotated file. Both can
+# be enabled simultaneously.
+stdout = true
+file   = true
+# Where rotated log files go. Empty / omitted = <memory.dir>/logs.
+# Daily rotation at midnight UTC; filename is `<file_prefix>.YYYY-MM-DD`.
+# No automatic deletion — old files accumulate until you remove them.
+# dir = "/var/log/ai-assistant"
+file_prefix = "ai-assistant.log"

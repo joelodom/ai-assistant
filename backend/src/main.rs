@@ -28,8 +28,10 @@
 //!   RUST_LOG                       Log filter (default: info).
 
 use anyhow::Result;
-use std::path::PathBuf;
-use tracing_subscriber::EnvFilter;
+use backend::config::LoggingCfg;
+use std::path::{Path, PathBuf};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{fmt::writer::MakeWriterExt, EnvFilter};
 
 #[derive(Debug, Default)]
 struct CliArgs {
@@ -62,12 +64,135 @@ fn parse_args() -> CliArgs {
     out
 }
 
+/// Initialize tracing per the TOML logging config. Composes a stdout
+/// writer (if enabled) AND a daily-rotated file writer (if enabled) into
+/// one subscriber. Uses JSON formatter when `format = "json"`, the human
+/// `fmt` formatter otherwise. RUST_LOG still overrides the configured
+/// level.
+///
+/// Returns the WorkerGuard for the non-blocking file appender — caller
+/// MUST hold it for the lifetime of the process or buffered writes get
+/// dropped at shutdown.
+fn init_logging(cfg: &LoggingCfg, memory_dir: &Path) -> Result<Option<WorkerGuard>> {
+    // Filter: RUST_LOG wins; else the configured level.
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(cfg.level.as_str()));
+
+    // Optional file appender.
+    let mut guard: Option<WorkerGuard> = None;
+    let file_writer = if cfg.file {
+        let log_dir = cfg.dir.clone().unwrap_or_else(|| memory_dir.join("logs"));
+        std::fs::create_dir_all(&log_dir)?;
+        let appender = tracing_appender::rolling::daily(&log_dir, &cfg.file_prefix);
+        let (nb, g) = tracing_appender::non_blocking(appender);
+        guard = Some(g);
+        Some(nb)
+    } else {
+        None
+    };
+
+    // Compose writers per the (stdout, file) matrix. Cases collapse to:
+    //   (true, true)   stdout + file
+    //   (true, false)  stdout only
+    //   (false, true)  file only
+    //   (false, false) silent (we still install a subscriber so events are
+    //                  defined but discarded)
+    let is_json = cfg.format.eq_ignore_ascii_case("json");
+
+    match (cfg.stdout, file_writer) {
+        (true, Some(fw)) => {
+            let w = std::io::stdout.and(fw);
+            if is_json {
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_env_filter(env_filter)
+                    .with_writer(w)
+                    .with_target(true)
+                    .init();
+            } else {
+                tracing_subscriber::fmt()
+                    .with_env_filter(env_filter)
+                    .with_writer(w)
+                    .with_target(true)
+                    .init();
+            }
+        }
+        (true, None) => {
+            if is_json {
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_env_filter(env_filter)
+                    .with_writer(std::io::stdout)
+                    .with_target(true)
+                    .init();
+            } else {
+                tracing_subscriber::fmt()
+                    .with_env_filter(env_filter)
+                    .with_writer(std::io::stdout)
+                    .with_target(true)
+                    .init();
+            }
+        }
+        (false, Some(fw)) => {
+            if is_json {
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_env_filter(env_filter)
+                    .with_writer(fw)
+                    .with_target(true)
+                    .init();
+            } else {
+                tracing_subscriber::fmt()
+                    .with_env_filter(env_filter)
+                    .with_writer(fw)
+                    .with_target(true)
+                    .init();
+            }
+        }
+        (false, None) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_writer(std::io::sink)
+                .init();
+        }
+    }
+
+    install_panic_hook();
+    Ok(guard)
+}
+
+/// Replace the default Rust panic hook with one that routes through
+/// `tracing::error!` so panics land in the log file alongside everything
+/// else. We chain to the default hook afterward so panic output still
+/// reaches stderr the way users expect.
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let msg: &str = if let Some(s) = payload.downcast_ref::<&str>() {
+            s
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.as_str()
+        } else {
+            "(non-string panic payload)"
+        };
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "(unknown)".to_string());
+        let thread = std::thread::current().name().unwrap_or("<unnamed>").to_string();
+        tracing::error!(
+            panic.message = msg,
+            panic.location = %location,
+            panic.thread = %thread,
+            "panic"
+        );
+        default(info);
+    }));
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .init();
-
     let cli = parse_args();
     let cfg_path = cli
         .config_path
@@ -76,12 +201,17 @@ async fn main() -> Result<()> {
             let p = PathBuf::from("./config.toml");
             p.exists().then_some(p)
         });
-    if let Some(p) = &cfg_path {
-        tracing::info!(config = %p.display(), "loading config");
-    } else {
-        tracing::info!("no config file; using built-in defaults");
-    }
     let cfg = backend::config::Config::load(cfg_path.as_deref())?;
+
+    // Initialize logging AFTER loading the config so the level/format/
+    // destinations come from the user's TOML. Held guard keeps the
+    // non-blocking file appender alive until process exit.
+    let _log_guard = init_logging(&cfg.logging, &cfg.memory.dir)?;
+
+    match &cfg_path {
+        Some(p) => tracing::info!(config = %p.display(), "loaded config"),
+        None => tracing::info!("no config file; using built-in defaults"),
+    }
 
     tracing::info!(
         memory_dir = %cfg.memory.dir.display(),

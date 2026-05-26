@@ -69,6 +69,10 @@ impl Connector for GmailConnector {
     }
 
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<RawConnectorResult>> {
+        let started = std::time::Instant::now();
+        // NOTE: never log `query` verbatim — it may contain personal names
+        // / dates from the user's memory. Lengths and counts are fine.
+        tracing::debug!(query_len = query.len(), limit, "gmail_search_start");
         let access = self.auth.access_token().await?;
         let limit = limit.clamp(1, 25);
 
@@ -92,21 +96,41 @@ impl Connector for GmailConnector {
             .context("Gmail messages.list JSON")?;
 
         let Some(messages) = list.messages else {
+            tracing::info!(
+                n_hits = 0,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "gmail_search_done"
+            );
             return Ok(vec![]);
         };
+        tracing::debug!(
+            n_hits = messages.len(),
+            list_duration_ms = started.elapsed().as_millis() as u64,
+            "gmail_list_done"
+        );
 
         // 2) Fetch each message in full. Sequentially for v1 — concurrent
         // fetches are easy to add later but rarely the bottleneck (the
         // expensive part is downstream sanitization).
-        let mut out = Vec::with_capacity(messages.len());
+        let n_messages = messages.len().min(limit);
+        let mut out = Vec::with_capacity(n_messages);
+        let mut n_failed = 0usize;
         for m in messages.into_iter().take(limit) {
             match self.fetch_message(&m.id, &access).await {
                 Ok(r) => out.push(r),
                 Err(e) => {
-                    tracing::warn!(error = %e, id = %m.id, "gmail fetch failed; skipping");
+                    n_failed += 1;
+                    tracing::warn!(error = %e, id = %m.id, "gmail_fetch_failed");
                 }
             }
         }
+        tracing::info!(
+            n_listed = n_messages,
+            n_fetched = out.len(),
+            n_failed,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "gmail_search_done"
+        );
         Ok(out)
     }
 }
