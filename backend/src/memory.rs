@@ -105,12 +105,19 @@ pub enum ItemKind {
     /// is zeroed (`[forgotten <ts>]`); the sidecar remains for audit.
     ForgottenStub,
     /// A result fetched from a connector (e.g. Gmail, Drive, Calendar) in
-    /// response to an assistant-initiated SEARCH. Body is the
-    /// Preprocessor-sanitized content; tags include `connector:<name>` and
-    /// the source ID.
+    /// A result fetched from a worker (e.g. Gmail, the web) in response
+    /// to an assistant-initiated SEARCH, or pushed in autonomously by a
+    /// worker's tick. Body is the Preprocessor-sanitized content;
+    /// tags include `worker:<name>` (and, for back-compat with reads,
+    /// also `connector:<name>`) plus the source ID. Subsumes the older
+    /// `ConnectorFinding` and `ScoutFinding` variants (which remain
+    /// readable per Invariant #7).
+    WorkerFinding,
+    /// Legacy alias: items written when this codebase still split
+    /// "connector" and "scout" as two distinct slots. Reads only;
+    /// new items use `WorkerFinding`. See above.
     ConnectorFinding,
 }
-
 /// Legacy decay stage. The Curator used to advance items through these
 /// stages and destructively summarize them. The Curator has been removed
 /// (its mechanical jobs moved to the Indexer); this enum stays only so
@@ -537,7 +544,7 @@ impl MemoryStore {
                     ItemKind::UserMessage => "user_message",
                     ItemKind::Ingestion => "ingestion",
                     ItemKind::ScoutFinding => "scout_finding",
-                    ItemKind::ConnectorFinding => "connector_finding",
+                    ItemKind::ConnectorFinding | ItemKind::WorkerFinding => "worker_finding",
                     ItemKind::AssistantNote => "assistant_note",
                     ItemKind::PreprocessorStub | ItemKind::SanitizerStub => "preprocessor_stub",
                     ItemKind::PreprocessorError | ItemKind::SanitizerError => "preprocessor_error",

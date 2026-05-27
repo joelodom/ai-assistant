@@ -16,6 +16,7 @@ pub mod retrieval;
 pub mod scout;
 pub mod self_knowledge;
 pub mod vector_index;
+pub mod workers;
 pub mod ws;
 
 /// Back-compat module alias — old code (and integration tests) imported
