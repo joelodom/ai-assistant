@@ -59,7 +59,11 @@ fn extract_pdf(bytes: &[u8]) -> String {
                     bytes.len()
                 )
             } else {
-                format!("[PDF text-extracted, {} chars]\n{}", trimmed.len(), clip(trimmed, MAX_EXTRACTED_CHARS))
+                format!(
+                    "[PDF text-extracted, {} chars]\n{}",
+                    trimmed.len(),
+                    clip(trimmed, MAX_EXTRACTED_CHARS)
+                )
             }
         }
         Err(e) => format!(

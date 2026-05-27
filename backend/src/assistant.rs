@@ -48,6 +48,17 @@ pub struct Assistant {
     /// Maximum total READ_MANUAL fetches per turn. Counts each section
     /// pulled, across however many rounds.
     pub max_manual_reads: usize,
+    /// Max concurrent Preprocessor calls when fanning out connector
+    /// results. Each call spawns a fresh `claude` subprocess
+    /// (Invariant #2), so it's the subprocess startup that dominates;
+    /// 4-way parallelism cuts a 10-result Gmail page from ~170s wall
+    /// time to ~45s without changing semantics.
+    pub preprocess_concurrency: usize,
+    /// Max concurrent connectors within one SEARCH round. When the LLM
+    /// emits `SEARCH: gmail …` and `SEARCH: calendar …` in the same
+    /// reply, both run side-by-side. Each connector internally fans
+    /// out its own preprocessing.
+    pub connector_concurrency: usize,
     pub system_facts: Arc<crate::self_knowledge::SystemFacts>,
 }
 
@@ -126,10 +137,13 @@ impl Assistant {
             retrieval_weights: RetrievalWeights::default(),
             max_search_rounds: 2,
             max_manual_reads: 4,
+            preprocess_concurrency: 4,
+            connector_concurrency: 4,
             system_facts: Arc::new(crate::self_knowledge::SystemFacts::placeholder()),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         llm: Arc<dyn LlmClient>,
@@ -144,6 +158,8 @@ impl Assistant {
         retrieval_weights: RetrievalWeights,
         max_search_rounds: usize,
         max_manual_reads: usize,
+        preprocess_concurrency: usize,
+        connector_concurrency: usize,
         system_facts: Arc<crate::self_knowledge::SystemFacts>,
     ) -> Self {
         Self {
@@ -159,6 +175,8 @@ impl Assistant {
             retrieval_weights,
             max_search_rounds,
             max_manual_reads,
+            preprocess_concurrency,
+            connector_concurrency,
             system_facts,
         }
     }
@@ -268,7 +286,11 @@ impl Assistant {
             ItemKind::Ingestion
         };
         let is_hazmat = preprocessed.redaction_report.contains("HAZMAT BYPASS");
-        let user_importance = if is_hazmat { 0.8 } else { preprocessed.importance };
+        let user_importance = if is_hazmat {
+            0.8
+        } else {
+            preprocessed.importance
+        };
         let mut tags: Vec<String> = vec![];
         if is_hazmat {
             tags.push("hazmat".to_string());
@@ -329,6 +351,7 @@ impl Assistant {
                     "re_retrieving"
                 },
                 Some("Looking through memory for relevant context…".into()),
+                None,
             );
 
             // Rebuild prompt every iteration — memory may have grown via
@@ -390,6 +413,7 @@ impl Assistant {
                     "Asking {}…",
                     current_model.as_deref().unwrap_or("the model")
                 )),
+                None,
             );
             let opts = LlmOptions {
                 allowed_tools: vec!["WebSearch".into(), "WebFetch".into()],
@@ -434,7 +458,11 @@ impl Assistant {
                     .unwrap_or("")
                     .to_string();
                 let reason_len = reason.len();
-                escalation_reason = if reason.is_empty() { None } else { Some(reason) };
+                escalation_reason = if reason.is_empty() {
+                    None
+                } else {
+                    Some(reason)
+                };
                 let esc = self.escalation_model.clone().or_else(|| self.model.clone());
                 tracing::info!(
                     reason_len,
@@ -449,6 +477,7 @@ impl Assistant {
                         "Handing off to {} for deeper reasoning…",
                         esc.as_deref().unwrap_or("the escalation model")
                     )),
+                    None,
                 );
                 current_model = esc;
                 escalated = true;
@@ -458,14 +487,18 @@ impl Assistant {
             // READ_MANUAL — fetch sections before SEARCH, since manual
             // content often informs whether a search is needed.
             let manual_requests = parse_manual_markers(&reply);
-            if !manual_requests.is_empty()
-                && manual_excerpts.len() < self.max_manual_reads
-            {
+            if !manual_requests.is_empty() && manual_excerpts.len() < self.max_manual_reads {
                 let budget = self.max_manual_reads - manual_excerpts.len();
                 let requested: Vec<String> = manual_requests
                     .iter()
                     .take(budget)
-                    .map(|s| if s.is_empty() { "<TOC>".to_string() } else { s.clone() })
+                    .map(|s| {
+                        if s.is_empty() {
+                            "<TOC>".to_string()
+                        } else {
+                            s.clone()
+                        }
+                    })
                     .collect();
                 tracing::info!(
                     sections = ?requested,
@@ -476,6 +509,7 @@ impl Assistant {
                     status_tx,
                     "reading_manual",
                     Some(format!("Consulting manual: {}", requested.join(", "))),
+                    None,
                 );
                 for section in manual_requests.into_iter().take(budget) {
                     let (display_name, body) = if section.is_empty() {
@@ -509,19 +543,26 @@ impl Assistant {
                     connectors = ?connectors,
                     n_searches = searches.len(),
                     round = search_rounds,
+                    connector_concurrency = self.connector_concurrency,
                     "search_round_starting"
                 );
-                for (conn_name, query) in searches {
-                    emit_status(
-                        status_tx,
-                        "searching",
-                        Some(format!("Searching {conn_name}…")),
-                    );
-                    let summary = self
-                        .execute_search(&conn_name, &query, metadata)
-                        .await;
-                    search_log.push(summary);
-                }
+                // Run multiple SEARCH markers concurrently — each
+                // connector hits a different external service and each
+                // result inside hits the Preprocessor in parallel
+                // (execute_search owns its own fan-out). Order doesn't
+                // matter for the search_log preamble; the user just
+                // wants forward motion.
+                use futures::stream::{self, StreamExt};
+                let concurrency = self.connector_concurrency.max(1);
+                let summaries: Vec<String> = stream::iter(searches.into_iter())
+                    .map(|(conn_name, query)| async move {
+                        self.execute_search(&conn_name, &query, metadata, status_tx)
+                            .await
+                    })
+                    .buffer_unordered(concurrency)
+                    .collect()
+                    .await;
+                search_log.extend(summaries);
                 continue;
             }
 
@@ -541,8 +582,7 @@ impl Assistant {
         let (after_config_strip, config_requests) = strip_config_markers(&final_reply);
 
         // 4b. Handle FORGET markers in the (now config-stripped) final reply.
-        let (final_text, forgotten_item_id) =
-            self.handle_forget_markers(&after_config_strip).await;
+        let (final_text, forgotten_item_id) = self.handle_forget_markers(&after_config_strip).await;
 
         // 5. Persist assistant note.
         let model_used = current_model.clone().unwrap_or_default();
@@ -614,20 +654,51 @@ impl Assistant {
     /// non-drop results land in memory, embedded, and indexed.
     /// Returns a one-line summary suitable for surfacing in the user-
     /// visible preamble.
-    #[tracing::instrument(skip(self, metadata), fields(connector = connector_name, query_len = query.len()))]
+    ///
+    /// Preprocessing the N results is fanned out via `buffer_unordered`
+    /// (`preprocess_concurrency`, default 4) — each Preprocessor call is
+    /// a fresh `claude` subprocess (Invariant #2) so they are independent
+    /// and safe to run in parallel. Memory writes are then performed
+    /// serially: they're sub-millisecond and serializing them avoids any
+    /// HNSW upsert contention.
+    ///
+    /// Status frames are emitted with `slot = Some("connector:<name>")`
+    /// so the client can render each in-flight connector as its own row
+    /// in the status bar without overwriting siblings.
+    #[tracing::instrument(skip(self, metadata, status_tx), fields(connector = connector_name, query_len = query.len()))]
     async fn execute_search(
         &self,
         connector_name: &str,
         query: &str,
         metadata: &Metadata,
+        status_tx: Option<&tokio::sync::mpsc::UnboundedSender<shared::ServerMessage>>,
     ) -> String {
         let started = std::time::Instant::now();
+        let slot = format!("connector:{connector_name}");
+        emit_status(
+            status_tx,
+            "searching",
+            Some(format!("{connector_name}: starting…")),
+            Some(slot.clone()),
+        );
         let Some(connector) = self.connectors.get(connector_name) else {
             tracing::warn!("connector_not_found");
+            emit_status(
+                status_tx,
+                "searching",
+                Some(format!("{connector_name}: no such connector")),
+                Some(slot),
+            );
             return format!("(no such connector: {connector_name})");
         };
         if !connector.is_available() {
             tracing::warn!("connector_not_configured");
+            emit_status(
+                status_tx,
+                "searching",
+                Some(format!("{connector_name}: not configured")),
+                Some(slot),
+            );
             return format!(
                 "({connector_name} not configured — set it up via the client per the manual)"
             );
@@ -638,22 +709,83 @@ impl Assistant {
                 // NOTE: log error string and connector — NOT the user's query
                 // verbatim. query_len is in the span fields.
                 tracing::warn!(error = %e, "connector_search_failed");
+                emit_status(
+                    status_tx,
+                    "searching",
+                    Some(format!("{connector_name}: search failed")),
+                    Some(slot),
+                );
                 return format!("(search {connector_name} failed: {e})");
             }
         };
         let total = results.len();
+        if total == 0 {
+            emit_status(
+                status_tx,
+                "searching",
+                Some(format!("{connector_name}: 0 results")),
+                Some(slot),
+            );
+            tracing::info!(
+                total = 0,
+                kept = 0,
+                dropped = 0,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "connector_search_done"
+            );
+            return format!("🔍 {connector_name}: searched \"{query}\" → 0 results");
+        }
+        emit_status(
+            status_tx,
+            "searching",
+            Some(format!(
+                "{connector_name}: {total} results, preprocessing 0/{total}…"
+            )),
+            Some(slot.clone()),
+        );
+
+        // Fan-out: each preprocess call is a fresh `claude` subprocess
+        // (Invariant #2 — ephemeral, isolated). They are independent, so
+        // we run up to `preprocess_concurrency` at a time.
+        use futures::stream::{self, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let concurrency = self.preprocess_concurrency.max(1);
+        let done_counter = std::sync::Arc::new(AtomicUsize::new(0));
+        let preprocessor = self.preprocessor.clone();
+
+        let pp_results: Vec<(
+            crate::connectors::RawConnectorResult,
+            anyhow::Result<PreprocessorResult>,
+        )> = stream::iter(results.into_iter())
+            .map(|r| {
+                let pp = preprocessor.clone();
+                let counter = done_counter.clone();
+                let status_owned = status_tx.cloned();
+                let slot = slot.clone();
+                let conn_name = connector_name.to_string();
+                async move {
+                    let res = pp.preprocess(&r.content, InputProvenance::PublicWeb).await;
+                    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    emit_status(
+                        status_owned.as_ref(),
+                        "searching",
+                        Some(format!("{conn_name}: preprocessing {n}/{total}")),
+                        Some(slot),
+                    );
+                    (r, res)
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+
+        // Commit serially. Per-item commit is sub-ms; serializing avoids
+        // HNSW upsert contention and keeps the order in `.json` shards
+        // deterministic.
         let mut kept = 0usize;
         let mut dropped = 0usize;
-        for r in results {
-            // External data → PublicWeb provenance hint. Gmail content is
-            // technically personal, but it came through an external API —
-            // we want the Preprocessor to apply normal redaction without
-            // dropping aggressively.
-            let pp = match self
-                .preprocessor
-                .preprocess(&r.content, InputProvenance::PublicWeb)
-                .await
-            {
+        for (r, pp_res) in pp_results {
+            let pp = match pp_res {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(error = %e, "preprocessor failed on connector result");
@@ -718,6 +850,14 @@ impl Assistant {
                 }
             }
         }
+        emit_status(
+            status_tx,
+            "searching",
+            Some(format!(
+                "{connector_name}: done — kept {kept}, dropped {dropped}"
+            )),
+            Some(slot),
+        );
         tracing::info!(
             total,
             kept,
@@ -760,9 +900,7 @@ impl Assistant {
                         ));
                     }
                     Err(e) => {
-                        out.push_str(&format!(
-                            "(forget for {id} failed: {e}; nothing changed)\n"
-                        ));
+                        out.push_str(&format!("(forget for {id} failed: {e}; nothing changed)\n"));
                     }
                 }
             } else {
@@ -798,15 +936,17 @@ fn strip_config_markers(text: &str) -> (String, Vec<shared::ConfigRequestKind>) 
             }
         }
         if let Some(rest) = trimmed.strip_prefix(CONFIG_BEGIN_OAUTH_MARKER) {
-            let connector = rest.trim().split_whitespace().next().unwrap_or("").to_string();
+            let connector = rest
+                .trim()
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
             if !connector.is_empty() {
                 let scope = crate::connectors::scope_for(&connector)
                     .unwrap_or("(unknown-scope)")
                     .to_string();
-                requests.push(shared::ConfigRequestKind::BeginOAuth {
-                    connector,
-                    scope,
-                });
+                requests.push(shared::ConfigRequestKind::BeginOAuth { connector, scope });
                 continue;
             }
         }
@@ -821,15 +961,23 @@ fn strip_config_markers(text: &str) -> (String, Vec<shared::ConfigRequestKind>) 
 /// channel. A disconnected receiver is silently ignored — status frames
 /// are advisory; failing to deliver one is not an error condition for the
 /// turn.
+///
+/// `slot` is forwarded as-is: pass `None` for linear pipeline phases
+/// (retrieving / thinking / replying) that should own the default
+/// single-slot line, or `Some(key)` for concurrent activities that
+/// should each get their own live line (e.g. parallel connector
+/// preprocessing).
 fn emit_status(
     tx: Option<&tokio::sync::mpsc::UnboundedSender<shared::ServerMessage>>,
     phase: &str,
     detail: Option<String>,
+    slot: Option<String>,
 ) {
     if let Some(tx) = tx {
         let _ = tx.send(shared::ServerMessage::Status {
             phase: phase.to_string(),
             detail,
+            slot,
         });
     }
 }
@@ -841,7 +989,9 @@ fn parse_search_markers(text: &str) -> Vec<(String, String)> {
     let mut out = vec![];
     for line in text.lines() {
         let trimmed = line.trim();
-        let Some(rest) = trimmed.strip_prefix(SEARCH_MARKER) else { continue };
+        let Some(rest) = trimmed.strip_prefix(SEARCH_MARKER) else {
+            continue;
+        };
         let rest = rest.trim();
         if rest.is_empty() {
             continue;
@@ -879,7 +1029,18 @@ fn looks_like_question(text: &str) -> bool {
             .map(|w| {
                 matches!(
                     w.to_lowercase().as_str(),
-                    "what" | "when" | "where" | "who" | "why" | "how" | "did" | "do" | "can" | "should" | "is" | "are"
+                    "what"
+                        | "when"
+                        | "where"
+                        | "who"
+                        | "why"
+                        | "how"
+                        | "did"
+                        | "do"
+                        | "can"
+                        | "should"
+                        | "is"
+                        | "are"
                 )
             })
             .unwrap_or(false)
@@ -959,9 +1120,8 @@ fn render_manual_excerpts(excerpts: &[(String, String)]) -> String {
     if excerpts.is_empty() {
         return String::new();
     }
-    let mut s = String::from(
-        "RECENTLY READ MANUAL SECTIONS (you fetched these earlier in this turn):\n\n",
-    );
+    let mut s =
+        String::from("RECENTLY READ MANUAL SECTIONS (you fetched these earlier in this turn):\n\n");
     for (name, body) in excerpts {
         s.push_str(&format!("### {name}\n{body}\n\n"));
     }
@@ -1057,9 +1217,11 @@ fn build_prompt(
     }
     comp.manual_excerpts = buf.len() - mark;
     mark = buf.len();
-    buf.push_str("\nWhen asked about yourself, use the SYSTEM SELF-KNOWLEDGE block above for \
+    buf.push_str(
+        "\nWhen asked about yourself, use the SYSTEM SELF-KNOWLEDGE block above for \
                   runtime facts (model names, intervals, paths) and READ_MANUAL: <section> for \
-                  procedural / architectural detail. Be specific; do not invent details.\n\n");
+                  procedural / architectural detail. Be specific; do not invent details.\n\n",
+    );
     comp.orientation = buf.len() - mark;
     mark = buf.len();
 
@@ -1069,7 +1231,10 @@ fn build_prompt(
             .label
             .clone()
             .unwrap_or_else(|| format!("{:.2},{:.2}", geo.lat, geo.lon));
-        buf.push_str(&format!("Location: {label} ({:.4}, {:.4})\n", geo.lat, geo.lon));
+        buf.push_str(&format!(
+            "Location: {label} ({:.4}, {:.4})\n",
+            geo.lat, geo.lon
+        ));
     }
     buf.push('\n');
     comp.metadata = buf.len() - mark;
@@ -1189,7 +1354,9 @@ mod tests {
     #[tokio::test]
     async fn intro_changes_after_first_item() {
         let (_td, a) = setup().await;
-        a.respond(&pp_pass("Bought milk"), &meta(), false).await.unwrap();
+        a.respond(&pp_pass("Bought milk"), &meta(), false)
+            .await
+            .unwrap();
         let i = a.introduction().await;
         assert!(i.contains("Welcome back"));
     }
@@ -1209,10 +1376,8 @@ mod tests {
         let user_item = recent
             .iter()
             .find(|i| {
-                matches!(
-                    i.sidecar.kind,
-                    ItemKind::UserMessage | ItemKind::Ingestion
-                ) && i.body.contains("calendar")
+                matches!(i.sidecar.kind, ItemKind::UserMessage | ItemKind::Ingestion)
+                    && i.body.contains("calendar")
             })
             .expect("item not found");
         assert!((user_item.sidecar.importance - 0.91).abs() < 1e-5);
@@ -1233,15 +1398,21 @@ mod tests {
         .await
         .unwrap();
         let recent = a.memory.recent(5).unwrap();
-        assert!(recent.iter().any(|i| i.sidecar.kind == ItemKind::UserMessage));
+        assert!(recent
+            .iter()
+            .any(|i| i.sidecar.kind == ItemKind::UserMessage));
     }
 
     #[tokio::test]
     async fn preference_detected_and_stored() {
         let (_td, a) = setup().await;
-        a.respond(&pp_pass("Please stop telling me about crypto news."), &meta(), false)
-            .await
-            .unwrap();
+        a.respond(
+            &pp_pass("Please stop telling me about crypto news."),
+            &meta(),
+            false,
+        )
+        .await
+        .unwrap();
         let p = a.memory.preferences().await;
         assert_eq!(p.statements.len(), 1);
         assert!(p.statements[0].text.to_lowercase().contains("crypto"));
@@ -1250,9 +1421,13 @@ mod tests {
     #[tokio::test]
     async fn assistant_passes_websearch_and_webfetch_to_llm() {
         let (_td, a, mock) = setup_with_mock().await;
-        a.respond(&pp_pass("What's the weather in Lafayette today?"), &meta(), false)
-            .await
-            .unwrap();
+        a.respond(
+            &pp_pass("What's the weather in Lafayette today?"),
+            &meta(),
+            false,
+        )
+        .await
+        .unwrap();
         let calls = mock.calls();
         let turn = calls
             .iter()
@@ -1276,7 +1451,11 @@ mod tests {
             "ESCALATE_TO_OPUS: needs deep reasoning about a non-obvious tradeoff",
         );
         let outcome = assistant
-            .respond(&pp_pass("Should I use eventual consistency for X?"), &meta(), false)
+            .respond(
+                &pp_pass("Should I use eventual consistency for X?"),
+                &meta(),
+                false,
+            )
             .await
             .unwrap();
         assert!(outcome.escalated, "should have escalated");
@@ -1292,7 +1471,10 @@ mod tests {
         let mut assistant = Assistant::new(mock.clone(), store);
         assistant.model = Some("claude-sonnet-4-6".into());
         assistant.escalation_model = Some("claude-opus-4-7".into());
-        let outcome = assistant.respond(&pp_pass("anything"), &meta(), true).await.unwrap();
+        let outcome = assistant
+            .respond(&pp_pass("anything"), &meta(), true)
+            .await
+            .unwrap();
         assert!(!outcome.escalated);
         assert_eq!(outcome.model_used, "claude-opus-4-7");
     }
@@ -1302,11 +1484,21 @@ mod tests {
         let (_td, a, mock) = setup_with_mock().await;
         let sc = a
             .memory
-            .add("private note to forget", ItemKind::Ingestion, 0.5, None, "".into(), vec![])
+            .add(
+                "private note to forget",
+                ItemKind::Ingestion,
+                0.5,
+                None,
+                "".into(),
+                vec![],
+            )
             .await
             .unwrap();
         let id = sc.id.clone();
-        mock.respond_when("USER MESSAGE", &format!("Sure, forgetting that.\nFORGET: {id}\n"));
+        mock.respond_when(
+            "USER MESSAGE",
+            &format!("Sure, forgetting that.\nFORGET: {id}\n"),
+        );
 
         let outcome = a
             .respond(&pp_pass("forget the private note please"), &meta(), false)
@@ -1323,7 +1515,10 @@ mod tests {
         let (_td, a, mock) = setup_with_mock().await;
         a.respond(&pp_pass("hello"), &meta(), false).await.unwrap();
         let calls = mock.calls();
-        let turn = calls.iter().find(|c| c.prompt.contains("USER MESSAGE")).unwrap();
+        let turn = calls
+            .iter()
+            .find(|c| c.prompt.contains("USER MESSAGE"))
+            .unwrap();
         assert!(turn.prompt.contains("WebSearch"));
         assert!(turn.prompt.contains("FORGET:"));
     }
@@ -1331,7 +1526,9 @@ mod tests {
     #[tokio::test]
     async fn vector_is_written_on_respond() {
         let (_td, a) = setup().await;
-        a.respond(&pp_pass("learn this fact"), &meta(), false).await.unwrap();
+        a.respond(&pp_pass("learn this fact"), &meta(), false)
+            .await
+            .unwrap();
         let recent = a.memory.recent(5).unwrap();
         let item = recent
             .iter()
@@ -1351,7 +1548,10 @@ mod tests {
         let s = "Let me look this up.\nSEARCH: gmail from:dr.patel implant\nsome prose\nSEARCH: calendar dentist 2024";
         let p = parse_search_markers(s);
         assert_eq!(p.len(), 2);
-        assert_eq!(p[0], ("gmail".to_string(), "from:dr.patel implant".to_string()));
+        assert_eq!(
+            p[0],
+            ("gmail".to_string(), "from:dr.patel implant".to_string())
+        );
         assert_eq!(p[1], ("calendar".to_string(), "dentist 2024".to_string()));
     }
 
@@ -1414,12 +1614,21 @@ mod tests {
         );
 
         let outcome = a
-            .respond(&pp_pass("what did Dr. Patel say about the implant?"), &meta(), false)
+            .respond(
+                &pp_pass("what did Dr. Patel say about the implant?"),
+                &meta(),
+                false,
+            )
             .await
             .unwrap();
 
         // Search log should record exactly one search.
-        assert_eq!(outcome.search_log.len(), 1, "search_log = {:?}", outcome.search_log);
+        assert_eq!(
+            outcome.search_log.len(),
+            1,
+            "search_log = {:?}",
+            outcome.search_log
+        );
         assert!(outcome.search_log[0].contains("gmail"));
         assert!(outcome.search_log[0].contains("implant"));
 
@@ -1442,8 +1651,11 @@ mod tests {
             .any(|t| t == "source:gmail:abc123"));
 
         // Final reply incorporates the search result.
-        assert!(outcome.text.contains("implant") || outcome.text.contains("Patel"),
-                "final reply should reflect what we found: {}", outcome.text);
+        assert!(
+            outcome.text.contains("implant") || outcome.text.contains("Patel"),
+            "final reply should reflect what we found: {}",
+            outcome.text
+        );
     }
 
     #[tokio::test]
@@ -1457,10 +1669,7 @@ mod tests {
         // every iteration up to max_search_rounds.
         a.max_search_rounds = 1;
 
-        mock.respond_when(
-            "EXTERNAL SEARCH",
-            "SEARCH: notreal anything goes here\n",
-        );
+        mock.respond_when("EXTERNAL SEARCH", "SEARCH: notreal anything goes here\n");
 
         let outcome = a
             .respond(&pp_pass("search please"), &meta(), false)
@@ -1481,10 +1690,7 @@ mod tests {
         // The mock returns a SEARCH marker on every assistant call. Without
         // the depth bound, this would loop forever; with depth = 1, it
         // executes once and then accepts whatever the second call returns.
-        mock.respond_when(
-            "USER MESSAGE",
-            "SEARCH: gmail anything\n",
-        );
+        mock.respond_when("USER MESSAGE", "SEARCH: gmail anything\n");
 
         let outcome = a
             .respond(&pp_pass("question"), &meta(), false)
@@ -1517,7 +1723,10 @@ mod tests {
         let (_td, a, mock) = setup_with_mock().await;
         a.respond(&pp_pass("hi"), &meta(), false).await.unwrap();
         let calls = mock.calls();
-        let turn = calls.iter().find(|c| c.prompt.contains("USER MESSAGE")).unwrap();
+        let turn = calls
+            .iter()
+            .find(|c| c.prompt.contains("USER MESSAGE"))
+            .unwrap();
         assert!(turn.prompt.contains("SYSTEM MANUAL"));
         assert!(turn.prompt.contains("READ_MANUAL"));
         // TOC includes section names from the embedded default manual.
@@ -1541,10 +1750,7 @@ mod tests {
             "Per the manual, FORGET is for explicit user requests.",
         );
         // First pass: emit READ_MANUAL marker for the "markers" section.
-        mock.respond_when(
-            "USER MESSAGE",
-            "Let me check.\nREAD_MANUAL: markers\n",
-        );
+        mock.respond_when("USER MESSAGE", "Let me check.\nREAD_MANUAL: markers\n");
 
         let outcome = a
             .respond(&pp_pass("how do I forget something?"), &meta(), false)
@@ -1562,14 +1768,8 @@ mod tests {
         let mut a = a_base;
         a.max_manual_reads = 1;
 
-        mock.respond_when(
-            "RECENTLY READ MANUAL SECTIONS",
-            "Got the TOC. Done.",
-        );
-        mock.respond_when(
-            "USER MESSAGE",
-            "READ_MANUAL\n",
-        );
+        mock.respond_when("RECENTLY READ MANUAL SECTIONS", "Got the TOC. Done.");
+        mock.respond_when("USER MESSAGE", "READ_MANUAL\n");
 
         let outcome = a
             .respond(&pp_pass("what sections are in the manual?"), &meta(), false)
@@ -1588,10 +1788,7 @@ mod tests {
 
         // Mock always emits a manual marker — without the bound this
         // would loop until something else stopped it.
-        mock.respond_when(
-            "USER MESSAGE",
-            "READ_MANUAL: invariants\n",
-        );
+        mock.respond_when("USER MESSAGE", "READ_MANUAL: invariants\n");
 
         let outcome = a
             .respond(&pp_pass("question"), &meta(), false)

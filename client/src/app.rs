@@ -41,7 +41,9 @@ fn prefs_path() -> Option<PathBuf> {
 }
 
 fn load_prefs() -> Prefs {
-    let Some(p) = prefs_path() else { return Prefs::default() };
+    let Some(p) = prefs_path() else {
+        return Prefs::default();
+    };
     std::fs::read_to_string(&p)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -72,12 +74,18 @@ enum Turn {
 /// elapsed-time counter in the status bar reads from
 /// `AssistantApp.turn_started_at`, not from per-status timestamps —
 /// it shows total turn elapsed, not per-phase elapsed.
+///
+/// `inserted_at` is used to order the bar deterministically: the
+/// default slot (single linear pipeline phase) stays on top, and any
+/// concurrent slots (one per in-flight connector) are stacked
+/// underneath in the order they first appeared. Slots are keyed by the
+/// optional `slot` field of the wire frame — see `shared::ServerMessage::Status`.
 #[derive(Debug, Clone)]
 struct TurnStatus {
     phase: String,
     detail: Option<String>,
+    inserted_at: std::time::Instant,
 }
-
 pub struct AssistantApp {
     url: String,
     pending_url_edit: String,
@@ -89,8 +97,14 @@ pub struct AssistantApp {
     transcript: Vec<Turn>,
     /// Buffer accumulating reply chunks until ReplyDone.
     streaming_reply: String,
-    /// Live status from the backend during a turn. None when idle.
-    turn_status: Option<TurnStatus>,
+    /// Live status from the backend during a turn. Empty when idle.
+    /// Keyed by the optional `slot` field on each Status frame — an empty
+    /// string is the default slot (used for linear pipeline phases:
+    /// retrieving, thinking, replying, etc.); other keys (e.g.
+    /// `connector:gmail`) own their own live line so concurrent
+    /// connectors can show progress in parallel without overwriting
+    /// siblings. Cleared on ReplyDone / Error / Disconnect.
+    turn_status: std::collections::BTreeMap<String, TurnStatus>,
     /// When the user pressed Send for the current turn — drives the
     /// elapsed-time counter in the status bar. Cleared on ReplyDone /
     /// Error / Disconnect.
@@ -159,7 +173,7 @@ impl AssistantApp {
             connected: false,
             transcript: Vec::new(),
             streaming_reply: String::new(),
-            turn_status: None,
+            turn_status: std::collections::BTreeMap::new(),
             turn_started_at: None,
             input_buf: String::new(),
             pending_attachments: Vec::new(),
@@ -192,7 +206,7 @@ impl AssistantApp {
                     self.connected = false;
                     // Drop any in-flight status — the turn isn't coming
                     // back to us.
-                    self.turn_status = None;
+                    self.turn_status.clear();
                     self.turn_started_at = None;
                 }
                 NetToUi::Frame(f) => match f {
@@ -202,13 +216,21 @@ impl AssistantApp {
                         // frame (e.g. backend skipped it, or this is the
                         // intro), seeing chunks is itself proof we're in
                         // the replying phase.
-                        if self.turn_status.as_ref().map(|s| s.phase != "replying").unwrap_or(true)
+                        if self
+                            .turn_status
+                            .get("")
+                            .map(|s| s.phase != "replying")
+                            .unwrap_or(true)
                             && self.turn_started_at.is_some()
                         {
-                            self.turn_status = Some(TurnStatus {
-                                phase: "replying".into(),
-                                detail: None,
-                            });
+                            self.turn_status.insert(
+                                String::new(),
+                                TurnStatus {
+                                    phase: "replying".into(),
+                                    detail: None,
+                                    inserted_at: std::time::Instant::now(),
+                                },
+                            );
                         }
                     }
                     ServerMessage::ReplyDone { text, .. } => {
@@ -226,7 +248,7 @@ impl AssistantApp {
                             });
                         }
                         // Turn is over — clear the status bar.
-                        self.turn_status = None;
+                        self.turn_status.clear();
                         self.turn_started_at = None;
                     }
                     ServerMessage::StubNotice { text } => {
@@ -234,7 +256,7 @@ impl AssistantApp {
                             text,
                             ts: now_str(),
                         });
-                        self.turn_status = None;
+                        self.turn_status.clear();
                         self.turn_started_at = None;
                     }
                     ServerMessage::Error { text } => {
@@ -242,25 +264,51 @@ impl AssistantApp {
                             text,
                             ts: now_str(),
                         });
-                        self.turn_status = None;
+                        self.turn_status.clear();
                         self.turn_started_at = None;
                     }
                     ServerMessage::Pong => {}
                     ServerMessage::ConfigRequest { request } => {
                         self.handle_config_request(request);
                     }
-                    ServerMessage::ConfigStatus { connector, ok, message } => {
+                    ServerMessage::ConfigStatus {
+                        connector,
+                        ok,
+                        message,
+                    } => {
                         let prefix = if ok { "✓" } else { "✗" };
                         self.transcript.push(Turn::System {
                             text: format!("{prefix} [{connector}] {message}"),
                             ts: now_str(),
                         });
                     }
-                    ServerMessage::Status { phase, detail } => {
-                        // Update the live status bar. The bar shows what
-                        // the backend is currently doing; clears on
-                        // ReplyDone or Error.
-                        self.turn_status = Some(TurnStatus { phase, detail });
+                    ServerMessage::Status {
+                        phase,
+                        detail,
+                        slot,
+                    } => {
+                        // Update the live status bar. Each `slot` gets
+                        // its own row, so concurrent activities (e.g.
+                        // multiple connectors fanning out preprocessing
+                        // in parallel) don't overwrite each other. The
+                        // default slot ("") is for linear pipeline
+                        // phases (retrieving, thinking, replying).
+                        // Preserve the original insertion time so the
+                        // bar's ordering stays stable as updates arrive.
+                        let key = slot.unwrap_or_default();
+                        let inserted_at = self
+                            .turn_status
+                            .get(&key)
+                            .map(|s| s.inserted_at)
+                            .unwrap_or_else(std::time::Instant::now);
+                        self.turn_status.insert(
+                            key,
+                            TurnStatus {
+                                phase,
+                                detail,
+                                inserted_at,
+                            },
+                        );
                     }
                 },
             }
@@ -312,10 +360,15 @@ impl AssistantApp {
         // Light up the status bar immediately so the user sees activity
         // before the first server frame arrives.
         self.turn_started_at = Some(std::time::Instant::now());
-        self.turn_status = Some(TurnStatus {
-            phase: "sending".into(),
-            detail: Some("Delivering your message…".into()),
-        });
+        self.turn_status.clear();
+        self.turn_status.insert(
+            String::new(),
+            TurnStatus {
+                phase: "sending".into(),
+                detail: Some("Delivering your message…".into()),
+                inserted_at: std::time::Instant::now(),
+            },
+        );
         let msg = ClientMessage::Message {
             payload: MessagePayload {
                 content: text,
@@ -381,9 +434,7 @@ impl AssistantApp {
                 // spawns listener). Render a transcript note so the user
                 // sees the OAuth dance kicking off.
                 self.transcript.push(Turn::System {
-                    text: format!(
-                        "🔐 [{connector}] starting OAuth handshake (scope: {scope})…"
-                    ),
+                    text: format!("🔐 [{connector}] starting OAuth handshake (scope: {scope})…"),
                     ts: now_str(),
                 });
             }
@@ -502,7 +553,10 @@ fn render_user_outgoing(text: &str, attachments: &[Attachment]) -> String {
             s.push_str(&format!(
                 "\n[attached {:?}{} · {} · {}]",
                 a.kind,
-                a.name.as_deref().map(|n| format!(" {n}")).unwrap_or_default(),
+                a.name
+                    .as_deref()
+                    .map(|n| format!(" {n}"))
+                    .unwrap_or_default(),
                 a.mime,
                 approx_size(a),
             ));
@@ -566,9 +620,7 @@ impl eframe::App for AssistantApp {
         let (zoom_in, zoom_out, zoom_reset) = ctx.input(|i| {
             let mac_or_ctrl = i.modifiers.command || i.modifiers.mac_cmd || i.modifiers.ctrl;
             (
-                mac_or_ctrl
-                    && (i.key_pressed(egui::Key::Plus)
-                        || i.key_pressed(egui::Key::Equals)),
+                mac_or_ctrl && (i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals)),
                 mac_or_ctrl && i.key_pressed(egui::Key::Minus),
                 mac_or_ctrl && i.key_pressed(egui::Key::Num0),
             )
@@ -692,39 +744,65 @@ impl eframe::App for AssistantApp {
                 // seconds so the user can see the backend is alive even
                 // during multi-second LLM calls. Cleared by ReplyDone /
                 // Error / Disconnect.
-                if let Some(ts) = self.turn_status.clone() {
+                if !self.turn_status.is_empty() {
                     let elapsed = self
                         .turn_started_at
                         .map(|t| t.elapsed())
                         .unwrap_or_default();
-                    let icon = match ts.phase.as_str() {
-                        "sending" => "📤",
-                        "preprocessing" => "🛡",
-                        "retrieving" | "re_retrieving" => "🔎",
-                        "thinking" => "🧠",
-                        "searching" => "📨",
-                        "reading_manual" => "📖",
-                        "escalating" => "⏫",
-                        "replying" => "💬",
-                        _ => "•",
-                    };
-                    let label = match &ts.detail {
-                        Some(d) => format!("{icon} {} — {}", ts.phase, d),
-                        None => format!("{icon} {}", ts.phase),
-                    };
-                    let elapsed_str = format!(" ({:.1}s)", elapsed.as_secs_f32());
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new().size(14.0));
-                        ui.label(egui::RichText::new(label).color(
-                            egui::Color32::from_rgb(150, 200, 255),
-                        ));
-                        ui.weak(elapsed_str);
-                    });
-                    ui.add_space(2.0);
+                    // Render the default slot first (linear pipeline
+                    // phase), then any concurrent slots ordered by when
+                    // they first appeared — so siblings stay in a
+                    // stable order even as updates rewrite their
+                    // detail strings.
+                    let mut rows: Vec<(&String, &TurnStatus)> =
+                        self.turn_status.iter().collect();
+                    rows.sort_by_key(|(k, v)| (!k.is_empty(), v.inserted_at));
+                    let n_rows = rows.len();
+                    for (i, (_key, ts)) in rows.into_iter().enumerate() {
+                        let icon = match ts.phase.as_str() {
+                            "sending" => "📤",
+                            "preprocessing" => "🛡",
+                            "retrieving" | "re_retrieving" => "🔎",
+                            "thinking" => "🧠",
+                            "searching" => "📨",
+                            "reading_manual" => "📖",
+                            "escalating" => "⏫",
+                            "replying" => "💬",
+                            _ => "•",
+                        };
+                        let label = match &ts.detail {
+                            Some(d) => format!("{icon} {} — {}", ts.phase, d),
+                            None => format!("{icon} {}", ts.phase),
+                        };
+                        ui.horizontal(|ui| {
+                            // Spinner only on the first row — the
+                            // others share the same "we're working"
+                            // signal and don't need their own.
+                            if i == 0 {
+                                ui.add(egui::Spinner::new().size(14.0));
+                            } else {
+                                ui.add_space(18.0);
+                            }
+                            ui.label(egui::RichText::new(label).color(
+                                egui::Color32::from_rgb(150, 200, 255),
+                            ));
+                            // Elapsed only on the first row — it tracks
+                            // the whole turn, not per-slot.
+                            if i == 0 {
+                                let elapsed_str =
+                                    format!(" ({:.1}s)", elapsed.as_secs_f32());
+                                ui.weak(elapsed_str);
+                            }
+                        });
+                    }
+                    if n_rows > 0 {
+                        ui.add_space(2.0);
+                    }
                     // Keep the elapsed counter ticking even when the
                     // user isn't interacting.
                     ctx.request_repaint_after(std::time::Duration::from_millis(250));
                 }
+
 
                 // Pending attachments strip.
                 if !self.pending_attachments.is_empty() {
@@ -864,22 +942,39 @@ impl eframe::App for AssistantApp {
 }
 
 fn render_turn(ui: &mut egui::Ui, turn: &Turn) {
-    let (who, color, body, ts) = match turn {
+    let (who, header_color, body, ts) = match turn {
         Turn::User { text, ts } => ("you", egui::Color32::from_rgb(140, 200, 255), text, ts),
-        Turn::Assistant { text, ts } => {
-            ("assistant", egui::Color32::from_rgb(180, 230, 180), text, ts)
-        }
-        Turn::Stub { text, ts } => {
-            ("gate", egui::Color32::from_rgb(240, 200, 120), text, ts)
-        }
+        Turn::Assistant { text, ts } => (
+            "assistant",
+            egui::Color32::from_rgb(180, 230, 180),
+            text,
+            ts,
+        ),
+        Turn::Stub { text, ts } => ("gate", egui::Color32::from_rgb(240, 200, 120), text, ts),
         Turn::Error { text, ts } => ("error", egui::Color32::from_rgb(240, 120, 120), text, ts),
-        Turn::System { text, ts } => {
-            ("system", egui::Color32::from_rgb(200, 200, 200), text, ts)
-        }
+        Turn::System { text, ts } => ("system", egui::Color32::from_rgb(200, 200, 200), text, ts),
     };
     ui.horizontal(|ui| {
-        ui.colored_label(color, format!("{who} ·"));
+        ui.colored_label(header_color, format!("{who} ·"));
         ui.weak(ts);
     });
-    ui.label(body);
+    // Body color: keep the user's own typing at the theme default
+    // (already legible because it's what they typed), but brighten the
+    // backend's voice — assistant, gate notices, errors, system notes —
+    // so the assistant's longer replies are easier to read against the
+    // dark background. Stops short of pure white to avoid harshness.
+    match turn {
+        Turn::User { .. } => {
+            ui.label(body);
+        }
+        Turn::Assistant { .. } => {
+            ui.colored_label(egui::Color32::from_rgb(232, 232, 232), body);
+        }
+        Turn::Stub { .. } | Turn::System { .. } => {
+            ui.colored_label(egui::Color32::from_rgb(210, 210, 210), body);
+        }
+        Turn::Error { .. } => {
+            ui.colored_label(egui::Color32::from_rgb(240, 180, 180), body);
+        }
+    }
 }

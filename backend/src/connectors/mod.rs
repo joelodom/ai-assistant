@@ -201,7 +201,11 @@ impl ConnectorRegistry {
         );
         let mut listed_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         for c in &instances {
-            let status = if c.is_available() { "✓ ACTIVE" } else { "✗ NOT CONFIGURED" };
+            let status = if c.is_available() {
+                "✓ ACTIVE"
+            } else {
+                "✗ NOT CONFIGURED"
+            };
             s.push_str(&format!(
                 "  • {} [{}]\n    {}\n",
                 c.name(),
@@ -249,7 +253,10 @@ pub mod mock {
         }
 
         pub fn respond_when(&self, query: &str, results: Vec<RawConnectorResult>) {
-            self.canned.lock().unwrap().insert(query.to_string(), results);
+            self.canned
+                .lock()
+                .unwrap()
+                .insert(query.to_string(), results);
         }
 
         pub fn calls(&self) -> Vec<(String, usize)> {

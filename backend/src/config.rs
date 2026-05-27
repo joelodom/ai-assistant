@@ -180,14 +180,18 @@ impl Default for ClaudeCfg {
 
 impl ClaudeCfg {
     pub fn model_for_preprocessor(&self) -> String {
-        self.preprocessor_model.clone().unwrap_or_else(|| self.model.clone())
+        self.preprocessor_model
+            .clone()
+            .unwrap_or_else(|| self.model.clone())
     }
     /// Back-compat alias.
     pub fn model_for_sanitizer(&self) -> String {
         self.model_for_preprocessor()
     }
     pub fn model_for_assistant(&self) -> String {
-        self.assistant_model.clone().unwrap_or_else(|| self.model.clone())
+        self.assistant_model
+            .clone()
+            .unwrap_or_else(|| self.model.clone())
     }
     pub fn model_for_assistant_escalation(&self) -> String {
         self.assistant_escalation_model
@@ -195,7 +199,9 @@ impl ClaudeCfg {
             .unwrap_or_else(|| self.model.clone())
     }
     pub fn model_for_scout(&self) -> String {
-        self.scout_model.clone().unwrap_or_else(|| self.model.clone())
+        self.scout_model
+            .clone()
+            .unwrap_or_else(|| self.model.clone())
     }
 }
 

@@ -55,8 +55,12 @@ pub struct ClientSecretData {
 
 pub fn load_client_secret(path: &Path) -> Result<ClientSecretData> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let parsed: ClientSecretFile = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parsing {} as a Google OAuth client_secret JSON", path.display()))?;
+    let parsed: ClientSecretFile = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "parsing {} as a Google OAuth client_secret JSON",
+            path.display()
+        )
+    })?;
     let inner = parsed
         .installed
         .or(parsed.web)
@@ -153,8 +157,8 @@ impl OAuthClient {
             .expires_in()
             .unwrap_or_else(|| std::time::Duration::from_secs(3600));
         g.access_token = new.access_token().secret().clone();
-        g.expires_at = Utc::now()
-            + ChronoDuration::from_std(expires_in).unwrap_or(ChronoDuration::hours(1));
+        g.expires_at =
+            Utc::now() + ChronoDuration::from_std(expires_in).unwrap_or(ChronoDuration::hours(1));
         // Google sometimes rotates refresh tokens.
         if let Some(rt) = new.refresh_token() {
             g.refresh_token = rt.secret().clone();

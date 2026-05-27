@@ -101,23 +101,39 @@ impl SystemFacts {
     }
 
     pub fn render_prompt_block(&self, memory_item_count: usize) -> String {
-        let mut s = String::from("SYSTEM SELF-KNOWLEDGE (current runtime configuration — accurate as of this turn):\n");
+        let mut s = String::from(
+            "SYSTEM SELF-KNOWLEDGE (current runtime configuration — accurate as of this turn):\n",
+        );
         s.push_str(&format!("  • Build version: {}\n", self.build_version));
         s.push_str(&format!(
             "  • Security Preprocessor model: {}\n",
             self.preprocessor_model
         ));
-        s.push_str(&format!("  • Assistant (Core) primary model: {}\n", self.assistant_model));
-        s.push_str(&format!("  • Assistant escalation model: {}\n", self.assistant_escalation_model));
+        s.push_str(&format!(
+            "  • Assistant (Core) primary model: {}\n",
+            self.assistant_model
+        ));
+        s.push_str(&format!(
+            "  • Assistant escalation model: {}\n",
+            self.assistant_escalation_model
+        ));
         s.push_str(&format!(
             "  • Scout model: {}  ({}, every {} min)\n",
             self.scout_model,
-            if self.scout_enabled { "enabled" } else { "disabled" },
+            if self.scout_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
             self.scout_interval_minutes,
         ));
         s.push_str(&format!(
             "  • Indexer: {}, every {} min, batch {} (mechanical, no LLM)\n",
-            if self.indexer_enabled { "enabled" } else { "disabled" },
+            if self.indexer_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
             self.indexer_interval_minutes,
             self.indexer_batch_size,
         ));
@@ -132,7 +148,10 @@ impl SystemFacts {
             self.retrieval_gamma,
             self.retrieval_half_life_days,
         ));
-        s.push_str(&format!("  • Memory directory: {}\n", self.memory_dir.display()));
+        s.push_str(&format!(
+            "  • Memory directory: {}\n",
+            self.memory_dir.display()
+        ));
         s.push_str(&format!("  • Memory item count: {}\n", memory_item_count));
         s.push_str(&format!("  • Listening on: ws://{}/ws\n", self.server_addr));
         s

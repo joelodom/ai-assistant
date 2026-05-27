@@ -165,7 +165,10 @@ mod tests {
         let m = Manual::open_or_seed(td.path()).unwrap();
         assert!(td.path().join(MANUAL_FILENAME).exists());
         let toc = m.toc();
-        assert!(!toc.is_empty(), "TOC should be non-empty from embedded default");
+        assert!(
+            !toc.is_empty(),
+            "TOC should be non-empty from embedded default"
+        );
         // Spot-check: a few sections we know are in the default.
         assert!(toc.iter().any(|s| s == "architecture"));
         assert!(toc.iter().any(|s| s == "invariants"));

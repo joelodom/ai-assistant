@@ -131,6 +131,8 @@ pub async fn build_app(cfg: config::Config) -> anyhow::Result<Built> {
         cfg.retrieval.clone(),
         2, // max_search_rounds — bound to keep latency + cost predictable
         4, // max_manual_reads
+        4, // preprocess_concurrency — fans out connector preprocessing
+        4, // connector_concurrency — fans out parallel SEARCH markers
         facts,
     ));
     let state = ws::AppState {

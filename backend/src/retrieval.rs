@@ -201,13 +201,17 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    async fn build() -> (TempDir, Arc<MemoryStore>, Arc<MockEmbedder>, Arc<VectorIndex>) {
+    async fn build() -> (
+        TempDir,
+        Arc<MemoryStore>,
+        Arc<MockEmbedder>,
+        Arc<VectorIndex>,
+    ) {
         let td = TempDir::new().unwrap();
         let mem = Arc::new(MemoryStore::open(td.path().to_path_buf()).await.unwrap());
         let emb = Arc::new(MockEmbedder::new());
-        let idx = Arc::new(
-            VectorIndex::open(mem.root(), emb.model_name(), emb.dimension()).unwrap(),
-        );
+        let idx =
+            Arc::new(VectorIndex::open(mem.root(), emb.model_name(), emb.dimension()).unwrap());
         (td, mem, emb, idx)
     }
 
@@ -220,7 +224,14 @@ mod tests {
         days_old: i64,
     ) -> String {
         let sc = memory
-            .add(body, ItemKind::Ingestion, importance, None, "".into(), vec![])
+            .add(
+                body,
+                ItemKind::Ingestion,
+                importance,
+                None,
+                "".into(),
+                vec![],
+            )
             .await
             .unwrap();
         let item = memory.get(&sc.id).unwrap().unwrap();
@@ -242,14 +253,20 @@ mod tests {
     async fn strong_match_old_still_returned() {
         let (_td, mem, emb, idx) = build().await;
         // Old item that should match the query semantically (shared tokens).
-        let old_id = add_with_age(&mem, &emb, &idx, "dentist appointment scheduling", 0.5, 300).await;
+        let old_id =
+            add_with_age(&mem, &emb, &idx, "dentist appointment scheduling", 0.5, 300).await;
         // Recent noise.
         let _new = add_with_age(&mem, &emb, &idx, "buy groceries milk eggs", 0.5, 0).await;
 
         let w = RetrievalWeights::default();
-        let hits = retrieve(&mem, &*emb, &idx, &w, "dentist appointment", 5).await.unwrap();
+        let hits = retrieve(&mem, &*emb, &idx, &w, "dentist appointment", 5)
+            .await
+            .unwrap();
         let ids: Vec<_> = hits.iter().map(|s| s.item.sidecar.id.clone()).collect();
-        assert!(ids.contains(&old_id), "old strong match should be in results: {ids:?}");
+        assert!(
+            ids.contains(&old_id),
+            "old strong match should be in results: {ids:?}"
+        );
     }
 
     #[tokio::test]
@@ -262,19 +279,27 @@ mod tests {
         let _old = add_with_age(&mem, &emb, &idx, "dentist appointment scheduling", 0.5, 365).await;
 
         let w = RetrievalWeights::default();
-        let hits = retrieve(&mem, &*emb, &idx, &w, "totally unrelated text", 5).await.unwrap();
+        let hits = retrieve(&mem, &*emb, &idx, &w, "totally unrelated text", 5)
+            .await
+            .unwrap();
         let ids: Vec<_> = hits.iter().map(|s| s.item.sidecar.id.clone()).collect();
-        assert!(ids.contains(&new_id), "new item should be in results via recency: {ids:?}");
+        assert!(
+            ids.contains(&new_id),
+            "new item should be in results via recency: {ids:?}"
+        );
     }
 
     #[tokio::test]
     async fn weak_match_old_buried() {
         let (_td, mem, emb, idx) = build().await;
         let weak_old = add_with_age(&mem, &emb, &idx, "ancient unrelated text", 0.2, 400).await;
-        let _strong_new = add_with_age(&mem, &emb, &idx, "dentist tuesday appointment", 0.8, 0).await;
+        let _strong_new =
+            add_with_age(&mem, &emb, &idx, "dentist tuesday appointment", 0.8, 0).await;
 
         let w = RetrievalWeights::default();
-        let hits = retrieve(&mem, &*emb, &idx, &w, "dentist appointment", 1).await.unwrap();
+        let hits = retrieve(&mem, &*emb, &idx, &w, "dentist appointment", 1)
+            .await
+            .unwrap();
         // Top hit should NOT be the weak old item.
         assert!(!hits.is_empty());
         assert_ne!(hits[0].item.sidecar.id, weak_old);
@@ -294,9 +319,17 @@ mod tests {
         let hi = add_with_age(&mem, &emb, &idx, body, 0.95, 30).await;
 
         let w = RetrievalWeights::default();
-        let hits = retrieve(&mem, &*emb, &idx, &w, "totally unrelated xyz topic", 5).await.unwrap();
-        let hi_rank = hits.iter().position(|s| s.item.sidecar.id == hi).expect("hi missing");
-        let lo_rank = hits.iter().position(|s| s.item.sidecar.id == lo).expect("lo missing");
+        let hits = retrieve(&mem, &*emb, &idx, &w, "totally unrelated xyz topic", 5)
+            .await
+            .unwrap();
+        let hi_rank = hits
+            .iter()
+            .position(|s| s.item.sidecar.id == hi)
+            .expect("hi missing");
+        let lo_rank = hits
+            .iter()
+            .position(|s| s.item.sidecar.id == lo)
+            .expect("lo missing");
         assert!(
             hi_rank < lo_rank,
             "high-importance item should rank above low-importance (hi at {hi_rank}, lo at {lo_rank})"
@@ -314,7 +347,9 @@ mod tests {
         idx.remove(&id);
 
         let w = RetrievalWeights::default();
-        let hits = retrieve(&mem, &*emb, &idx, &w, "secret thing", 10).await.unwrap();
+        let hits = retrieve(&mem, &*emb, &idx, &w, "secret thing", 10)
+            .await
+            .unwrap();
         let ids: Vec<_> = hits.iter().map(|s| s.item.sidecar.id.clone()).collect();
         assert!(!ids.contains(&id));
     }
@@ -324,15 +359,27 @@ mod tests {
         struct FailEmb;
         #[async_trait::async_trait]
         impl Embedder for FailEmb {
-            fn dimension(&self) -> usize { 384 }
-            fn model_name(&self) -> &str { "fail" }
+            fn dimension(&self) -> usize {
+                384
+            }
+            fn model_name(&self) -> &str {
+                "fail"
+            }
             async fn embed(&self, _: &str) -> Result<Vec<f32>> {
                 Err(anyhow::anyhow!("embedding broken"))
             }
         }
         let (_td, mem, _emb, idx) = build().await;
         // Add an item via the real (mock) embedder.
-        let _id = add_with_age(&mem, &MockEmbedder::new(), &idx, "dentist appointment", 0.5, 0).await;
+        let _id = add_with_age(
+            &mem,
+            &MockEmbedder::new(),
+            &idx,
+            "dentist appointment",
+            0.5,
+            0,
+        )
+        .await;
 
         // Now query with a failing embedder — should still return results.
         let fail = FailEmb;

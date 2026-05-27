@@ -134,12 +134,16 @@ reply to the user. Use them when appropriate; never speculatively.
   as `id=...`.
 
 - `SEARCH: <connector> <query>` — runs a search against a configured
+- `SEARCH: <connector> <query>` — runs a search against a configured
   connector. Each result passes through the Preprocessor and lands in
   memory as a ConnectorFinding. You're re-prompted with the new memory
   available. Bounded at 2 search rounds per turn. Use when the answer
   is likely outside current memory but inside one of the connected
-  sources.
-
+  sources. Multiple SEARCH markers in one reply run **in parallel**
+  (default 4-way), and within a single connector the per-result
+  Preprocessor calls also fan out in parallel — so a 10-result Gmail
+  page no longer serializes 10×15s of Haiku latency. Status frames per
+  connector show live progress in the client status bar.
 - `READ_MANUAL: <section-name>` — fetch a section of this manual.
 - `READ_MANUAL` (alone, no args) — fetch the table of contents.
   Bounded at 4 reads per turn. Use when you need procedural reference,
@@ -518,8 +522,16 @@ if that content shouldn't persist.
 - `manual_reads_requested` / `manual_section_not_found` — was the
   manual helpful? Did the assistant ask for a section that doesn't
   exist?
-- `search_round_starting` / `connector_search_done` (`total`, `kept`,
-  `dropped`) — what came back from external sources.
+- `search_round_starting` (`connectors`, `n_searches`, `round`,
+  `connector_concurrency`) / `connector_search_done` (`total`, `kept`,
+  `dropped`, `duration_ms`) — what came back from external sources.
+  Multiple SEARCH markers in one reply fan out across connectors in
+  parallel (default 4-way); within one connector, per-result
+  Preprocessor calls also fan out (default 4-way). If a single Gmail
+  turn still dominates the latency, look at `preprocess_done`
+  `duration_ms` per call and at the spread vs. the per-connector
+  total — that tells you whether Haiku itself slowed down or whether
+  serialization crept back in.
 - `gmail_search_done` (`n_listed`, `n_fetched`, `n_failed`,
   `duration_ms`) — Gmail API performance.
 - `config_payload_received` (`kind`, `connector`) — setup flow events.

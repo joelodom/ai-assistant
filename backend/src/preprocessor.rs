@@ -325,7 +325,10 @@ mod tests {
         );
         let pp = Preprocessor::new(mock);
         let r = pp
-            .preprocess("Met with Dr. Patel about implant", InputProvenance::Personal)
+            .preprocess(
+                "Met with Dr. Patel about implant",
+                InputProvenance::Personal,
+            )
             .await
             .unwrap();
         assert_eq!(r.tier, Tier::Pass);
@@ -400,7 +403,8 @@ mod tests {
     fn legacy_response_without_importance_field_still_parses() {
         // Old sanitizer responses didn't include importance. Parser should
         // accept and default to 0.5 (or 0.0 for drop).
-        let r = parse_response(r#"{"tier":"pass","output":"hello","redaction_report":""}"#).unwrap();
+        let r =
+            parse_response(r#"{"tier":"pass","output":"hello","redaction_report":""}"#).unwrap();
         assert!((r.importance - 0.5).abs() < 1e-6);
     }
 }

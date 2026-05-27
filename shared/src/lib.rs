@@ -63,10 +63,7 @@ pub enum ConfigPayloadKind {
     /// Client has bound an OAuth loopback listener at this port and is
     /// ready to receive the authorization redirect from Google. Backend
     /// uses the port to mint the auth URL.
-    ConnectorLoopbackReady {
-        connector: String,
-        port: u16,
-    },
+    ConnectorLoopbackReady { connector: String, port: u16 },
     /// Client's loopback listener received the OAuth redirect. Backend
     /// validates `state` against its pending entry and exchanges the code
     /// for tokens.
@@ -123,7 +120,9 @@ pub struct Geolocation {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     /// Streaming chunk of an assistant reply.
-    ReplyChunk { text: String },
+    ReplyChunk {
+        text: String,
+    },
     /// End-of-reply marker. `text` may carry a final non-streamed payload
     /// (e.g. when the backend chose to send the whole thing at once).
     ReplyDone {
@@ -134,14 +133,20 @@ pub enum ServerMessage {
     },
     /// Sanitizer dropped or redacted something — let the user know without
     /// revealing the dropped content.
-    StubNotice { text: String },
+    StubNotice {
+        text: String,
+    },
     /// Backend-side error surfaced to the user.
-    Error { text: String },
+    Error {
+        text: String,
+    },
     Pong,
     /// Structured ask for the client to perform a configuration step
     /// (open a file picker, bind a loopback, launch a browser). Driven by
     /// the assistant's config markers — see SPEC §19.
-    ConfigRequest { request: ConfigRequestKind },
+    ConfigRequest {
+        request: ConfigRequestKind,
+    },
     /// Result of a ConfigPayload the client just sent. Rendered in the
     /// transcript as a system note.
     ConfigStatus {
@@ -158,10 +163,22 @@ pub enum ServerMessage {
     /// `thinking`, `searching`, `reading_manual`, `escalating`,
     /// `replying`); `detail` is an optional one-line human-readable
     /// elaboration (e.g. `"gmail: 4 results, kept 3"`).
+    ///
+    /// `slot` lets concurrent activities (e.g. two connectors being
+    /// preprocessed in parallel) each own their own line in the client's
+    /// status bar without overwriting each other. When `slot` is `None`,
+    /// the frame replaces the default (single-slot) line — used for
+    /// linear pipeline phases like `retrieving`/`thinking`/`replying`.
+    /// When `slot` is `Some(key)`, the client keeps a separate live line
+    /// per key, so e.g. `slot = Some("connector:gmail")` and
+    /// `slot = Some("connector:calendar")` can stream independent
+    /// progress at the same time.
     Status {
         phase: String,
         #[serde(default)]
         detail: Option<String>,
+        #[serde(default)]
+        slot: Option<String>,
     },
 }
 
@@ -189,10 +206,7 @@ pub enum ConfigRequestKind {
     },
     /// Open this URL in the user's browser. The client should also continue
     /// listening on the loopback bound in the BeginOAuth step.
-    OpenBrowser {
-        url: String,
-        hint: String,
-    },
+    OpenBrowser { url: String, hint: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

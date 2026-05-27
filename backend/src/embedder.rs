@@ -67,7 +67,9 @@ pub struct MockEmbedder {
 
 impl MockEmbedder {
     pub fn new() -> Self {
-        Self { dim: MOCK_EMBEDDING_DIM }
+        Self {
+            dim: MOCK_EMBEDDING_DIM,
+        }
     }
 
     pub fn with_dim(dim: usize) -> Self {
@@ -177,10 +179,8 @@ mod fastembed_impl {
                 return Ok(());
             }
             let model = fastembed::TextEmbedding::try_new(
-                fastembed::InitOptions::new(
-                    fastembed::EmbeddingModel::MultilingualE5Small,
-                )
-                .with_show_download_progress(false),
+                fastembed::InitOptions::new(fastembed::EmbeddingModel::MultilingualE5Small)
+                    .with_show_download_progress(false),
             )
             .context("failed to initialize fastembed model")?;
             *g = Some(model);

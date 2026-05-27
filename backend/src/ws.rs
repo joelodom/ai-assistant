@@ -130,8 +130,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 .await;
             }
 
-
-
             ClientMessage::ConfigPayload { payload } => {
                 // Sensitive payload — bypass Preprocessor + memory (Invariant #8).
                 // Dispatch directly to the config protocol handler.
@@ -195,11 +193,11 @@ async fn run_assistant_turn(
     metadata: Metadata,
     force_opus: bool,
 ) {
-    let (status_tx, mut status_rx) =
-        tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
-    let respond_fut = state
-        .assistant
-        .respond_with_status(&preprocessed, &metadata, force_opus, Some(&status_tx));
+    let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
+    let respond_fut =
+        state
+            .assistant
+            .respond_with_status(&preprocessed, &metadata, force_opus, Some(&status_tx));
     tokio::pin!(respond_fut);
 
     let result = loop {
@@ -230,6 +228,7 @@ async fn run_assistant_turn(
                 &ServerMessage::Status {
                     phase: "replying".into(),
                     detail: None,
+                    slot: None,
                 },
             )
             .await;
@@ -392,8 +391,7 @@ async fn handle_user_message(
         Ok(PreprocessorResult {
             tier: Tier::Pass,
             output: bundle.clone(),
-            redaction_report: "HAZMAT BYPASS — Preprocessor skipped at user request"
-                .to_string(),
+            redaction_report: "HAZMAT BYPASS — Preprocessor skipped at user request".to_string(),
             importance: 0.8,
             importance_reason: Some("HAZMAT bypass — user explicitly elevated".into()),
         })
@@ -407,6 +405,7 @@ async fn handle_user_message(
             &ServerMessage::Status {
                 phase: "preprocessing".into(),
                 detail: Some("Reviewing your message…".into()),
+                slot: None,
             },
         )
         .await;
@@ -470,4 +469,3 @@ async fn handle_user_message(
 
     run_assistant_turn(state, sender, preprocessed, metadata, force_opus).await;
 }
-

@@ -75,8 +75,8 @@ fn parse_args() -> CliArgs {
 /// dropped at shutdown.
 fn init_logging(cfg: &LoggingCfg, memory_dir: &Path) -> Result<Option<WorkerGuard>> {
     // Filter: RUST_LOG wins; else the configured level.
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(cfg.level.as_str()));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(cfg.level.as_str()));
 
     // Optional file appender.
     let mut guard: Option<WorkerGuard> = None;
@@ -180,7 +180,10 @@ fn install_panic_hook() {
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "(unknown)".to_string());
-        let thread = std::thread::current().name().unwrap_or("<unnamed>").to_string();
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_string();
         tracing::error!(
             panic.message = msg,
             panic.location = %location,
@@ -194,13 +197,10 @@ fn install_panic_hook() {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = parse_args();
-    let cfg_path = cli
-        .config_path
-        .clone()
-        .or_else(|| {
-            let p = PathBuf::from("./config.toml");
-            p.exists().then_some(p)
-        });
+    let cfg_path = cli.config_path.clone().or_else(|| {
+        let p = PathBuf::from("./config.toml");
+        p.exists().then_some(p)
+    });
     let cfg = backend::config::Config::load(cfg_path.as_deref())?;
 
     // Initialize logging AFTER loading the config so the level/format/

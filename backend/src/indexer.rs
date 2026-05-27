@@ -164,10 +164,18 @@ mod tests {
         let td = TempDir::new().unwrap();
         let mem = Arc::new(MemoryStore::open(td.path().to_path_buf()).await.unwrap());
         let emb: Arc<dyn Embedder> = Arc::new(MockEmbedder::new());
-        let idx = Arc::new(VectorIndex::open(mem.root(), emb.model_name(), emb.dimension()).unwrap());
+        let idx =
+            Arc::new(VectorIndex::open(mem.root(), emb.model_name(), emb.dimension()).unwrap());
 
         let sc = mem
-            .add("hello world", ItemKind::Ingestion, 0.5, None, "".into(), vec![])
+            .add(
+                "hello world",
+                ItemKind::Ingestion,
+                0.5,
+                None,
+                "".into(),
+                vec![],
+            )
             .await
             .unwrap();
         assert!(idx.is_empty());
@@ -190,7 +198,8 @@ mod tests {
         let td = TempDir::new().unwrap();
         let mem = Arc::new(MemoryStore::open(td.path().to_path_buf()).await.unwrap());
         let emb: Arc<dyn Embedder> = Arc::new(MockEmbedder::new());
-        let idx = Arc::new(VectorIndex::open(mem.root(), emb.model_name(), emb.dimension()).unwrap());
+        let idx =
+            Arc::new(VectorIndex::open(mem.root(), emb.model_name(), emb.dimension()).unwrap());
 
         let sc = mem
             .add("private", ItemKind::Ingestion, 0.5, None, "".into(), vec![])
@@ -213,10 +222,13 @@ mod tests {
         let td = TempDir::new().unwrap();
         let mem = Arc::new(MemoryStore::open(td.path().to_path_buf()).await.unwrap());
         let emb: Arc<dyn Embedder> = Arc::new(MockEmbedder::new());
-        let idx = Arc::new(VectorIndex::open(mem.root(), emb.model_name(), emb.dimension()).unwrap());
+        let idx =
+            Arc::new(VectorIndex::open(mem.root(), emb.model_name(), emb.dimension()).unwrap());
 
         // Record an OLD model name on disk to simulate a model change.
-        mem.write_embedding_model("old-model-v0", 384).await.unwrap();
+        mem.write_embedding_model("old-model-v0", 384)
+            .await
+            .unwrap();
 
         let sc = mem
             .add("hi", ItemKind::Ingestion, 0.5, None, "".into(), vec![])
@@ -247,7 +259,8 @@ mod tests {
         let td = TempDir::new().unwrap();
         let mem = Arc::new(MemoryStore::open(td.path().to_path_buf()).await.unwrap());
         let emb: Arc<dyn Embedder> = Arc::new(MockEmbedder::new());
-        let idx = Arc::new(VectorIndex::open(mem.root(), emb.model_name(), emb.dimension()).unwrap());
+        let idx =
+            Arc::new(VectorIndex::open(mem.root(), emb.model_name(), emb.dimension()).unwrap());
 
         mem.add("x", ItemKind::Ingestion, 0.5, None, "".into(), vec![])
             .await

@@ -150,9 +150,7 @@ impl VectorIndex {
             })
             .collect();
         // Sort descending by score.
-        scored.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored
             .into_iter()
             .take(k)
@@ -170,8 +168,7 @@ impl VectorIndex {
             model: self.model.read().unwrap().clone(),
             dim: self.dim,
             item_ids: {
-                let mut ids: Vec<String> =
-                    self.vectors.read().unwrap().keys().cloned().collect();
+                let mut ids: Vec<String> = self.vectors.read().unwrap().keys().cloned().collect();
                 ids.sort();
                 ids
             },

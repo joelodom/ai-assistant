@@ -200,7 +200,9 @@ fn run_oauth_listener(
     let mut state: Option<String> = None;
     let mut error: Option<String> = None;
     for kv in query.split('&') {
-        let Some((k, v)) = kv.split_once('=') else { continue };
+        let Some((k, v)) = kv.split_once('=') else {
+            continue;
+        };
         let dec = urlencoding::decode(v)
             .unwrap_or(std::borrow::Cow::Borrowed(v))
             .into_owned();

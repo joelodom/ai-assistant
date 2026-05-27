@@ -266,6 +266,23 @@ ingests non-drop results as `ItemKind::ConnectorFinding` items.
 After ingestion the assistant is re-prompted with the now-updated memory.
 Bounded at `max_search_rounds` (default 2) so the loop can't recurse forever.
 
+**Parallelism.** Two layers of fan-out:
+
+- Multiple `SEARCH:` markers in a single reply run concurrently
+  (`Assistant.connector_concurrency`, default 4) — each connector hits
+  its own external service.
+- Within one connector, the per-result Preprocessor calls also fan out
+  (`Assistant.preprocess_concurrency`, default 4) via
+  `futures::stream::buffer_unordered`. Each Preprocessor call is a
+  fresh `claude` subprocess (Invariant #2), so they're independent;
+  4-way parallelism cuts a 10-result Gmail page from ~170s wall to
+  ~45s. Memory writes are still serial — they're sub-millisecond and
+  serializing them avoids HNSW upsert contention.
+
+Status frames carry a `slot` field so the client status bar can show
+each in-flight connector as its own row, instead of a single line that
+flickers between concurrent activities. See
+`shared::ServerMessage::Status`.
 **Defense in depth.** Each connector is bound to the narrowest possible
 OAuth scope (Gmail uses `gmail.readonly`). The connector trait deliberately
 exposes only `search` — there is no `.send()` or `.delete()` method for a

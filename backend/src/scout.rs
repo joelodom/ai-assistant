@@ -55,8 +55,7 @@ impl Scout {
             .filter(|i| {
                 !matches!(
                     i.sidecar.kind,
-                    crate::memory::ItemKind::SelfKnowledge
-                        | crate::memory::ItemKind::AssistantNote
+                    crate::memory::ItemKind::SelfKnowledge | crate::memory::ItemKind::AssistantNote
                 )
             })
             .collect();

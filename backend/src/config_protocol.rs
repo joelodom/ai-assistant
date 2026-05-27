@@ -144,7 +144,10 @@ impl ConfigProtocol {
             .or_else(|| parsed.get("web"))
             .unwrap();
         if inner.get("client_id").and_then(|v| v.as_str()).is_none()
-            || inner.get("client_secret").and_then(|v| v.as_str()).is_none()
+            || inner
+                .get("client_secret")
+                .and_then(|v| v.as_str())
+                .is_none()
         {
             bail!("config: client_secret.json missing client_id or client_secret");
         }
@@ -169,11 +172,7 @@ impl ConfigProtocol {
         })
     }
 
-    async fn handle_loopback_ready(
-        &self,
-        connector: String,
-        port: u16,
-    ) -> Result<ConfigResponse> {
+    async fn handle_loopback_ready(&self, connector: String, port: u16) -> Result<ConfigResponse> {
         if !(1024..=65535).contains(&port) {
             bail!("config: loopback port out of range: {port}");
         }
@@ -266,9 +265,7 @@ impl ConfigProtocol {
             g.remove(&connector)
         };
         let pending = pending.ok_or_else(|| {
-            anyhow!(
-                "config: no pending OAuth for {connector} (timed out or never initiated?)"
-            )
+            anyhow!("config: no pending OAuth for {connector} (timed out or never initiated?)")
         })?;
         if pending.expires_at < Utc::now() {
             bail!("config: pending OAuth for {connector} expired before the callback arrived");
@@ -401,7 +398,8 @@ mod tests {
     #[tokio::test]
     async fn client_secret_writes_atomically() {
         let (td, cp) = fixture();
-        let body = r#"{"installed":{"client_id":"a","client_secret":"b","auth_uri":"x","token_uri":"y"}}"#;
+        let body =
+            r#"{"installed":{"client_id":"a","client_secret":"b","auth_uri":"x","token_uri":"y"}}"#;
         let res = cp
             .handle(ConfigPayloadKind::ConnectorClientSecret {
                 connector: "gmail".into(),
@@ -411,10 +409,7 @@ mod tests {
             .unwrap();
         match res {
             ConfigResponse::FramesAndContinue { frames, .. } => {
-                let st = matches!(
-                    frames[0],
-                    ServerMessage::ConfigStatus { ok: true, .. }
-                );
+                let st = matches!(frames[0], ServerMessage::ConfigStatus { ok: true, .. });
                 assert!(st);
             }
             _ => panic!("expected FramesAndContinue"),
@@ -436,10 +431,8 @@ mod tests {
         // Should return a "needs client_secret first" status, not bail.
         match res {
             ConfigResponse::FramesAndContinue { frames, .. } => {
-                let bad_status = matches!(
-                    &frames[0],
-                    ServerMessage::ConfigStatus { ok: false, .. }
-                );
+                let bad_status =
+                    matches!(&frames[0], ServerMessage::ConfigStatus { ok: false, .. });
                 assert!(bad_status, "expected non-ok ConfigStatus");
             }
             _ => panic!("unexpected response"),

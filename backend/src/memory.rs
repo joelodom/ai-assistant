@@ -32,7 +32,9 @@ use walkdir::WalkDir;
 /// rename into place. On POSIX, rename within the same filesystem is atomic,
 /// so a crash mid-write can never leave a partially-written sidecar/body.
 pub async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().ok_or_else(|| anyhow::anyhow!("path has no parent: {path:?}"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path has no parent: {path:?}"))?;
     tokio::fs::create_dir_all(parent).await?;
     let tmp = parent.join(format!(
         ".{}.tmp.{}.{}",
@@ -54,7 +56,9 @@ pub async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 /// in an async context (e.g. VectorIndex manifest writes during graph
 /// rebuild). Same atomicity story: temp file → fsync → rename.
 pub fn atomic_write_sync(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().ok_or_else(|| anyhow::anyhow!("path has no parent: {path:?}"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path has no parent: {path:?}"))?;
     std::fs::create_dir_all(parent)?;
     let tmp = parent.join(format!(
         ".{}.tmp.{}.{}",
@@ -235,8 +239,16 @@ impl MemoryStore {
         redaction_report: String,
         tags: Vec<String>,
     ) -> Result<Sidecar> {
-        self.add_with_reason(body, kind, importance, None, metadata, redaction_report, tags)
-            .await
+        self.add_with_reason(
+            body,
+            kind,
+            importance,
+            None,
+            metadata,
+            redaction_report,
+            tags,
+        )
+        .await
     }
 
     /// As `add`, but also records an `importance_reason` (typically the
@@ -312,10 +324,7 @@ impl MemoryStore {
         if !items_root.exists() {
             return Ok(out);
         }
-        for entry in WalkDir::new(&items_root)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
+        for entry in WalkDir::new(&items_root).into_iter().filter_map(|e| e.ok()) {
             let p = entry.path();
             if p.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
@@ -373,7 +382,12 @@ impl MemoryStore {
                 if body_lc.contains(term) {
                     score += 2;
                 }
-                if item.sidecar.tags.iter().any(|t| t.to_lowercase().contains(term)) {
+                if item
+                    .sidecar
+                    .tags
+                    .iter()
+                    .any(|t| t.to_lowercase().contains(term))
+                {
                     score += 3;
                 }
             }
@@ -473,9 +487,7 @@ impl MemoryStore {
     pub fn items_missing_vectors(&self) -> Result<Vec<MemoryItem>> {
         let mut out = Vec::new();
         for item in self.scan_all()? {
-            if !item.vector_path().exists()
-                && item.sidecar.kind != ItemKind::ForgottenStub
-            {
+            if !item.vector_path().exists() && item.sidecar.kind != ItemKind::ForgottenStub {
                 out.push(item);
             }
         }
@@ -536,10 +548,7 @@ impl MemoryStore {
                 *out.entry(k).or_insert(0) += 1;
             }
             out.insert("total", all.len());
-            let with_vec = all
-                .iter()
-                .filter(|i| i.vector_path().exists())
-                .count();
+            let with_vec = all.iter().filter(|i| i.vector_path().exists()).count();
             out.insert("with_vector", with_vec);
         }
         out
@@ -600,11 +609,25 @@ mod tests {
     async fn add_and_recent_roundtrip() {
         let (_td, store) = fresh_store().await;
         store
-            .add("first item", ItemKind::UserMessage, 0.5, None, "".into(), vec![])
+            .add(
+                "first item",
+                ItemKind::UserMessage,
+                0.5,
+                None,
+                "".into(),
+                vec![],
+            )
             .await
             .unwrap();
         store
-            .add("second item", ItemKind::Ingestion, 0.5, None, "".into(), vec!["email".into()])
+            .add(
+                "second item",
+                ItemKind::Ingestion,
+                0.5,
+                None,
+                "".into(),
+                vec!["email".into()],
+            )
             .await
             .unwrap();
         let r = store.recent(10).unwrap();
@@ -617,7 +640,14 @@ mod tests {
     async fn sha256_is_recorded_on_add() {
         let (_td, store) = fresh_store().await;
         let sc = store
-            .add("hello world", ItemKind::Ingestion, 0.5, None, "".into(), vec![])
+            .add(
+                "hello world",
+                ItemKind::Ingestion,
+                0.5,
+                None,
+                "".into(),
+                vec![],
+            )
             .await
             .unwrap();
         let expected = sha256_hex(b"hello world");
@@ -628,11 +658,25 @@ mod tests {
     async fn search_finds_by_body_and_tags() {
         let (_td, store) = fresh_store().await;
         store
-            .add("dentist appointment on Tuesday", ItemKind::UserMessage, 0.5, None, "".into(), vec![])
+            .add(
+                "dentist appointment on Tuesday",
+                ItemKind::UserMessage,
+                0.5,
+                None,
+                "".into(),
+                vec![],
+            )
             .await
             .unwrap();
         store
-            .add("car maintenance receipt", ItemKind::Ingestion, 0.5, None, "".into(), vec!["car".into()])
+            .add(
+                "car maintenance receipt",
+                ItemKind::Ingestion,
+                0.5,
+                None,
+                "".into(),
+                vec!["car".into()],
+            )
             .await
             .unwrap();
         let hits = store.search("dentist", 10).unwrap();
@@ -650,22 +694,43 @@ mod tests {
 
         let before_sidecar = {
             let s = MemoryStore::open(path.clone()).await.unwrap();
-            s.add("first", ItemKind::UserMessage, 0.5, None, "".into(), vec!["a".into()])
-                .await
-                .unwrap();
+            s.add(
+                "first",
+                ItemKind::UserMessage,
+                0.5,
+                None,
+                "".into(),
+                vec!["a".into()],
+            )
+            .await
+            .unwrap();
             let sc = s
-                .add("second", ItemKind::Ingestion, 0.7, None, "rep".into(), vec!["b".into()])
+                .add(
+                    "second",
+                    ItemKind::Ingestion,
+                    0.7,
+                    None,
+                    "rep".into(),
+                    vec!["b".into()],
+                )
                 .await
                 .unwrap();
-            s.add_preference("don't tell me about sports").await.unwrap();
-            s.add_stub("dropped a 2FA message", "OTP".into()).await.unwrap();
+            s.add_preference("don't tell me about sports")
+                .await
+                .unwrap();
+            s.add_stub("dropped a 2FA message", "OTP".into())
+                .await
+                .unwrap();
             sc
         };
 
         let after = MemoryStore::open(path).await.unwrap();
         let items = after.recent(10).unwrap();
         assert_eq!(items.len(), 2);
-        let matched = items.iter().find(|i| i.sidecar.id == before_sidecar.id).unwrap();
+        let matched = items
+            .iter()
+            .find(|i| i.sidecar.id == before_sidecar.id)
+            .unwrap();
         assert_eq!(matched.sidecar.importance, 0.7);
         assert!(matched.sidecar.tags.contains(&"b".to_string()));
     }
@@ -674,7 +739,14 @@ mod tests {
     async fn forget_zeros_body_and_tombstones() {
         let (_td, store) = fresh_store().await;
         let sc = store
-            .add("private note", ItemKind::Ingestion, 0.6, None, "".into(), vec!["personal".into()])
+            .add(
+                "private note",
+                ItemKind::Ingestion,
+                0.6,
+                None,
+                "".into(),
+                vec!["personal".into()],
+            )
             .await
             .unwrap();
         let ok = store.forget(&sc.id).await.unwrap();

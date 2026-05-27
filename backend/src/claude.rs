@@ -77,7 +77,10 @@ impl LlmClient for ClaudeCliClient {
             .stderr(std::process::Stdio::piped());
 
         let mut child = cmd.spawn().with_context(|| {
-            format!("failed to spawn `{}` — is the Claude CLI installed and on PATH?", self.binary)
+            format!(
+                "failed to spawn `{}` — is the Claude CLI installed and on PATH?",
+                self.binary
+            )
         })?;
 
         if let Some(mut stdin) = child.stdin.take() {

@@ -410,18 +410,18 @@ async fn hazmat_bypass_skips_sanitizer_and_tags_memory() {
 
     // Verify: Sanitizer was NOT called for the bypass message.
     let calls = mock.calls();
-    let sanitizer_call_for_message = calls.iter().any(|c| {
-        c.prompt.contains("SANITIZER_TASK") && c.prompt.contains(secret_marker)
-    });
+    let sanitizer_call_for_message = calls
+        .iter()
+        .any(|c| c.prompt.contains("SANITIZER_TASK") && c.prompt.contains(secret_marker));
     assert!(
         !sanitizer_call_for_message,
         "Sanitizer was invoked despite bypass flag"
     );
 
     // Verify: Assistant DID see the raw content.
-    let assistant_saw_it = calls.iter().any(|c| {
-        c.prompt.contains("USER MESSAGE:") && c.prompt.contains(secret_marker)
-    });
+    let assistant_saw_it = calls
+        .iter()
+        .any(|c| c.prompt.contains("USER MESSAGE:") && c.prompt.contains(secret_marker));
     assert!(
         assistant_saw_it,
         "Assistant never received the raw bypass content"
@@ -463,7 +463,9 @@ async fn sanitizer_failure_drops_input_persists_audit_and_notifies_user() {
     cfg.scout.enabled = false;
     cfg.indexer.enabled = false;
     let memory = std::sync::Arc::new(
-        backend::memory::MemoryStore::open(cfg.memory.dir.clone()).await.unwrap()
+        backend::memory::MemoryStore::open(cfg.memory.dir.clone())
+            .await
+            .unwrap(),
     );
     let failing: std::sync::Arc<dyn backend::claude::LlmClient> =
         std::sync::Arc::new(backend::claude::FailingLlmClient {
@@ -621,7 +623,9 @@ async fn config_payload_writes_client_secret_atomically_and_replies_config_statu
         .ok()
         .flatten()
     {
-        let Ok(Message::Text(t)) = frame else { continue };
+        let Ok(Message::Text(t)) = frame else {
+            continue;
+        };
         let parsed: ServerMessage = serde_json::from_str(&t).unwrap();
         if let ServerMessage::ConfigStatus { connector, ok, .. } = &parsed {
             if connector == "gmail" && *ok {
@@ -654,7 +658,10 @@ async fn config_payload_writes_client_secret_atomically_and_replies_config_statu
             }
         }
     }
-    assert!(!secret_leaked, "ConfigPayload secrets leaked into items/ memory");
+    assert!(
+        !secret_leaked,
+        "ConfigPayload secrets leaked into items/ memory"
+    );
 }
 
 #[tokio::test]
@@ -707,7 +714,9 @@ async fn unknown_config_connector_returns_bad_status_not_panic() {
         .ok()
         .flatten()
     {
-        let Ok(Message::Text(t)) = frame else { continue };
+        let Ok(Message::Text(t)) = frame else {
+            continue;
+        };
         let parsed: ServerMessage = serde_json::from_str(&t).unwrap();
         if let ServerMessage::ConfigStatus { ok: false, .. } = parsed {
             saw_bad = true;
@@ -716,5 +725,8 @@ async fn unknown_config_connector_returns_bad_status_not_panic() {
             break;
         }
     }
-    assert!(saw_bad, "expected ConfigStatus ok=false for missing client_secret");
+    assert!(
+        saw_bad,
+        "expected ConfigStatus ok=false for missing client_secret"
+    );
 }

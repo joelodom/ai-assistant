@@ -17,7 +17,8 @@ mod net;
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let mut url = std::env::var("AI_ASSISTANT_URL").unwrap_or_else(|_| "ws://127.0.0.1:8765/ws".to_string());
+    let mut url =
+        std::env::var("AI_ASSISTANT_URL").unwrap_or_else(|_| "ws://127.0.0.1:8765/ws".to_string());
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         if a == "--url" {

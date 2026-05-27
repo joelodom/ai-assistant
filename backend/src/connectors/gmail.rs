@@ -169,9 +169,8 @@ impl GmailConnector {
         // Compose a human-readable block. The Preprocessor will see this
         // verbatim — the From/To/Subject lines are exactly the structured
         // signal it needs for importance scoring.
-        let content = format!(
-            "From: {from}\nTo: {to}\nSubject: {subject}\nDate: {date_header}\n\n{body}"
-        );
+        let content =
+            format!("From: {from}\nTo: {to}\nSubject: {subject}\nDate: {date_header}\n\n{body}");
 
         let at = m
             .internal_date
@@ -367,8 +366,14 @@ mod tests {
     #[test]
     fn header_map_builds_lookup() {
         let h = vec![
-            GmailHeader { name: "From".into(), value: "a@b".into() },
-            GmailHeader { name: "Subject".into(), value: "hi".into() },
+            GmailHeader {
+                name: "From".into(),
+                value: "a@b".into(),
+            },
+            GmailHeader {
+                name: "Subject".into(),
+                value: "hi".into(),
+            },
         ];
         let m = header_map(&h);
         assert_eq!(m.get("From"), Some(&"a@b".to_string()));
