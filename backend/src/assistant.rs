@@ -18,13 +18,13 @@
 //! to Opus; Opus answers, no further escalation).
 
 use crate::claude::{LlmClient, LlmOptions};
-use crate::connectors::ConnectorRegistry;
 use crate::embedder::Embedder;
 use crate::manual::Manual;
 use crate::memory::{ItemKind, MemoryStore};
-use crate::preprocessor::{InputProvenance, Preprocessor, PreprocessorResult};
+use crate::preprocessor::{Preprocessor, PreprocessorResult};
 use crate::retrieval::{retrieve, RetrievalWeights, ScoredItem};
 use crate::vector_index::VectorIndex;
+use crate::workers::{SearchEvent, WorkerRegistry};
 use anyhow::Result;
 use shared::{Metadata, Tier};
 use std::sync::Arc;
@@ -35,7 +35,7 @@ pub struct Assistant {
     pub embedder: Arc<dyn Embedder>,
     pub vector_index: Arc<VectorIndex>,
     pub preprocessor: Arc<Preprocessor>,
-    pub connectors: Arc<ConnectorRegistry>,
+    pub workers: Arc<WorkerRegistry>,
     pub manual: Arc<Manual>,
     pub model: Option<String>,
     /// Heavier model Sonnet hands off to when it judges a question needs
@@ -113,9 +113,9 @@ pub struct RespondOutcome {
 }
 
 impl Assistant {
-    /// Minimal test constructor. Wires an empty connector registry and a
-    /// Preprocessor backed by the same mock LLM. Production callers should
-    /// use `build()` instead.
+    /// Minimal test constructor. Wires an empty worker registry and a
+    /// Preprocessor backed by the same mock LLM. Production callers
+    /// should use `build()` instead.
     pub fn new(llm: Arc<dyn LlmClient>, memory: Arc<MemoryStore>) -> Self {
         let embedder: Arc<dyn Embedder> = Arc::new(crate::embedder::MockEmbedder::new());
         let vector_index = Arc::new(
@@ -124,13 +124,21 @@ impl Assistant {
         );
         let preprocessor = Arc::new(Preprocessor::new(llm.clone()));
         let manual = Arc::new(Manual::open_or_seed(memory.root()).expect("seed manual"));
+        let worker_ctx = Arc::new(crate::workers::WorkerContext {
+            preprocessor: preprocessor.clone(),
+            memory: memory.clone(),
+            embedder: embedder.clone(),
+            vector_index: vector_index.clone(),
+            preprocess_concurrency: 4,
+        });
+        let workers = Arc::new(WorkerRegistry::empty(worker_ctx));
         Self {
             llm,
             memory,
             embedder,
             vector_index,
             preprocessor,
-            connectors: Arc::new(ConnectorRegistry::empty()),
+            workers,
             manual,
             model: None,
             escalation_model: None,
@@ -144,14 +152,13 @@ impl Assistant {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn build(
         llm: Arc<dyn LlmClient>,
         memory: Arc<MemoryStore>,
         embedder: Arc<dyn Embedder>,
         vector_index: Arc<VectorIndex>,
         preprocessor: Arc<Preprocessor>,
-        connectors: Arc<ConnectorRegistry>,
+        workers: Arc<WorkerRegistry>,
         manual: Arc<Manual>,
         model: Option<String>,
         escalation_model: Option<String>,
@@ -168,7 +175,7 @@ impl Assistant {
             embedder,
             vector_index,
             preprocessor,
-            connectors,
+            workers,
             manual,
             model,
             escalation_model,
@@ -209,10 +216,10 @@ impl Assistant {
         a
     }
 
-    /// Test seam: override the connector registry on an already-built
-    /// Assistant. Useful when wiring a MockConnector in unit tests.
-    pub fn with_connectors(mut self, connectors: Arc<ConnectorRegistry>) -> Self {
-        self.connectors = connectors;
+    /// Test seam: override the worker registry on an already-built
+    /// Assistant. Useful when wiring a MockWorker in unit tests.
+    pub fn with_workers(mut self, workers: Arc<WorkerRegistry>) -> Self {
+        self.workers = workers;
         self
     }
 
@@ -370,7 +377,7 @@ impl Assistant {
             let prefs = self.memory.preferences().await;
             let item_count = self.memory.stats().get("total").copied().unwrap_or(0);
             let facts_block = self.system_facts.render_prompt_block(item_count);
-            let connectors_block = self.connectors.render_prompt_block();
+            let workers_block = self.workers.render_prompt_block();
             let manual_block = render_manual_pointer(&self.manual);
             let excerpts_block = render_manual_excerpts(&manual_excerpts);
             let (prompt, composition) = build_prompt(
@@ -380,7 +387,7 @@ impl Assistant {
                 &retrieved,
                 &prefs.statements,
                 &facts_block,
-                &connectors_block,
+                &workers_block,
                 &manual_block,
                 &excerpts_block,
             );
@@ -420,7 +427,7 @@ impl Assistant {
                 model: current_model.clone(),
                 ..Default::default()
             };
-            let raw = self.llm.oneshot(&prompt, opts).await?;
+            let raw = self.llm.oneshot(&prompt, opts.clone()).await?;
             let reply = raw.trim().to_string();
             tracing::debug!(
                 reply_len = reply.len(),
@@ -566,7 +573,51 @@ impl Assistant {
                 continue;
             }
 
-            // No more markers (or hit a cap). This is the final reply.
+            // No more markers, OR markers we can't act on. If the LLM
+            // emitted a SEARCH marker as its final reply AFTER we'd hit
+            // the cap, the marker would leak to the UI — so re-prompt
+            // ONCE more with an explicit "no more SEARCH, answer with
+            // what you have" instruction. This is the recovery path
+            // for "Sonnet keeps wanting more rounds and never produces
+            // prose" — costs one extra LLM call instead of showing the
+            // user a raw marker.
+            if !searches.is_empty() && search_rounds >= self.max_search_rounds {
+                tracing::info!(
+                    cap = self.max_search_rounds,
+                    "search_cap_recovery: re-prompting with no-more-search instruction"
+                );
+                let cap_notice = format!(
+                    "\n\nNOTE FROM THE BACKEND: you've used all {} of your SEARCH rounds for this turn. \
+                     Do NOT emit any more SEARCH markers — they will leak to the user as-is. \
+                     Answer the user's question using the memory you already have, even if \
+                     incomplete. If you truly can't answer, say so plainly.",
+                    self.max_search_rounds
+                );
+                let recovery_prompt = format!("{prompt}{cap_notice}");
+                emit_status(
+                    status_tx,
+                    "thinking",
+                    Some("Wrapping up (search budget used)…".into()),
+                    None,
+                );
+                let recovery_raw = self
+                    .llm
+                    .oneshot(&recovery_prompt, opts.clone())
+                    .await
+                    .unwrap_or_default();
+                let recovery = recovery_raw.trim().to_string();
+                if recovery.is_empty() {
+                    tracing::warn!("llm_returned_empty_reply_on_cap_recovery");
+                    break EMPTY_REPLY_POLITE_MESSAGE.to_string();
+                }
+                // Strip any leftover SEARCH markers from the recovery
+                // reply just in case the LLM didn't comply.
+                let cleaned = strip_search_markers(&recovery);
+                break cleaned;
+            }
+
+            // No more markers (or hit a cap with no SEARCH leaks). This
+            // is the final reply.
             tracing::debug!(
                 final_model = ?current_model,
                 final_reply_len = reply.len(),
@@ -649,225 +700,197 @@ impl Assistant {
         })
     }
 
-    /// Execute one SEARCH: marker. Each connector result goes through the
-    /// Preprocessor (Invariant #3 — external data passes the Gate first),
-    /// non-drop results land in memory, embedded, and indexed.
-    /// Returns a one-line summary suitable for surfacing in the user-
-    /// visible preamble.
+    /// Dispatch one SEARCH: marker to a worker. The worker drives its
+    /// own results through the Preprocessor + memory store, emitting
+    /// `SearchEvent` values as it works. This function consumes that
+    /// event stream and:
     ///
-    /// Preprocessing the N results is fanned out via `buffer_unordered`
-    /// (`preprocess_concurrency`, default 4) — each Preprocessor call is
-    /// a fresh `claude` subprocess (Invariant #2) so they are independent
-    /// and safe to run in parallel. Memory writes are then performed
-    /// serially: they're sub-millisecond and serializing them avoids any
-    /// HNSW upsert contention.
+    ///   - Re-emits each event as a slot-keyed `ServerMessage::Status`
+    ///     frame so the client status bar shows live progress.
+    ///   - Maintains a tally for the user-visible summary.
+    ///   - Watchdog: if no event arrives for `STALL_TIMEOUT`, logs a
+    ///     warning and returns the partial summary. The worker future
+    ///     is dropped (its in-flight HTTP requests cancel).
     ///
-    /// Status frames are emitted with `slot = Some("connector:<name>")`
-    /// so the client can render each in-flight connector as its own row
-    /// in the status bar without overwriting siblings.
-    #[tracing::instrument(skip(self, metadata, status_tx), fields(connector = connector_name, query_len = query.len()))]
+    /// Returns a one-line summary suitable for surfacing in the
+    /// user-visible preamble.
+    #[tracing::instrument(skip(self, metadata, status_tx), fields(worker = worker_name, query_len = query.len()))]
     async fn execute_search(
         &self,
-        connector_name: &str,
+        worker_name: &str,
         query: &str,
         metadata: &Metadata,
         status_tx: Option<&tokio::sync::mpsc::UnboundedSender<shared::ServerMessage>>,
     ) -> String {
+        const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
         let started = std::time::Instant::now();
-        let slot = format!("connector:{connector_name}");
+        let slot = format!("worker:{worker_name}");
         emit_status(
             status_tx,
             "searching",
-            Some(format!("{connector_name}: starting…")),
+            Some(format!("{worker_name}: starting…")),
             Some(slot.clone()),
         );
-        let Some(connector) = self.connectors.get(connector_name) else {
-            tracing::warn!("connector_not_found");
+        let Some(worker) = self.workers.get(worker_name) else {
+            tracing::warn!("worker_not_found");
             emit_status(
                 status_tx,
                 "searching",
-                Some(format!("{connector_name}: no such connector")),
+                Some(format!("{worker_name}: no such worker")),
                 Some(slot),
             );
-            return format!("(no such connector: {connector_name})");
+            return format!("(no such worker: {worker_name})");
         };
-        if !connector.is_available() {
-            tracing::warn!("connector_not_configured");
+        if !worker.is_available() {
+            tracing::warn!("worker_not_configured");
             emit_status(
                 status_tx,
                 "searching",
-                Some(format!("{connector_name}: not configured")),
+                Some(format!("{worker_name}: not configured")),
                 Some(slot),
             );
             return format!(
-                "({connector_name} not configured — set it up via the client per the manual)"
+                "({worker_name} not configured — set it up via the client per the manual)"
             );
         }
-        let results = match connector.search(query, 10).await {
-            Ok(r) => r,
-            Err(e) => {
-                // NOTE: log error string and connector — NOT the user's query
-                // verbatim. query_len is in the span fields.
-                tracing::warn!(error = %e, "connector_search_failed");
-                emit_status(
-                    status_tx,
-                    "searching",
-                    Some(format!("{connector_name}: search failed")),
-                    Some(slot),
-                );
-                return format!("(search {connector_name} failed: {e})");
-            }
-        };
-        let total = results.len();
-        if total == 0 {
-            emit_status(
-                status_tx,
-                "searching",
-                Some(format!("{connector_name}: 0 results")),
-                Some(slot),
-            );
-            tracing::info!(
-                total = 0,
-                kept = 0,
-                dropped = 0,
-                duration_ms = started.elapsed().as_millis() as u64,
-                "connector_search_done"
-            );
-            return format!("🔍 {connector_name}: searched \"{query}\" → 0 results");
-        }
-        emit_status(
-            status_tx,
-            "searching",
-            Some(format!(
-                "{connector_name}: {total} results, preprocessing 0/{total}…"
-            )),
-            Some(slot.clone()),
-        );
 
-        // Fan-out: each preprocess call is a fresh `claude` subprocess
-        // (Invariant #2 — ephemeral, isolated). They are independent, so
-        // we run up to `preprocess_concurrency` at a time.
-        use futures::stream::{self, StreamExt};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let concurrency = self.preprocess_concurrency.max(1);
-        let done_counter = std::sync::Arc::new(AtomicUsize::new(0));
-        let preprocessor = self.preprocessor.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SearchEvent>();
+        let ctx = self.workers.ctx();
+        let metadata_owned = metadata.clone();
+        let worker_clone = worker.clone();
+        let query_owned = query.to_string();
+        let worker_task = tokio::spawn(async move {
+            worker_clone
+                .search(&query_owned, 10, ctx, metadata_owned, tx)
+                .await
+        });
 
-        let pp_results: Vec<(
-            crate::connectors::RawConnectorResult,
-            anyhow::Result<PreprocessorResult>,
-        )> = stream::iter(results.into_iter())
-            .map(|r| {
-                let pp = preprocessor.clone();
-                let counter = done_counter.clone();
-                let status_owned = status_tx.cloned();
-                let slot = slot.clone();
-                let conn_name = connector_name.to_string();
-                async move {
-                    let res = pp.preprocess(&r.content, InputProvenance::PublicWeb).await;
-                    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    emit_status(
-                        status_owned.as_ref(),
-                        "searching",
-                        Some(format!("{conn_name}: preprocessing {n}/{total}")),
-                        Some(slot),
-                    );
-                    (r, res)
-                }
-            })
-            .buffer_unordered(concurrency)
-            .collect()
-            .await;
-
-        // Commit serially. Per-item commit is sub-ms; serializing avoids
-        // HNSW upsert contention and keeps the order in `.json` shards
-        // deterministic.
+        // Drain events with a stall watchdog.
         let mut kept = 0usize;
         let mut dropped = 0usize;
-        for (r, pp_res) in pp_results {
-            let pp = match pp_res {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(error = %e, "preprocessor failed on connector result");
-                    continue;
-                }
-            };
-            if pp.tier == Tier::Drop {
-                dropped += 1;
-                let _ = self
-                    .memory
-                    .add_stub(&pp.output, pp.redaction_report.clone())
-                    .await;
-                continue;
-            }
-            // Tag with provenance so the audit trail is clear.
-            let tags = vec![
-                "connector".into(),
-                format!("connector:{connector_name}"),
-                format!("source:{}", r.source_id),
-            ];
-            let mut item_metadata = metadata.clone();
-            // Stuff the source_url into freeform so the assistant can cite it.
-            if let Some(url) = r.source_url {
-                let mut extras = serde_json::Map::new();
-                extras.insert("source_url".into(), serde_json::Value::String(url));
-                extras.insert(
-                    "source_id".into(),
-                    serde_json::Value::String(r.source_id.clone()),
-                );
-                extras.insert(
-                    "connector".into(),
-                    serde_json::Value::String(connector_name.to_string()),
-                );
-                item_metadata.freeform = serde_json::Value::Object(extras);
-            }
-            let added = self
-                .memory
-                .add_with_reason(
-                    &pp.output,
-                    ItemKind::ConnectorFinding,
-                    pp.importance,
-                    pp.importance_reason.clone(),
-                    Some(item_metadata),
-                    pp.redaction_report.clone(),
-                    tags,
-                )
-                .await;
-            match added {
-                Ok(sc) => {
-                    kept += 1;
-                    // Embed + index inline so the very next retrieve() call
-                    // surfaces this result.
-                    if let Ok(v) = self.embedder.embed(&pp.output).await {
-                        if let Some(item) = self.memory.get(&sc.id).ok().flatten() {
-                            let _ = self.memory.write_vector(&item, &v).await;
-                            let _ = self.vector_index.upsert(&sc.id, v);
+        let mut failed = 0usize;
+        let mut stalled = false;
+        loop {
+            let next = tokio::time::timeout(STALL_TIMEOUT, rx.recv()).await;
+            match next {
+                Ok(Some(ev)) => {
+                    match &ev {
+                        SearchEvent::Started { detail, .. } => {
+                            emit_status(
+                                status_tx,
+                                "searching",
+                                detail
+                                    .clone()
+                                    .or_else(|| Some(format!("{worker_name}: starting"))),
+                                Some(slot.clone()),
+                            );
+                        }
+                        SearchEvent::Progress {
+                            detail,
+                            completed,
+                            total,
+                            ..
+                        } => {
+                            let label = detail.clone().unwrap_or_else(|| match total {
+                                Some(t) => format!("{worker_name}: {completed}/{t}"),
+                                None => format!("{worker_name}: {completed} processed"),
+                            });
+                            emit_status(status_tx, "searching", Some(label), Some(slot.clone()));
+                        }
+                        SearchEvent::Ingested { .. } => {
+                            kept += 1;
+                        }
+                        SearchEvent::Dropped { .. } => {
+                            dropped += 1;
+                        }
+                        SearchEvent::Failed { error, .. } => {
+                            failed += 1;
+                            tracing::warn!(error = %error, worker = worker_name, "worker_event_failed");
+                        }
+                        SearchEvent::Finished {
+                            kept: k,
+                            dropped: d,
+                            failed: f,
+                            duration_ms,
+                            ..
+                        } => {
+                            // Worker's own tally trumps our event-tally
+                            // (a worker may know about a result we missed
+                            // — e.g. listing failed before any ingest).
+                            kept = *k;
+                            dropped = *d;
+                            failed = *f;
+                            tracing::info!(
+                                worker = worker_name,
+                                kept,
+                                dropped,
+                                failed,
+                                duration_ms = duration_ms,
+                                "worker_search_done"
+                            );
+                            break;
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to add connector result to memory");
+                Ok(None) => {
+                    // Worker dropped the channel without sending
+                    // Finished. Treat as completion with whatever we
+                    // have so far.
+                    tracing::warn!(
+                        worker = worker_name,
+                        "worker_channel_closed_without_finished"
+                    );
+                    break;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        worker = worker_name,
+                        stall_secs = STALL_TIMEOUT.as_secs(),
+                        kept,
+                        dropped,
+                        failed,
+                        "worker_stalled"
+                    );
+                    stalled = true;
+                    break;
                 }
             }
         }
-        emit_status(
-            status_tx,
-            "searching",
-            Some(format!(
-                "{connector_name}: done — kept {kept}, dropped {dropped}"
-            )),
-            Some(slot),
-        );
+
+        // We have either Finished, stall, or channel-close. The worker
+        // task may still be running — abort it so its in-flight HTTP
+        // requests cancel cleanly.
+        worker_task.abort();
+
+        let final_detail = if stalled {
+            format!("{worker_name}: stalled after {kept} kept, {dropped} dropped, {failed} failed")
+        } else {
+            format!("{worker_name}: done — kept {kept}, dropped {dropped}")
+        };
+        emit_status(status_tx, "searching", Some(final_detail), Some(slot));
+
+        let total_seen = kept + dropped + failed;
         tracing::info!(
-            total,
+            worker = worker_name,
+            total_seen,
             kept,
             dropped,
+            failed,
+            stalled,
             duration_ms = started.elapsed().as_millis() as u64,
-            "connector_search_done"
+            "execute_search_complete"
         );
-        format!(
-            "🔍 {connector_name}: searched \"{query}\" → {total} results, kept {kept}, dropped {dropped}"
-        )
+
+        if stalled {
+            format!(
+                "🔍 {worker_name}: searched \"{query}\" → stalled after {kept} kept, {dropped} dropped"
+            )
+        } else {
+            format!(
+                "🔍 {worker_name}: searched \"{query}\" → {total_seen} results, kept {kept}, dropped {dropped}"
+            )
+        }
     }
 
     /// Scan the reply for FORGET: markers, act on any valid ones, and
@@ -943,7 +966,7 @@ fn strip_config_markers(text: &str) -> (String, Vec<shared::ConfigRequestKind>) 
                 .unwrap_or("")
                 .to_string();
             if !connector.is_empty() {
-                let scope = crate::connectors::scope_for(&connector)
+                let scope = crate::workers::scope_for(&connector)
                     .unwrap_or("(unknown-scope)")
                     .to_string();
                 requests.push(shared::ConfigRequestKind::BeginOAuth { connector, scope });
@@ -1005,6 +1028,20 @@ fn parse_search_markers(text: &str) -> Vec<(String, String)> {
         out.push((connector, query));
     }
     out
+}
+
+/// Remove all `SEARCH:` marker lines from a reply. Used as a final
+/// safety net when the LLM emits a SEARCH marker even after we tell
+/// it not to (the cap-recovery path). Trims trailing whitespace.
+fn strip_search_markers(text: &str) -> String {
+    let mut out: Vec<&str> = Vec::with_capacity(text.lines().count());
+    for line in text.lines() {
+        if line.trim().starts_with(SEARCH_MARKER) {
+            continue;
+        }
+        out.push(line);
+    }
+    out.join("\n").trim_end().to_string()
 }
 
 const BOOTSTRAP_INTRO: &str = "\
@@ -1155,7 +1192,7 @@ fn build_prompt(
     retrieved: &[ScoredItem],
     preferences: &[crate::memory::PreferenceStatement],
     system_facts_block: &str,
-    connectors_block: &str,
+    workers_block: &str,
     manual_block: &str,
     manual_excerpts_block: &str,
 ) -> (String, PromptComposition) {
@@ -1206,8 +1243,8 @@ fn build_prompt(
     comp.manual_pointer = buf.len() - mark;
     mark = buf.len();
 
-    if !connectors_block.is_empty() {
-        buf.push_str(connectors_block);
+    if !workers_block.is_empty() {
+        buf.push_str(workers_block);
     }
     comp.connectors = buf.len() - mark;
     mark = buf.len();
@@ -1309,8 +1346,8 @@ pub fn truncate_chars(s: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::claude::MockLlmClient;
-    use crate::connectors::mock::MockConnector;
-    use crate::connectors::{ConnectorRegistry, RawConnectorResult};
+    use crate::workers::mock::MockWorker;
+    use crate::workers::{RawWorkerResult, WorkerRegistry};
     use tempfile::TempDir;
 
     async fn setup() -> (TempDir, Assistant) {
@@ -1563,11 +1600,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assistant_prompt_includes_connectors_block_when_registered() {
+    async fn assistant_prompt_includes_workers_block_when_registered() {
         let (_td, a_base, mock) = setup_with_mock().await;
-        let m: Arc<dyn crate::connectors::Connector> = MockConnector::new("gmail");
-        let registry = Arc::new(ConnectorRegistry::new(vec![m]));
-        let a = a_base.with_connectors(registry);
+        let m: Arc<dyn crate::workers::Worker> = MockWorker::new("gmail");
+        let ctx = a_base.workers.ctx();
+        let registry = Arc::new(WorkerRegistry::new(ctx, vec![m]));
+        let a = a_base.with_workers(registry);
 
         a.respond(&pp_pass("hi"), &meta(), false).await.unwrap();
         let calls = mock.calls();
@@ -1575,41 +1613,39 @@ mod tests {
             .iter()
             .find(|c| c.prompt.contains("USER MESSAGE"))
             .unwrap();
-        assert!(assistant_call.prompt.contains("EXTERNAL SEARCH"));
+        assert!(assistant_call.prompt.contains("AVAILABLE WORKERS"));
         assert!(assistant_call.prompt.contains("gmail"));
     }
 
     #[tokio::test]
     async fn search_marker_executes_and_ingests_results() {
         let (_td, a_base, mock) = setup_with_mock().await;
-        // MockConnector returns one canned result for the query "implant".
-        let m = MockConnector::new("gmail");
-        m.respond_when(
+        // MockWorker drives canned RawWorkerResults through the real
+        // ingest_one path, so memory really gets the item.
+        let m = MockWorker::new("gmail");
+        m.respond_with_results(
             "implant",
-            vec![RawConnectorResult {
+            vec![RawWorkerResult {
                 source_id: "gmail:abc123".into(),
                 source_url: Some("https://mail.google.com/abc123".into()),
                 content: "From: dr.patel@example.com\nSubject: implant\n\nThe implant looks good, follow up in 6 months.".into(),
                 at: None,
             }],
         );
-        let m_dyn: Arc<dyn crate::connectors::Connector> = m.clone();
-        let registry = Arc::new(ConnectorRegistry::new(vec![m_dyn]));
-        let a = a_base.with_connectors(registry);
+        let m_dyn: Arc<dyn crate::workers::Worker> = m.clone();
+        let ctx = a_base.workers.ctx();
+        let registry = Arc::new(WorkerRegistry::new(ctx, vec![m_dyn]));
+        let a = a_base.with_workers(registry);
 
-        // Matchers are checked in registration order; first hit wins.
-        //
-        // On the second-pass assistant prompt, the retrieved memory block
-        // will include a line containing "kind=ConnectorFinding" (the
-        // ingested gmail result). That string never appears in the
-        // Preprocessor's prompts or the first-pass assistant prompt — so
-        // matching on it cleanly distinguishes the second assistant pass.
+        // On the second-pass assistant prompt, the retrieved memory
+        // block will contain "kind=WorkerFinding" — that string is
+        // unique to the post-ingest prompt, so we use it as a matcher.
         mock.respond_when(
-            "kind=ConnectorFinding",
+            "kind=WorkerFinding",
             "Dr. Patel said the implant looks good and to follow up in 6 months.",
         );
         mock.respond_when(
-            "EXTERNAL SEARCH",
+            "AVAILABLE WORKERS",
             "Let me check your email.\nSEARCH: gmail implant\n",
         );
 
@@ -1622,7 +1658,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Search log should record exactly one search.
         assert_eq!(
             outcome.search_log.len(),
             1,
@@ -1632,17 +1667,18 @@ mod tests {
         assert!(outcome.search_log[0].contains("gmail"));
         assert!(outcome.search_log[0].contains("implant"));
 
-        // Connector was called once.
         assert_eq!(m.calls().len(), 1);
         assert_eq!(m.calls()[0].0, "implant");
 
-        // Result was ingested as a ConnectorFinding.
+        // Result was ingested as a WorkerFinding.
         let all = a.memory.scan_all().unwrap();
         let finding = all
             .iter()
-            .find(|i| i.sidecar.kind == ItemKind::ConnectorFinding)
-            .expect("no ConnectorFinding stored");
+            .find(|i| i.sidecar.kind == ItemKind::WorkerFinding)
+            .expect("no WorkerFinding stored");
         assert!(finding.body.contains("implant"));
+        // Both new + back-compat tag forms should be present.
+        assert!(finding.sidecar.tags.iter().any(|t| t == "worker:gmail"));
         assert!(finding.sidecar.tags.iter().any(|t| t == "connector:gmail"));
         assert!(finding
             .sidecar
@@ -1650,7 +1686,6 @@ mod tests {
             .iter()
             .any(|t| t == "source:gmail:abc123"));
 
-        // Final reply incorporates the search result.
         assert!(
             outcome.text.contains("implant") || outcome.text.contains("Patel"),
             "final reply should reflect what we found: {}",
@@ -1659,37 +1694,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_connector_in_search_marker_does_not_blow_up() {
+    async fn unknown_worker_in_search_marker_does_not_blow_up() {
         let (_td, a_base, mock) = setup_with_mock().await;
-        let m: Arc<dyn crate::connectors::Connector> = MockConnector::new("gmail");
-        let registry = Arc::new(ConnectorRegistry::new(vec![m]));
-        let mut a = a_base.with_connectors(registry);
-        // Cap rounds at 1 so the mock-always-says-SEARCH loop terminates
-        // after one iteration. Without this the mock would emit SEARCH on
-        // every iteration up to max_search_rounds.
+        let m: Arc<dyn crate::workers::Worker> = MockWorker::new("gmail");
+        let ctx = a_base.workers.ctx();
+        let registry = Arc::new(WorkerRegistry::new(ctx, vec![m]));
+        let mut a = a_base.with_workers(registry);
         a.max_search_rounds = 1;
 
-        mock.respond_when("EXTERNAL SEARCH", "SEARCH: notreal anything goes here\n");
+        mock.respond_when("AVAILABLE WORKERS", "SEARCH: notreal anything goes here\n");
 
         let outcome = a
             .respond(&pp_pass("search please"), &meta(), false)
             .await
             .unwrap();
         assert_eq!(outcome.search_log.len(), 1);
-        assert!(outcome.search_log[0].contains("no such connector"));
+        assert!(outcome.search_log[0].contains("no such worker"));
     }
 
     #[tokio::test]
     async fn search_rounds_are_bounded() {
         let (_td, a_base, mock) = setup_with_mock().await;
-        let m: Arc<dyn crate::connectors::Connector> = MockConnector::new("gmail");
-        let registry = Arc::new(ConnectorRegistry::new(vec![m]));
-        let mut a = a_base.with_connectors(registry);
-        a.max_search_rounds = 1; // tighter for the test
+        let m: Arc<dyn crate::workers::Worker> = MockWorker::new("gmail");
+        let ctx = a_base.workers.ctx();
+        let registry = Arc::new(WorkerRegistry::new(ctx, vec![m]));
+        let mut a = a_base.with_workers(registry);
+        a.max_search_rounds = 1;
 
-        // The mock returns a SEARCH marker on every assistant call. Without
-        // the depth bound, this would loop forever; with depth = 1, it
-        // executes once and then accepts whatever the second call returns.
         mock.respond_when("USER MESSAGE", "SEARCH: gmail anything\n");
 
         let outcome = a

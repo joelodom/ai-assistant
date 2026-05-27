@@ -498,7 +498,11 @@ impl WorkerRegistry {
             };
             let ctx = self.ctx.clone();
             let name = w.name();
-            tracing::info!(worker = name, interval_secs = interval.as_secs(), "worker tick driver starting");
+            tracing::info!(
+                worker = name,
+                interval_secs = interval.as_secs(),
+                "worker tick driver starting"
+            );
             tokio::spawn(async move {
                 // Stagger the first tick slightly so we don't all
                 // hammer dependencies at startup.
@@ -529,9 +533,10 @@ impl WorkerRegistry {
     }
 }
 
-/// Test-only worker that returns canned events. Useful for exercising
-/// the Assistant's search-event consumption logic without real
-/// network/LLM calls.
+/// Test-only worker that can either echo canned `SearchEvent`s (for
+/// testing the Assistant's stream-consumption logic) OR push canned
+/// `RawWorkerResult`s through the real `ctx.ingest_one()` pipeline
+/// (for tests that need the assistant to see ingested items in memory).
 #[cfg(test)]
 pub mod mock {
     use super::*;
@@ -539,7 +544,11 @@ pub mod mock {
 
     pub struct MockWorker {
         name: &'static str,
-        canned: Mutex<HashMap<String, Vec<SearchEvent>>>,
+        /// Canned event streams — replayed verbatim, no ingestion.
+        canned_events: Mutex<HashMap<String, Vec<SearchEvent>>>,
+        /// Canned raw results — driven through `ctx.ingest_one()` so
+        /// real memory items appear in the store.
+        canned_results: Mutex<HashMap<String, Vec<RawWorkerResult>>>,
         calls: Mutex<Vec<(String, usize)>>,
         available: bool,
     }
@@ -548,17 +557,32 @@ pub mod mock {
         pub fn new(name: &'static str) -> Arc<Self> {
             Arc::new(Self {
                 name,
-                canned: Mutex::new(HashMap::new()),
+                canned_events: Mutex::new(HashMap::new()),
+                canned_results: Mutex::new(HashMap::new()),
                 calls: Mutex::new(Vec::new()),
                 available: true,
             })
         }
 
+        /// Replay these events verbatim when `query` is searched.
+        /// Useful for testing the Assistant's stream-consumption + stall
+        /// handling without actually committing items to memory.
         pub fn respond_when(&self, query: &str, events: Vec<SearchEvent>) {
-            self.canned
+            self.canned_events
                 .lock()
                 .unwrap()
                 .insert(query.to_string(), events);
+        }
+
+        /// Push these raw results through the real ingest pipeline when
+        /// `query` is searched. After the call, items will be in the
+        /// memory store, embedded, and indexed — exactly as a real
+        /// worker would have produced them.
+        pub fn respond_with_results(&self, query: &str, results: Vec<RawWorkerResult>) {
+            self.canned_results
+                .lock()
+                .unwrap()
+                .insert(query.to_string(), results);
         }
 
         pub fn calls(&self) -> Vec<(String, usize)> {
@@ -581,13 +605,53 @@ pub mod mock {
             &self,
             query: &str,
             limit: usize,
-            _ctx: Arc<WorkerContext>,
-            _metadata: Metadata,
+            ctx: Arc<WorkerContext>,
+            metadata: Metadata,
             tx: UnboundedSender<SearchEvent>,
         ) -> Result<()> {
             self.calls.lock().unwrap().push((query.to_string(), limit));
+
+            // If raw results were canned, run them through the real
+            // ingest_one pipeline so the assistant sees them in memory.
+            let results = self.canned_results.lock().unwrap().get(query).cloned();
+            if let Some(results) = results {
+                let total = results.len();
+                let _ = tx.send(SearchEvent::Started {
+                    worker: self.name.to_string(),
+                    expected_total: Some(total),
+                    detail: None,
+                });
+                let mut kept = 0;
+                let mut dropped = 0;
+                for r in results {
+                    match ctx
+                        .ingest_one(
+                            self.name,
+                            &r,
+                            metadata.clone(),
+                            InputProvenance::PublicWeb,
+                            &tx,
+                        )
+                        .await
+                    {
+                        Some(_) => kept += 1,
+                        None => dropped += 1,
+                    }
+                }
+                let _ = tx.send(SearchEvent::Finished {
+                    worker: self.name.to_string(),
+                    kept,
+                    dropped,
+                    failed: 0,
+                    duration_ms: 0,
+                });
+                return Ok(());
+            }
+
+            // Otherwise replay canned events (defaults to Started +
+            // Finished with zero results).
             let events = self
-                .canned
+                .canned_events
                 .lock()
                 .unwrap()
                 .get(query)
@@ -635,7 +699,7 @@ mod tests {
         let vector_index = Arc::new(
             VectorIndex::open(memory.root(), embedder.model_name(), embedder.dimension()).unwrap(),
         );
-        let llm = Arc::new(MockLlmClient::new());
+        let llm: Arc<dyn crate::claude::LlmClient> = MockLlmClient::new();
         let preprocessor = Arc::new(Preprocessor::new(llm));
         // Leak the tempdir for the duration of the process — these are
         // test-only helpers; we don't care about clean teardown.

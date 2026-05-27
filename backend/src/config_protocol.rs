@@ -20,11 +20,11 @@
 //!     handler synthesizes a continuation turn from the
 //!     `ConfigResponse::FramesAndContinue` payload.
 
-use crate::connectors::oauth::{
+use crate::memory::atomic_write_sync;
+use crate::workers::oauth::{
     client_secret_path, load_client_secret, token_path, ClientSecretData, StoredToken,
 };
-use crate::connectors::{gmail::GmailConnector, Connector, ConnectorRegistry};
-use crate::memory::atomic_write_sync;
+use crate::workers::{gmail::GmailWorker, Worker, WorkerRegistry};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use oauth2::basic::BasicClient;
@@ -69,12 +69,12 @@ struct PendingOAuth {
 
 pub struct ConfigProtocol {
     memory_root: PathBuf,
-    registry: Arc<ConnectorRegistry>,
+    registry: Arc<WorkerRegistry>,
     pending: Mutex<HashMap<String, PendingOAuth>>,
 }
 
 impl ConfigProtocol {
-    pub fn new(memory_root: PathBuf, registry: Arc<ConnectorRegistry>) -> Self {
+    pub fn new(memory_root: PathBuf, registry: Arc<WorkerRegistry>) -> Self {
         Self {
             memory_root,
             registry,
@@ -317,17 +317,17 @@ impl ConfigProtocol {
         atomic_write_sync(&tp, &serde_json::to_vec_pretty(&stored)?)?;
         tracing::info!(connector = %connector, scope = %pending.scope, "config: token stored");
 
-        // Instantiate + register the live connector.
+        // Instantiate + register the live worker.
         let registered_msg = match connector.as_str() {
-            "gmail" => match GmailConnector::open(&self.memory_root)? {
-                Some(c) => {
-                    self.registry.register(Arc::new(c) as Arc<dyn Connector>);
+            "gmail" => match GmailWorker::open(&self.memory_root)? {
+                Some(w) => {
+                    self.registry.register(Arc::new(w) as Arc<dyn Worker>);
                     "Gmail is now active and searchable."
                 }
-                None => "Token saved, but connector failed to open. Check logs.",
+                None => "Token saved, but worker failed to open. Check logs.",
             },
             other => {
-                tracing::warn!("config: no live-register handler for connector kind: {other}");
+                tracing::warn!("config: no live-register handler for worker kind: {other}");
                 "Token saved; restart the backend to activate."
             }
         };
@@ -354,28 +354,53 @@ impl ConfigProtocol {
     }
 }
 
-fn scope_for(connector: &str) -> Result<&'static str> {
-    match connector {
-        "gmail" => Ok(crate::connectors::gmail::GMAIL_SCOPE),
-        other => bail!("config: unknown connector kind: {other}"),
+fn scope_for(worker: &str) -> Result<&'static str> {
+    match worker {
+        "gmail" => Ok(crate::workers::gmail::GMAIL_SCOPE),
+        other => bail!("config: unknown worker kind: {other}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workers::WorkerContext;
     use tempfile::TempDir;
 
-    fn fixture() -> (TempDir, ConfigProtocol) {
+    async fn fixture() -> (TempDir, ConfigProtocol) {
         let td = TempDir::new().unwrap();
-        let registry = Arc::new(ConnectorRegistry::empty());
+        let memory = Arc::new(
+            crate::memory::MemoryStore::open(td.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let embedder: Arc<dyn crate::embedder::Embedder> =
+            Arc::new(crate::embedder::MockEmbedder::new());
+        let vector_index = Arc::new(
+            crate::vector_index::VectorIndex::open(
+                memory.root(),
+                embedder.model_name(),
+                embedder.dimension(),
+            )
+            .unwrap(),
+        );
+        let llm: Arc<dyn crate::claude::LlmClient> = crate::claude::MockLlmClient::new();
+        let preprocessor = Arc::new(crate::preprocessor::Preprocessor::new(llm));
+        let ctx = Arc::new(WorkerContext {
+            preprocessor,
+            memory,
+            embedder,
+            vector_index,
+            preprocess_concurrency: 4,
+        });
+        let registry = Arc::new(WorkerRegistry::empty(ctx));
         let cp = ConfigProtocol::new(td.path().to_path_buf(), registry);
         (td, cp)
     }
 
     #[tokio::test]
     async fn client_secret_validates_shape() {
-        let (_td, cp) = fixture();
+        let (_td, cp) = fixture().await;
         let bogus = "not json".to_string();
         let r = cp
             .handle(ConfigPayloadKind::ConnectorClientSecret {
@@ -397,7 +422,7 @@ mod tests {
 
     #[tokio::test]
     async fn client_secret_writes_atomically() {
-        let (td, cp) = fixture();
+        let (td, cp) = fixture().await;
         let body =
             r#"{"installed":{"client_id":"a","client_secret":"b","auth_uri":"x","token_uri":"y"}}"#;
         let res = cp
@@ -420,7 +445,7 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_ready_errors_when_no_secret() {
-        let (_td, cp) = fixture();
+        let (_td, cp) = fixture().await;
         let res = cp
             .handle(ConfigPayloadKind::ConnectorLoopbackReady {
                 connector: "gmail".into(),
@@ -441,7 +466,7 @@ mod tests {
 
     #[tokio::test]
     async fn oauth_callback_without_pending_errors() {
-        let (_td, cp) = fixture();
+        let (_td, cp) = fixture().await;
         let r = cp
             .handle(ConfigPayloadKind::ConnectorOAuthCallback {
                 connector: "gmail".into(),
@@ -454,7 +479,7 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_port_validated() {
-        let (_td, cp) = fixture();
+        let (_td, cp) = fixture().await;
         let r = cp
             .handle(ConfigPayloadKind::ConnectorLoopbackReady {
                 connector: "gmail".into(),

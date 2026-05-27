@@ -44,11 +44,13 @@ client (egui, Mac native) ──WS──> backend ──> Preprocessor ──> A
 - **VectorIndex** — HNSW graph cached on disk; rebuildable from `.vec` sidecars.
 - **Indexer** — mechanical, no-LLM background worker. Replaces the Curator. Backfills
   missing embeddings, compacts the HNSW graph, snapshots stats.
-- **Connectors** — search-only adapters to external personal-data sources
-  (Gmail today; Drive/Calendar later). Triggered by the assistant emitting
-  `SEARCH: <name> <query>` markers. Results always pass through the
-  Preprocessor before reaching memory.
-- **Scout** — opt-in web/news worker.
+- **Workers** — subsystems that fetch external data. Two modes,
+  combinable in one worker: (a) on-demand `SEARCH: <worker> <query>`
+  dispatched by the assistant, (b) autonomous tick (e.g. Gmail polls
+  for new mail every minute, the WWW worker scans the web every N
+  minutes). Each result passes through the Preprocessor before
+  reaching memory. Workers REPLACE the older Connectors/Scout split —
+  they did the same job under two names.
 
 ## Non-negotiable invariants
 
@@ -127,9 +129,12 @@ relaxing one, stop and ask.
   `hnsw/manifest.json`. Rebuilds from `.vec` sidecars on staleness.
 - `backend/src/indexer.rs` — mechanical maintenance worker. No LLM calls.
   Replaces the Curator.
-- `backend/src/connectors/` — search-only adapters (Connector trait,
-  ConnectorRegistry, OAuth machinery, Gmail implementation).
-- `backend/src/scout.rs` — periodic web/news worker (opt-in).
+- `backend/src/workers/` — the Worker trait, WorkerRegistry,
+  WorkerContext, SearchEvent. Subdirectory holds `gmail.rs` (read-only
+  Gmail search + tick), `www.rs` (open-web search + autonomous interest
+  scan), `oauth.rs` (Google OAuth runtime). Workers OWN their
+  preprocess + memory-write pipeline; the Assistant just consumes the
+  SearchEvent stream.
 - `backend/src/claude.rs` — `LlmClient` trait + `ClaudeCliClient` (production)
   + `MockLlmClient` + `FailingLlmClient` (testing).
 - `backend/src/ws.rs` — axum WebSocket handler, error→memory→client wiring.
@@ -254,51 +259,67 @@ TRACE adds per-event detail. For product-analysis work, run at TRACE
 (see joel.toml as an example) and the manual's `logging-and-analysis`
 section.
 
-## Connectors (search-only)
+## Workers
 
-Connectors are search-only adapters to external personal-data sources. The
-assistant emits `SEARCH: <name> <query>` markers when it judges the answer
-is likely in one. The WS-driven `Assistant::respond` loop executes each
-search via the registered connector, runs every result through the
-Preprocessor (Invariant #3 — connector data is "outside world" data), and
-ingests non-drop results as `ItemKind::ConnectorFinding` items.
+A Worker is the unified abstraction for "thing that produces external
+data for the assistant". Lives in `backend/src/workers/`. Replaces the
+older Connector + Scout split (both did the same job; the distinction
+was bookkeeping).
 
-After ingestion the assistant is re-prompted with the now-updated memory.
-Bounded at `max_search_rounds` (default 2) so the loop can't recurse forever.
+A Worker can run in either or both of two modes:
+
+- **On-demand `search`** — the assistant emits `SEARCH: <worker>
+  <query>`, the WS-driven `Assistant::execute_search` dispatches to
+  the worker, the worker drives its own results through the
+  Preprocessor and into memory, and the Assistant observes a
+  `SearchEvent` stream (`Started` / `Progress` / `Ingested` /
+  `Dropped` / `Failed` / `Finished`). The Assistant re-emits those
+  events as slot-keyed Status frames so the client status bar shows
+  live progress, and uses `Finished` to know when to re-prompt with
+  the now-updated memory. A 60-second watchdog timeout per worker
+  detects stalls and abandons the worker cleanly.
+- **Autonomous `tick`** — workers that declare a `tick_interval()`
+  get a tokio task spawned at startup that calls `tick()` on cadence.
+  Gmail polls for new mail every minute; the WWW worker (when
+  `cfg.scout.enabled`) scans the web every N minutes. Items just
+  appear in memory; no SEARCH marker involved.
+
+Bounded at `max_search_rounds` (default 2) so the loop can't recurse
+forever. If the LLM emits another SEARCH marker after the cap, the
+assistant re-prompts ONCE more with an explicit "no more SEARCH" note
+(and strips any leftover markers) instead of leaking them to the UI.
 
 **Parallelism.** Two layers of fan-out:
 
 - Multiple `SEARCH:` markers in a single reply run concurrently
-  (`Assistant.connector_concurrency`, default 4) — each connector hits
-  its own external service.
-- Within one connector, the per-result Preprocessor calls also fan out
-  (`Assistant.preprocess_concurrency`, default 4) via
-  `futures::stream::buffer_unordered`. Each Preprocessor call is a
-  fresh `claude` subprocess (Invariant #2), so they're independent;
-  4-way parallelism cuts a 10-result Gmail page from ~170s wall to
-  ~45s. Memory writes are still serial — they're sub-millisecond and
-  serializing them avoids HNSW upsert contention.
+  (`Assistant.connector_concurrency`, default 4).
+- Within one worker, per-result Preprocessor calls fan out via
+  `futures::stream::buffer_unordered` (`WorkerContext.preprocess_concurrency`,
+  default 4). Each Preprocessor call is a fresh `claude` subprocess
+  (Invariant #2). Memory writes are still serial — sub-millisecond and
+  avoids HNSW upsert contention.
 
-Status frames carry a `slot` field so the client status bar can show
-each in-flight connector as its own row, instead of a single line that
-flickers between concurrent activities. See
-`shared::ServerMessage::Status`.
-**Defense in depth.** Each connector is bound to the narrowest possible
-OAuth scope (Gmail uses `gmail.readonly`). The connector trait deliberately
-exposes only `search` — there is no `.send()` or `.delete()` method for a
-bug to call into existence. And even if the connector tried, Google's
-authorization server would 403 because the token is scope-bound at
-issuance.
+Status frames carry a `slot` field so the client status bar shows each
+in-flight worker as its own row, not a single line that flickers
+between concurrent activities. See `shared::ServerMessage::Status`.
 
-Setup is **client-driven** (see "Client-driven configuration" below). The
-user tells the assistant they want to set up a connector; the assistant
-walks them through it conversationally, emitting `CONFIG_REQUEST_FILE` and
-`CONFIG_BEGIN_OAUTH` markers that the backend translates into structured
-`ServerMessage::ConfigRequest` frames. The client hosts the OAuth loopback
-listener (so the browser dance works even when the backend is on a
-headless EC2 instance) and launches the browser locally. The backend
-exchanges the resulting code with Google, writes `token.json` atomically,
-and registers the live connector instance.
+**Defense in depth.** Each worker that talks to an authenticated API
+is bound to the narrowest possible OAuth scope (Gmail uses
+`gmail.readonly`). The Worker trait deliberately exposes only `search`
+and `tick` — there is no `.send()` or `.delete()` method to bug-call
+into existence. And even if a worker tried, Google's authorization
+server would 403 because the token is scope-bound at issuance.
+
+Setup is **client-driven** (see "Client-driven configuration" below).
+The user tells the assistant they want to set up a worker; the
+assistant walks them through it conversationally, emitting
+`CONFIG_REQUEST_FILE` and `CONFIG_BEGIN_OAUTH` markers that the
+backend translates into structured `ServerMessage::ConfigRequest`
+frames. The client hosts the OAuth loopback listener (so the browser
+dance works even when the backend is on a headless EC2 instance) and
+launches the browser locally. The backend exchanges the resulting
+code with Google, writes `token.json` atomically, and registers the
+live worker instance.
 
 ## Client-driven configuration (Invariant #8)
 

@@ -224,16 +224,13 @@ async fn main() -> Result<()> {
 
     let built = backend::build_app(cfg).await?;
 
-    // Spawn Scout (opt-in) + Indexer (mechanical, no LLM). They no-op if disabled.
-    backend::scout::Scout {
-        llm: built.llm.clone(),
-        sanitizer: built.state.preprocessor.clone(),
-        assistant: built.state.assistant.clone(),
-        cfg: built.cfg.scout.clone(),
-        allowed_tools: built.cfg.claude.scout_allowed_tools.clone(),
-        model: Some(built.cfg.claude.model_for_scout()),
-    }
-    .spawn();
+    // Spawn worker tick drivers. Each worker advertises its own
+    // cadence via Worker::tick_interval(); workers with None don't
+    // get a driver. Gmail polls for new mail every minute; WWW runs
+    // its interest-inferred web scan at cfg.scout.interval_minutes
+    // when cfg.scout.enabled is true.
+    built.workers.spawn_tick_drivers();
+
     backend::indexer::Indexer {
         memory: built.memory.clone(),
         embedder: built.embedder.clone(),
@@ -241,7 +238,6 @@ async fn main() -> Result<()> {
         cfg: built.cfg.indexer.clone(),
     }
     .spawn();
-
     let addr = built.cfg.server.addr.clone();
     let app = backend::ws::router(built.state);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

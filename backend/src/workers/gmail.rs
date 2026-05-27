@@ -217,13 +217,7 @@ impl GmailWorker {
                     // Failed itself; tally locally.
                     let id_before = raw.source_id.clone();
                     match ctx
-                        .ingest_one(
-                            self.name(),
-                            &raw,
-                            metadata,
-                            provenance,
-                            &tx,
-                        )
+                        .ingest_one(self.name(), &raw, metadata, provenance, &tx)
                         .await
                     {
                         Some(_) => {

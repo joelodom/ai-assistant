@@ -476,7 +476,9 @@ async fn sanitizer_failure_drops_input_persists_audit_and_notifies_user() {
         failing.clone(),
         memory.clone(),
     ));
-    let registry = std::sync::Arc::new(backend::connectors::ConnectorRegistry::empty());
+    // Reuse the assistant's worker registry so config_protocol shares
+    // the same backing context — empty is fine for this failing-LLM test.
+    let registry = assistant.workers.clone();
     let config_protocol = std::sync::Arc::new(backend::config_protocol::ConfigProtocol::new(
         memory.root().to_path_buf(),
         registry,

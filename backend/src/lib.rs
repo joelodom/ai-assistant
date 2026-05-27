@@ -6,14 +6,12 @@ pub mod attachments;
 pub mod claude;
 pub mod config;
 pub mod config_protocol;
-pub mod connectors;
 pub mod embedder;
 pub mod indexer;
 pub mod manual;
 pub mod memory;
 pub mod preprocessor;
 pub mod retrieval;
-pub mod scout;
 pub mod self_knowledge;
 pub mod vector_index;
 pub mod workers;
@@ -38,7 +36,7 @@ pub struct Built {
     pub llm: Arc<dyn claude::LlmClient>,
     pub embedder: Arc<dyn embedder::Embedder>,
     pub vector_index: Arc<vector_index::VectorIndex>,
-    pub connectors: Arc<connectors::ConnectorRegistry>,
+    pub workers: Arc<workers::WorkerRegistry>,
     pub cfg: config::Config,
 }
 
@@ -47,23 +45,15 @@ pub async fn build_app(cfg: config::Config) -> anyhow::Result<Built> {
     let llm = claude::make_client_from_env(&cfg.claude);
     let embedder = embedder::make_embedder_from_env();
 
-    // Open or initialize the vector index. The actual graph contents are a
-    // derived cache — Indexer will warm it from .vec sidecars in the
-    // background. If the existing embedding_model record disagrees with the
-    // current embedder, the Indexer will trigger a re-embed.
     let vector_index = Arc::new(vector_index::VectorIndex::open(
         memory.root(),
         embedder.model_name(),
         embedder.dimension(),
     )?);
-    // Warm the index from any existing .vec sidecars synchronously so the
-    // first retrieve() call after startup has something to work with.
     for (item, vec) in memory.items_with_vectors().unwrap_or_default() {
         let _ = vector_index.upsert(&item.sidecar.id, vec);
-        let _ = item; // silence unused warning if the upsert is no-op'd
+        let _ = item;
     }
-    // Record the active embedding model. The Indexer reads this on each
-    // tick to detect model changes.
     memory
         .write_embedding_model(embedder.model_name(), embedder.dimension())
         .await
@@ -85,36 +75,55 @@ pub async fn build_app(cfg: config::Config) -> anyhow::Result<Built> {
         Some(cfg.claude.model_for_preprocessor()),
     ));
 
-    // Discover available connectors. Each connector reports Ok(None) if
-    // not yet configured (no client_secret.json / token.json on disk) so
-    // first-run is graceful — the assistant sees an empty connector list
-    // and falls back to its normal behavior.
-    let mut connector_list: Vec<Arc<dyn connectors::Connector>> = vec![];
-    match connectors::gmail::GmailConnector::open(memory.root()) {
+    // Shared services every worker needs.
+    let worker_ctx = Arc::new(workers::WorkerContext {
+        preprocessor: preprocessor.clone(),
+        memory: memory.clone(),
+        embedder: embedder.clone(),
+        vector_index: vector_index.clone(),
+        preprocess_concurrency: 4,
+    });
+
+    // Discover available workers. Each reports Ok(None) if not yet
+    // configured (no client_secret.json / token.json on disk) so first
+    // run is graceful — the assistant sees an empty worker list and
+    // falls back to its normal behavior.
+    let mut worker_list: Vec<Arc<dyn workers::Worker>> = vec![];
+    match workers::gmail::GmailWorker::open(memory.root()) {
         Ok(Some(gmail)) => {
-            tracing::info!("gmail connector loaded");
-            connector_list.push(Arc::new(gmail));
+            tracing::info!("gmail worker loaded");
+            worker_list.push(Arc::new(gmail));
         }
         Ok(None) => {
-            tracing::info!("gmail connector not configured (no client_secret.json or token.json)");
+            tracing::info!("gmail worker not configured (no client_secret.json or token.json)");
         }
         Err(e) => {
-            tracing::warn!(error = %e, "failed to open gmail connector");
+            tracing::warn!(error = %e, "failed to open gmail worker");
         }
     }
-    let connectors_registry = Arc::new(connectors::ConnectorRegistry::new(connector_list));
-    // Register every connector *kind* so the assistant prompt lists them
-    // even when not yet configured — letting the assistant offer setup.
-    for k in connectors::known_connector_kinds() {
-        connectors_registry.register_kind(k);
+    // WWW worker is always present — WebSearch/WebFetch need no setup.
+    // Autonomous tick is still gated on cfg.scout.enabled (kept under
+    // the legacy `scout` section name for back-compat; renamed in a
+    // future config schema bump).
+    worker_list.push(Arc::new(workers::www::WwwWorker::new(
+        llm.clone(),
+        preprocessor.clone(),
+        cfg.scout.clone(),
+        cfg.claude.scout_allowed_tools.clone(),
+        Some(cfg.claude.model_for_scout()),
+    )));
+
+    let workers_registry = Arc::new(workers::WorkerRegistry::new(worker_ctx, worker_list));
+    for k in workers::known_worker_kinds() {
+        workers_registry.register_kind(k);
     }
 
     // Config protocol dispatcher — owns pending OAuth state, writes
-    // client_secret.json / token.json atomically, registers new connector
+    // client_secret.json / token.json atomically, registers new worker
     // instances live after OAuth completes.
     let config_protocol = Arc::new(config_protocol::ConfigProtocol::new(
         memory.root().to_path_buf(),
-        connectors_registry.clone(),
+        workers_registry.clone(),
     ));
 
     let manual = Arc::new(manual::Manual::open_or_seed(memory.root())?);
@@ -125,15 +134,15 @@ pub async fn build_app(cfg: config::Config) -> anyhow::Result<Built> {
         embedder.clone(),
         vector_index.clone(),
         preprocessor.clone(),
-        connectors_registry.clone(),
+        workers_registry.clone(),
         manual,
         Some(cfg.claude.model_for_assistant()),
         Some(cfg.claude.model_for_assistant_escalation()),
         cfg.retrieval.clone(),
-        2, // max_search_rounds — bound to keep latency + cost predictable
+        2, // max_search_rounds
         4, // max_manual_reads
-        4, // preprocess_concurrency — fans out connector preprocessing
-        4, // connector_concurrency — fans out parallel SEARCH markers
+        4, // preprocess_concurrency
+        4, // connector_concurrency
         facts,
     ));
     let state = ws::AppState {
@@ -147,7 +156,7 @@ pub async fn build_app(cfg: config::Config) -> anyhow::Result<Built> {
         llm,
         embedder,
         vector_index,
-        connectors: connectors_registry,
+        workers: workers_registry,
         cfg,
     })
 }

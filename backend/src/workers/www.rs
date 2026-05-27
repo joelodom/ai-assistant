@@ -219,13 +219,7 @@ Query: {query}
                     // ingestion pipeline single-pathed. We could add
                     // a "preprocessed already" variant later.
                     let _ = ctx
-                        .ingest_one(
-                            self.name(),
-                            &raw,
-                            metadata,
-                            InputProvenance::PublicWeb,
-                            tx,
-                        )
+                        .ingest_one(self.name(), &raw, metadata, InputProvenance::PublicWeb, tx)
                         .await;
                 } else {
                     // Tick path: no channel. Write directly using the

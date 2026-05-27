@@ -23,8 +23,10 @@ Sections (request via `READ_MANUAL: <section-name>`):
 - **memory-store** — on-disk layout, atomic writes, sha256, forward-compat.
 - **hazmat-bypass** — what HAZMAT mode does and how to talk about it.
 - **forget-action** — explicit forget, when to use it, what happens.
-- **connector-setup-gmail** — full walkthrough including Cloud Console.
-- **connector-setup-general** — pattern for any future connector.
+- **worker-setup-gmail** — full walkthrough including Cloud Console.
+- **worker-setup-general** — pattern for any future worker.
+- **workers** — what workers are, how they differ from the old
+  "connector"/"scout" split, and how the assistant talks to them.
 - **client-driven-config** — how runtime configuration flows from the client.
 - **error-handling** — what happens when the LLM fails, what to tell the user.
 - **troubleshooting** — common user-facing problems and how to resolve them.
@@ -270,7 +272,7 @@ If the user says "stop telling me about X," that's a preference
 preference automatically and stores it in `preferences.json`; you
 don't need to do anything for that case.
 
-## connector-setup-gmail
+## worker-setup-gmail
 
 When the user wants Gmail set up, walk them through these steps. You
 own the conversation; the client handles file picking + browser launch
@@ -327,21 +329,49 @@ Once they have the JSON file:
 - Token gets refreshed automatically. Revoke any time at
   https://myaccount.google.com/permissions.
 
-## connector-setup-general
+## worker-setup-general
 
-Connectors are search-only adapters. The user asks; you decide whether
-to search; you emit `SEARCH: <connector> <query>`; results pass through
-the Preprocessor and land in memory; you're re-prompted.
+Workers are subsystems that fetch external data. They can be passive
+(respond to a SEARCH dispatched by you) and/or autonomous (push items
+into memory via tick). Every item goes through the Preprocessor before
+reaching memory.
 
-For any new connector with OAuth, the setup pattern is the same as
-Gmail (Cloud Console → JSON → CONFIG_REQUEST_FILE → CONFIG_BEGIN_OAUTH
-→ done). Check the connector's section in this manual for the
-provider-specific Cloud Console quirks.
+For any new worker with OAuth, setup is the same as Gmail (Cloud
+Console → JSON → CONFIG_REQUEST_FILE → CONFIG_BEGIN_OAUTH → done).
+Check the worker's section in this manual for provider-specific
+Cloud Console quirks.
 
-If the user asks about a connector that isn't configured (`✗ NOT
-CONFIGURED` in the AVAILABLE CONNECTORS block), offer to set it up.
-If they decline, just answer using what's in memory.
+If the user asks about a worker that isn't configured (`✗ NOT
+CONFIGURED` in the AVAILABLE WORKERS block), offer to set it up. If
+they decline, just answer using what's in memory.
 
+## workers
+
+A Worker is "a thing that produces external data". It may:
+
+- Respond to `SEARCH: <worker> <query>` from you — the worker runs
+  the search, streams each result through the Preprocessor, writes
+  passing items to memory, and notifies the assistant when finished.
+  You then get re-prompted with the new memory available.
+- Run autonomously on a tick interval — e.g. Gmail polls for new mail
+  every minute; the WWW worker (when enabled) scans the web for
+  interest-relevant news every N minutes. Items just appear in memory;
+  no SEARCH marker is involved.
+
+Currently shipping:
+
+- **gmail** — Read-only Gmail. Both search-on-demand and tick-driven
+  ingestion of new mail. Each new email goes through the Preprocessor,
+  which decides what to do (full body, summarized, redacted, or
+  dropped) before anything lands in memory.
+- **www** — Open web (WebSearch + WebFetch). Both an interest-inferred
+  autonomous scan (when enabled) and on-demand `SEARCH: www <query>`
+  for fresh-news questions whose answer isn't in memory.
+
+Workers REPLACE the previous "connectors" + "Scout" split — that
+distinction was bookkeeping; both did the same architectural job. Old
+items written under the connector/scout naming still read fine
+(Invariant #7).
 ## client-driven-config
 
 The backend's CLI accepts exactly one flag: `--config <path>` (defaults
@@ -387,10 +417,10 @@ items tagged `error`.
 
 ## troubleshooting
 
-- **"The assistant can't search my Gmail."** Likely the gmail connector
-  is `NOT CONFIGURED`. Check the AVAILABLE CONNECTORS block — if it's
+- **"The assistant can't search my Gmail."** Likely the gmail worker
+  is `NOT CONFIGURED`. Check the AVAILABLE WORKERS block — if it's
   missing client_secret.json or token.json, walk them through
-  `connector-setup-gmail`.
+  `worker-setup-gmail`.
 
 - **"My OAuth says 'Google hasn't verified this app'."** Correct and
   expected for a personal OAuth client in Testing mode. Advanced →
