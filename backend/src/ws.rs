@@ -182,6 +182,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 /// One assistant turn: call respond, stream reply, send any ConfigRequest
 /// frames the assistant emitted, send ReplyDone. Used both for normal user
 /// turns AND for the synthetic continuation turns after a ConfigPayload.
+///
+/// Runs respond with a status channel so the assistant can emit in-flight
+/// `ServerMessage::Status` frames (retrieving / thinking / searching /
+/// reading_manual / escalating). Status frames stream to the client
+/// concurrently with the respond future via `tokio::select!`, so the UI
+/// can show a live status bar instead of a blank pause.
 async fn run_assistant_turn(
     state: &AppState,
     sender: &mut SplitSink<WebSocket, Message>,
@@ -189,12 +195,44 @@ async fn run_assistant_turn(
     metadata: Metadata,
     force_opus: bool,
 ) {
-    match state
+    let (status_tx, mut status_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
+    let respond_fut = state
         .assistant
-        .respond(&preprocessed, &metadata, force_opus)
-        .await
-    {
+        .respond_with_status(&preprocessed, &metadata, force_opus, Some(&status_tx));
+    tokio::pin!(respond_fut);
+
+    let result = loop {
+        tokio::select! {
+            biased;
+            // Status events get priority — surface them as soon as they
+            // arrive so the UI updates without waiting on the respond
+            // future.
+            Some(msg) = status_rx.recv() => {
+                let _ = send_frame(sender, &msg).await;
+            }
+            outcome = &mut respond_fut => {
+                // Drain any status events buffered before respond
+                // returned, before we start streaming the reply.
+                while let Ok(msg) = status_rx.try_recv() {
+                    let _ = send_frame(sender, &msg).await;
+                }
+                break outcome;
+            }
+        }
+    };
+
+    match result {
         Ok(outcome) => {
+            // Final status: we have the reply, about to stream it.
+            let _ = send_frame(
+                sender,
+                &ServerMessage::Status {
+                    phase: "replying".into(),
+                    detail: None,
+                },
+            )
+            .await;
             if outcome.escalated {
                 let prefix = if let Some(r) = &outcome.escalation_reason {
                     format!(
@@ -360,6 +398,18 @@ async fn handle_user_message(
             importance_reason: Some("HAZMAT bypass — user explicitly elevated".into()),
         })
     } else {
+        // Status before preprocess so the UI immediately reflects activity —
+        // Haiku can take several seconds on cold start, and we don't want
+        // the user staring at an unresponsive window. Fire-and-forget; a
+        // disconnected client just means the user already moved on.
+        let _ = send_frame(
+            sender,
+            &ServerMessage::Status {
+                phase: "preprocessing".into(),
+                detail: Some("Reviewing your message…".into()),
+            },
+        )
+        .await;
         state
             .preprocessor
             .preprocess(&bundle, InputProvenance::Personal)

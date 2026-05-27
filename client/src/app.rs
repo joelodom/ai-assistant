@@ -66,6 +66,18 @@ enum Turn {
     System { text: String, ts: String },
 }
 
+/// In-flight status for the current turn, populated by
+/// `ServerMessage::Status` frames as the backend works. Cleared when
+/// `ReplyDone` arrives (or when an `Error` frame ends the turn). The
+/// elapsed-time counter in the status bar reads from
+/// `AssistantApp.turn_started_at`, not from per-status timestamps —
+/// it shows total turn elapsed, not per-phase elapsed.
+#[derive(Debug, Clone)]
+struct TurnStatus {
+    phase: String,
+    detail: Option<String>,
+}
+
 pub struct AssistantApp {
     url: String,
     pending_url_edit: String,
@@ -77,6 +89,12 @@ pub struct AssistantApp {
     transcript: Vec<Turn>,
     /// Buffer accumulating reply chunks until ReplyDone.
     streaming_reply: String,
+    /// Live status from the backend during a turn. None when idle.
+    turn_status: Option<TurnStatus>,
+    /// When the user pressed Send for the current turn — drives the
+    /// elapsed-time counter in the status bar. Cleared on ReplyDone /
+    /// Error / Disconnect.
+    turn_started_at: Option<std::time::Instant>,
 
     input_buf: String,
     pending_attachments: Vec<Attachment>,
@@ -141,6 +159,8 @@ impl AssistantApp {
             connected: false,
             transcript: Vec::new(),
             streaming_reply: String::new(),
+            turn_status: None,
+            turn_started_at: None,
             input_buf: String::new(),
             pending_attachments: Vec::new(),
             show_settings: false,
@@ -170,10 +190,26 @@ impl AssistantApp {
                 NetToUi::Disconnected(why) => {
                     self.status = format!("disconnected: {why}");
                     self.connected = false;
+                    // Drop any in-flight status — the turn isn't coming
+                    // back to us.
+                    self.turn_status = None;
+                    self.turn_started_at = None;
                 }
                 NetToUi::Frame(f) => match f {
                     ServerMessage::ReplyChunk { text } => {
                         self.streaming_reply.push_str(&text);
+                        // If we never saw an explicit `replying` Status
+                        // frame (e.g. backend skipped it, or this is the
+                        // intro), seeing chunks is itself proof we're in
+                        // the replying phase.
+                        if self.turn_status.as_ref().map(|s| s.phase != "replying").unwrap_or(true)
+                            && self.turn_started_at.is_some()
+                        {
+                            self.turn_status = Some(TurnStatus {
+                                phase: "replying".into(),
+                                detail: None,
+                            });
+                        }
                     }
                     ServerMessage::ReplyDone { text, .. } => {
                         if let Some(t) = text {
@@ -189,18 +225,25 @@ impl AssistantApp {
                                 ts: now_str(),
                             });
                         }
+                        // Turn is over — clear the status bar.
+                        self.turn_status = None;
+                        self.turn_started_at = None;
                     }
                     ServerMessage::StubNotice { text } => {
                         self.transcript.push(Turn::Stub {
                             text,
                             ts: now_str(),
                         });
+                        self.turn_status = None;
+                        self.turn_started_at = None;
                     }
                     ServerMessage::Error { text } => {
                         self.transcript.push(Turn::Error {
                             text,
                             ts: now_str(),
                         });
+                        self.turn_status = None;
+                        self.turn_started_at = None;
                     }
                     ServerMessage::Pong => {}
                     ServerMessage::ConfigRequest { request } => {
@@ -212,6 +255,12 @@ impl AssistantApp {
                             text: format!("{prefix} [{connector}] {message}"),
                             ts: now_str(),
                         });
+                    }
+                    ServerMessage::Status { phase, detail } => {
+                        // Update the live status bar. The bar shows what
+                        // the backend is currently doing; clears on
+                        // ReplyDone or Error.
+                        self.turn_status = Some(TurnStatus { phase, detail });
                     }
                 },
             }
@@ -259,6 +308,13 @@ impl AssistantApp {
         self.transcript.push(Turn::User {
             text: display,
             ts: now_str(),
+        });
+        // Light up the status bar immediately so the user sees activity
+        // before the first server frame arrives.
+        self.turn_started_at = Some(std::time::Instant::now());
+        self.turn_status = Some(TurnStatus {
+            phase: "sending".into(),
+            detail: Some("Delivering your message…".into()),
         });
         let msg = ClientMessage::Message {
             payload: MessagePayload {
@@ -630,6 +686,45 @@ impl eframe::App for AssistantApp {
             .default_height(200.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
+
+                // Live status bar — populated by `ServerMessage::Status`
+                // frames during a turn. Shows phase + detail + elapsed
+                // seconds so the user can see the backend is alive even
+                // during multi-second LLM calls. Cleared by ReplyDone /
+                // Error / Disconnect.
+                if let Some(ts) = self.turn_status.clone() {
+                    let elapsed = self
+                        .turn_started_at
+                        .map(|t| t.elapsed())
+                        .unwrap_or_default();
+                    let icon = match ts.phase.as_str() {
+                        "sending" => "📤",
+                        "preprocessing" => "🛡",
+                        "retrieving" | "re_retrieving" => "🔎",
+                        "thinking" => "🧠",
+                        "searching" => "📨",
+                        "reading_manual" => "📖",
+                        "escalating" => "⏫",
+                        "replying" => "💬",
+                        _ => "•",
+                    };
+                    let label = match &ts.detail {
+                        Some(d) => format!("{icon} {} — {}", ts.phase, d),
+                        None => format!("{icon} {}", ts.phase),
+                    };
+                    let elapsed_str = format!(" ({:.1}s)", elapsed.as_secs_f32());
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(14.0));
+                        ui.label(egui::RichText::new(label).color(
+                            egui::Color32::from_rgb(150, 200, 255),
+                        ));
+                        ui.weak(elapsed_str);
+                    });
+                    ui.add_space(2.0);
+                    // Keep the elapsed counter ticking even when the
+                    // user isn't interacting.
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                }
 
                 // Pending attachments strip.
                 if !self.pending_attachments.is_empty() {

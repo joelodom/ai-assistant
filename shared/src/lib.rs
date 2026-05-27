@@ -149,6 +149,20 @@ pub enum ServerMessage {
         ok: bool,
         message: String,
     },
+    /// In-flight status update for a turn — tells the client "I'm at
+    /// stage X right now" so the UI can render a live status bar instead
+    /// of an unresponsive pause. Sent between `ws_message_received` and
+    /// the first `ReplyChunk`. Multiple per turn allowed.
+    ///
+    /// `phase` is a short stable identifier (`preprocessing`, `retrieving`,
+    /// `thinking`, `searching`, `reading_manual`, `escalating`,
+    /// `replying`); `detail` is an optional one-line human-readable
+    /// elaboration (e.g. `"gmail: 4 results, kept 3"`).
+    Status {
+        phase: String,
+        #[serde(default)]
+        detail: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

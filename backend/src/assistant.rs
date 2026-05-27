@@ -219,10 +219,29 @@ impl Assistant {
         }
     }
 
-    // Note: turn_id is set on the PARENT `turn` span created in ws.rs so
-    // every event in the pipeline (including the preprocessor's, which
-    // fires before respond) carries the same UUID. This span adds the
-    // post-preprocess fields the parent didn't have.
+    /// Back-compat wrapper around `respond_with_status`. Use this when
+    /// you don't care about in-turn UI status (tests, scout, internal
+    /// continuation turns).
+    pub async fn respond(
+        &self,
+        preprocessed: &PreprocessorResult,
+        metadata: &Metadata,
+        force_opus: bool,
+    ) -> Result<RespondOutcome> {
+        self.respond_with_status(preprocessed, metadata, force_opus, None)
+            .await
+    }
+
+    /// Same as `respond`, but emits `ServerMessage::Status` events on the
+    /// optional channel as the turn progresses. The WS handler forwards
+    /// these to the client so the user sees a live status bar instead of
+    /// a blank pause. Channel send failures are silently ignored (a
+    /// disconnected client is not an error condition for the turn).
+    ///
+    /// Note: turn_id is set on the PARENT `turn` span created in ws.rs so
+    /// every event in the pipeline (including the preprocessor's, which
+    /// fires before respond) carries the same UUID. This span adds the
+    /// post-preprocess fields the parent didn't have.
     #[tracing::instrument(
         name = "respond",
         skip_all,
@@ -232,11 +251,12 @@ impl Assistant {
             importance = preprocessed.importance,
         )
     )]
-    pub async fn respond(
+    pub async fn respond_with_status(
         &self,
         preprocessed: &PreprocessorResult,
         metadata: &Metadata,
         force_opus: bool,
+        status_tx: Option<&tokio::sync::mpsc::UnboundedSender<shared::ServerMessage>>,
     ) -> Result<RespondOutcome> {
         let turn_start = std::time::Instant::now();
         tracing::info!("turn_started");
@@ -300,6 +320,17 @@ impl Assistant {
         let mut manual_reads_log: Vec<String> = vec![];
 
         let final_reply = loop {
+            // Status: we're about to scan memory.
+            emit_status(
+                status_tx,
+                if search_rounds == 0 && manual_excerpts.is_empty() {
+                    "retrieving"
+                } else {
+                    "re_retrieving"
+                },
+                Some("Looking through memory for relevant context…".into()),
+            );
+
             // Rebuild prompt every iteration — memory may have grown via
             // SEARCH ingestion, and manual_excerpts may have grown via
             // READ_MANUAL in the previous round.
@@ -352,6 +383,14 @@ impl Assistant {
                 "llm_call_starting"
             );
             let llm_start = std::time::Instant::now();
+            emit_status(
+                status_tx,
+                "thinking",
+                Some(format!(
+                    "Asking {}…",
+                    current_model.as_deref().unwrap_or("the model")
+                )),
+            );
             let opts = LlmOptions {
                 allowed_tools: vec!["WebSearch".into(), "WebFetch".into()],
                 model: current_model.clone(),
@@ -403,6 +442,14 @@ impl Assistant {
                     to_model = ?esc,
                     "escalation_triggered"
                 );
+                emit_status(
+                    status_tx,
+                    "escalating",
+                    Some(format!(
+                        "Handing off to {} for deeper reasoning…",
+                        esc.as_deref().unwrap_or("the escalation model")
+                    )),
+                );
                 current_model = esc;
                 escalated = true;
                 continue;
@@ -424,6 +471,11 @@ impl Assistant {
                     sections = ?requested,
                     budget,
                     "manual_reads_requested"
+                );
+                emit_status(
+                    status_tx,
+                    "reading_manual",
+                    Some(format!("Consulting manual: {}", requested.join(", "))),
                 );
                 for section in manual_requests.into_iter().take(budget) {
                     let (display_name, body) = if section.is_empty() {
@@ -460,6 +512,11 @@ impl Assistant {
                     "search_round_starting"
                 );
                 for (conn_name, query) in searches {
+                    emit_status(
+                        status_tx,
+                        "searching",
+                        Some(format!("Searching {conn_name}…")),
+                    );
                     let summary = self
                         .execute_search(&conn_name, &query, metadata)
                         .await;
@@ -758,6 +815,23 @@ fn strip_config_markers(text: &str) -> (String, Vec<shared::ConfigRequestKind>) 
     let stripped = out_lines.join("\n");
     let stripped = stripped.trim_end().to_string();
     (stripped, requests)
+}
+
+/// Best-effort dispatch of a `ServerMessage::Status` event on the optional
+/// channel. A disconnected receiver is silently ignored — status frames
+/// are advisory; failing to deliver one is not an error condition for the
+/// turn.
+fn emit_status(
+    tx: Option<&tokio::sync::mpsc::UnboundedSender<shared::ServerMessage>>,
+    phase: &str,
+    detail: Option<String>,
+) {
+    if let Some(tx) = tx {
+        let _ = tx.send(shared::ServerMessage::Status {
+            phase: phase.to_string(),
+            detail,
+        });
+    }
 }
 
 /// Parse SEARCH: markers from an LLM reply. Returns (connector_name,

@@ -89,6 +89,9 @@ async fn full_roundtrip_with_mock_llm() {
                 break;
             }
             ServerMessage::Error { text } => panic!("server error: {text}"),
+            // In-flight status frames are advisory; the test cares about
+            // the reply, not what the backend was doing. Just skip them.
+            ServerMessage::Status { .. } => continue,
             other => panic!("unexpected frame: {other:?}"),
         }
     }
@@ -172,18 +175,31 @@ async fn sanitizer_drop_path_emits_stub_notice_and_persists_only_stub() {
         .unwrap()
         .unwrap()
         .unwrap();
-    let txt = match frame {
-        Message::Text(t) => t,
-        other => panic!("unexpected: {other:?}"),
-    };
-    let parsed: ServerMessage = serde_json::from_str(&txt).unwrap();
-    match parsed {
-        ServerMessage::StubNotice { text } => {
-            assert!(text.contains("dropped"));
-            assert!(!text.contains("482194"), "OTP leaked: {text}");
+    // Drain any in-flight Status frames; the actual decision (drop →
+    // StubNotice) comes after preprocess completes.
+    let mut current_frame = frame;
+    let stub_text = loop {
+        let txt = match current_frame {
+            Message::Text(t) => t,
+            other => panic!("unexpected: {other:?}"),
+        };
+        let parsed: ServerMessage = serde_json::from_str(&txt).unwrap();
+        match parsed {
+            ServerMessage::Status { .. } => {
+                // Skip; await the next frame.
+                current_frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                continue;
+            }
+            ServerMessage::StubNotice { text } => break text,
+            other => panic!("expected StubNotice, got {other:?}"),
         }
-        other => panic!("expected StubNotice, got {other:?}"),
-    }
+    };
+    assert!(stub_text.contains("dropped"));
+    assert!(!stub_text.contains("482194"), "OTP leaked: {stub_text}");
 
     // Walk the memory dir: the OTP must not appear anywhere on disk.
     let mut leaked = false;
@@ -505,18 +521,30 @@ async fn sanitizer_failure_drops_input_persists_audit_and_notifies_user() {
         .unwrap()
         .unwrap()
         .unwrap();
-    let txt = match frame {
-        Message::Text(t) => t,
-        other => panic!("unexpected: {other:?}"),
-    };
-    let parsed: ServerMessage = serde_json::from_str(&txt).unwrap();
-    match parsed {
-        ServerMessage::StubNotice { text } => {
-            assert!(text.contains("Preprocessor"), "stub: {text}");
-            assert!(text.contains("dropped"), "stub: {text}");
+    // Drain any in-flight Status frames; the preprocessor-failure
+    // StubNotice comes after preprocess errors out.
+    let mut current_frame = frame;
+    let stub_text = loop {
+        let txt = match current_frame {
+            Message::Text(t) => t,
+            other => panic!("unexpected: {other:?}"),
+        };
+        let parsed: ServerMessage = serde_json::from_str(&txt).unwrap();
+        match parsed {
+            ServerMessage::Status { .. } => {
+                current_frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                continue;
+            }
+            ServerMessage::StubNotice { text } => break text,
+            other => panic!("expected StubNotice on sanitizer failure, got {other:?}"),
         }
-        other => panic!("expected StubNotice on sanitizer failure, got {other:?}"),
-    }
+    };
+    assert!(stub_text.contains("Preprocessor"), "stub: {stub_text}");
+    assert!(stub_text.contains("dropped"), "stub: {stub_text}");
 
     // Audit record is on disk, raw input is NOT.
     let mut saw_audit = false;
