@@ -1,13 +1,13 @@
 # ai-assistant
 
-A personal AI assistant with long-term memory that lives on your machine, not
-in someone else's cloud. You hand it your inbox, your notes, your documents.
-It remembers. Later you ask "what am I supposed to be thinking about right
-now?" and it answers — using everything you've ever told it, weighted by
-recency and importance.
+A personal AI assistant with long-term memory that lives on **your** machine,
+not in someone else's cloud. You hand it your inbox, your notes, your
+documents. It remembers. Later you ask *"what am I supposed to be thinking
+about right now?"* and it answers — using everything you've ever told it,
+weighted by recency and importance.
 
-It is designed around one **non-negotiable security property**: a strict
-one-way data flow we call **"the diode."**
+It is built around one **non-negotiable property**: a strict one-way data
+flow we call **the diode**.
 
 ```
    you ──data──▶ assistant ──answers──▶ you
@@ -15,418 +15,157 @@ one-way data flow we call **"the diode."**
                      └── cannot reach the outside world
 ```
 
-Data flows **in**: emails, notes, calendar entries, scanned documents, photos,
-free-text. The assistant **accumulates** knowledge over time. It only ever
-produces **outputs back to you**: reminders, summaries, answers, news you
-might care about. **It cannot take actions in the outside world.** It cannot
+Data flows **in**: emails, notes, calendar entries, scanned documents,
+photos, free text. The assistant **accumulates** knowledge over time. It only
+ever produces **outputs back to you**: reminders, summaries, answers, news you
+might care about. **It cannot take actions in the outside world** — it cannot
 send an email on your behalf, change a thermostat, reset a password, move
-money, or call any write-capable API. There is no "let me just integrate
-this one webhook" — the architecture forbids it.
+money, or call any write-capable API. There is no "let me just integrate this
+one webhook." The architecture forbids it.
 
 Think of it as a trusted human personal assistant: you hand them your mail,
 they read and remember it, and later you ask them things. They never act on
 your behalf in the world.
 
+---
+
+## Documentation
+
+| Document | Read it if you want to… |
+|----------|--------------------------|
+| **[User's Guide](docs/USER_GUIDE.md)** | Install, run, and *use* the assistant day to day — the chat UI, attachments, HAZMAT, connecting Gmail, telling it to forget things. |
+| **[Architecture & Development](docs/ARCHITECTURE.md)** | Understand the implementation, the design principles, and how to contribute. Written for humans and AI agents alike. |
+| **[Security Model](docs/SECURITY.md)** | Understand the threat model, what's defended, what's deliberately *not*, and the eight invariants that make the guarantee real. |
+
+Two further references that live with the code:
+
+- **`config.toml`** — the annotated configuration template (every knob the
+  backend has).
+- **`backend/src/DEFAULT_MANUAL.md`** — the assistant's own operating manual,
+  embedded in the binary and seeded to `<memory-dir>/SYSTEM_MANUAL.md` on
+  first run. It is the canonical source of *procedural* truth and is
+  user-editable.
+
+*(Contributors and AI agents: `CLAUDE.md` at the repo root holds the working
+agreement for editing this codebase. It is intentionally not part of the
+documentation set above.)*
+
+---
+
+## Why this exists
+
+Mainstream assistants make you choose between **memory** and **privacy**.
+Cloud chat tools either forget you between sessions or remember you on
+someone else's servers. Agentic tools that *do* remember also tend to *act* —
+and an assistant that can both read your email and take actions is a single
+prompt-injection away from being a liability.
+
+This project takes a different stance:
+
+- **Your substrate is yours.** Memory is plain text + JSON files in a folder
+  you choose. No database, no cloud, no account. You can `cat`, `grep`, and
+  `tar` your assistant's brain, and read it with `less` ten years from now.
+- **Safe to feed.** Because the backend has no outbound-action machinery, the
+  worst a malicious email can do is corrupt an *answer* — never trigger an
+  action. That makes it safe to hand the system your real, messy, sensitive
+  data.
+- **It actually remembers.** A local embedding model plus hybrid retrieval
+  (semantic + keyword + recency + importance) means a strong match from a
+  year ago still surfaces, and important things float up on their own.
+
 ## What it's good for
 
-- **A persistent memory layer for an LLM you actually trust with personal
-  data.** ChatGPT, Claude.ai, and similar tools either forget between
-  sessions or store everything in someone else's cloud. This stores
-  everything in plain files in a folder you control.
-- **Replacing the scatter** of Apple Notes + email screenshots + a half-used
-  calendar + sticky notes + "I'll remember this" with one queryable surface
-  that actually does remember.
-- **"What's on my plate?" / "What am I supposed to be thinking about?"** —
-  the assistant uses *now* + *here* + accumulated memory + learned
-  preferences to answer.
-- **Cross-domain reasoning**: "When did I last hear from my accountant?",
-  "What did the inspector say about the roof?", "Did I ever follow up on
-  that interview?" — answers across email, notes, and documents you've
-  handed it.
-- **A second-brain for personal projects**: drop in research notes, paste
-  in conversations, attach PDFs. Ask it questions later in plain English.
-- **Curated news** (opt-in): a background "Scout" worker that infers what
-  you care about from your memory and surfaces relevant news without you
-  asking. Off by default until you've used the system enough that it
-  knows you.
+- **A persistent memory layer for an LLM you trust with personal data.**
+- **Replacing the scatter** of Notes + email screenshots + a half-used
+  calendar + sticky notes with one queryable surface that actually remembers.
+- **"What's on my plate?"** — answered from *now* + *here* + accumulated
+  memory + learned preferences.
+- **Cross-domain recall**: *"When did I last hear from my accountant?"*,
+  *"What did the inspector say about the roof?"*, *"Did I ever follow up on
+  that interview?"* — across email, notes, and documents you've handed it.
+- **A second brain for personal projects**: drop in research, paste
+  conversations, attach PDFs, ask questions later in plain English.
+- **Curated news** (opt-in): a background web worker that infers what you care
+  about from your memory and surfaces relevant items without you asking.
 
-## Who it's NOT for
+## Who it's *not* for
 
-- People who want an agent that *does* things (books flights, sends email,
-  posts to Slack). That's a different product with a fundamentally
-  different security model.
+- People who want an agent that *does* things (books flights, sends mail,
+  posts to Slack). That's a different product with a fundamentally different
+  security model.
 - People who want it to run on someone else's servers. The whole point is
   that the substrate is yours.
 
-## Security model — the short version
-
-Security is the whole reason this design looks the way it does. Five
-properties hold whether you trust the model or not:
-
-### 1. The diode: no outbound actions, ever
-
-The backend is read-in / respond-out only. No code path writes to an
-external system. This is the deepest defense against prompt injection in
-your data: even if a malicious email convinces the model to "send a
-password-reset link to attacker@evil.com," there is no machinery in the
-backend that *can* send an email. The worst an attacker can do via
-ingested data is corrupt the answers you get back. They cannot make the
-assistant act in the world.
-
-This is what we mean by "load-bearing." The diode isn't a policy you can
-relax for convenience — it's an architectural property. The system has no
-HTTP client for outbound writes, no SMTP, no SDKs that mutate state. Web
-search and URL fetching are read-only and are the only outbound traffic.
-
-### 2. The Security Preprocessor: a checkpoint that sees everything first
-
-Every byte from the outside world — your typing, an ingested email, text
-extracted from a PDF, a web page the Scout fetched — passes through the
-**Security Preprocessor** (Preprocessor for short) before anything else sees
-it. The Preprocessor is a **separate, ephemeral process per call**: a fresh
-`claude` subprocess with no shared session state, no `--continue`, no
-history. The raw input lives only on one function's stack and inside that
-one short-lived subprocess. When the subprocess exits, the raw input is gone.
-
-The Preprocessor classifies each piece of input into three tiers:
-
-- **Drop entirely** — content that is *only* security-relevant (an OTP
-  email, a password-reset link). The content is destroyed; only a
-  content-free stub note is recorded ("Received and dropped a message that
-  appeared to be a security code").
-- **Redact, then pass** — sensitive but contextually useful content (a
-  bank deposit confirmation). Account numbers and similar
-  directly-actionable identifiers are replaced with placeholders; who/what/
-  when is preserved.
-- **Pass through** — the vast majority of input. Just goes through.
-
-### 3. Threat model: account-takeover attackers, not nation-states
-
-The Preprocessor is tuned to defeat **financially motivated attackers** trying for
-account takeover or direct theft. It actively suppresses anything that
-would directly enable that:
-
-- 2FA / MFA / OTP codes
-- Password reset links and tokens
-- API keys, access tokens, session tokens, recovery codes
-- Full bank account numbers, full card numbers, routing numbers, wire/ACH
-  identifiers
-
-It is **not** trying to suppress every fact a social engineer might find
-useful. Birthdays, vacation dates ("house empty next Tuesday"), kids'
-school names, employer info, calendar events — these get remembered and
-reasoned over, because hobbling the assistant's usefulness to defend
-against social engineering would defeat the point. The threshold is "would
-this one fact directly enable account takeover?" — if yes, drop or redact;
-if no, keep.
-
-### 4. Your data lives on your disk in plain text
-
-There is **no database** and **no cloud storage**. Memory is plain text
-bodies plus small JSON sidecars under a directory you choose:
-
-```
-<memory-dir>/
-  items/2026-05-25/<id>.txt        # the sanitized body
-  items/2026-05-25/<id>.json       # who/when/how-important
-  stubs/<id>.json                  # content-free drop records
-  preferences.json                 # things you've told it to remember about your preferences
-```
-
-You can `cat` your assistant's memory. You can `grep` it. You can back it
-up with `tar`. You can move it to another machine. You can delete a
-specific item by removing two files. The whole format is designed to
-survive the death of this software — you can read the data with `less`
-ten years from now.
-
-All writes are atomic (temp file + fsync + rename), so a crash mid-write
-cannot corrupt items. The backend can be killed, restarted, power-cycled
-at any moment without losing anything except an in-flight request.
-
-### 5. The HAZMAT bypass is opt-in, audited, and never automatic
-
-There is one explicit user-controlled exception to "the Preprocessor sees
-everything": a `☢ HAZMAT` checkbox in the client. Tick it and the next
-message skips the Preprocessor and goes straight to the assistant. Use it
-when you've consciously decided the content is safe and you want it
-reasoned over verbatim. Every bypass is logged at WARN, tagged `hazmat`
-in the memory audit trail, and shown with a banner in your local
-transcript so you can never wonder later whether a message went through
-the Preprocessor. **No code path may set the bypass programmatically** —
-only the human-pressed checkbox can flip it.
-
 ---
 
-For the in-depth architecture, security argument, and the canonical
-walkthrough the assistant itself uses, see
-`backend/src/DEFAULT_MANUAL.md` (also written to
-`<memory-dir>/SYSTEM_MANUAL.md` on first run; user-editable). For
-contribution invariants, see [CLAUDE.md](CLAUDE.md).
-
----
-
-## Run it locally
+## Quick start
 
 ### Prerequisites
 
-- Rust 2021 (1.75+). `rustc --version`.
-- The `claude` CLI, authenticated against your Claude Max account: `claude --version`.
+- **Rust** 2021 (1.75+) — `rustc --version`
+- The **`claude` CLI**, authenticated against your Claude account —
+  `claude --version`
 
 ### Build
 
 ```bash
+# Default build (uses a deterministic mock embedder — fine for trying it out).
 cargo build --release
+
+# Production build (real local semantic embeddings via fastembed-rs).
+cargo build --release --features fastembed-real
 ```
 
-This builds two binaries:
+This produces two binaries:
 
 - `target/release/ai-assistant-backend` — the WebSocket server.
-- `target/release/ai-assistant-client` — the native Mac chat UI.
+- `target/release/ai-assistant-client` — the native chat UI.
 
-### Start the backend
+> **Embeddings note:** without the `fastembed-real` feature the backend uses a
+> deterministic hash-based `MockEmbedder` — great for tests and a quick look,
+> but **not semantically meaningful**. Build with `--features fastembed-real`
+> for real recall quality. See the
+> [Architecture doc](docs/ARCHITECTURE.md#embedding--the-vector-index).
 
-```bash
-./target/release/ai-assistant-backend                       # uses ./config.toml if present, else defaults
-./target/release/ai-assistant-backend --config my.toml      # explicit config
-```
-
-The backend has exactly one flag: `--config <path>`. Everything tunable
-(memory dir, listen address, model choices, scout/indexer toggles,
-retrieval weights) lives in the TOML — see `config.toml` for the
-annotated template. Default listen address is `127.0.0.1:8765`. By
-default the **Scout** is disabled and the **Indexer** is enabled.
-
-Logs go to stderr; tune with `RUST_LOG=debug`.
-
-### Start the client
+### Run
 
 ```bash
-./target/release/ai-assistant-client                            # connects to default
-./target/release/ai-assistant-client --url ws://127.0.0.1:8765/ws
-AI_ASSISTANT_URL=ws://10.0.0.5:8765/ws ./target/release/ai-assistant-client
-```
-
-The client opens an 800×720 window with a single chat surface. ⌘+Enter sends.
-On first connect, the assistant introduces itself and tells you what it can
-and can't do. After that, just talk to it — hand it data (paste an email,
-jot a note), ask it questions, or tell it what to remember or forget.
-
----
-
-## Different datasets / backup
-
-The memory directory **is** the database. Point the backend at different
-folders by editing `[memory] dir` in your TOML, and pick which TOML to
-use with `--config`:
-
-```bash
-./target/release/ai-assistant-backend --config personal.toml
-./target/release/ai-assistant-backend --config work.toml
-```
-
-Backup is just a tarball of that folder:
-
-```bash
-tar czf data-$(date +%F).tgz -C ~/data personal
-```
-
-All writes are atomic (temp file + rename), so a crash mid-write cannot
-corrupt items. Stopping and restarting the backend is safe — there is no
-process-resident state beyond what's on disk.
-
----
-
-## Test it without spending tokens
-
-```bash
-AI_ASSISTANT_MOCK_CLAUDE=1 cargo test --workspace
-```
-
-This swaps the real `claude` CLI for a deterministic in-process mock. Unit
-tests cover the sanitizer JSON parser, memory store, decay logic, and
-preference detection. Integration tests in `backend/tests/` spin up a real
-backend + WebSocket client and assert end-to-end behavior including the
-sanitizer Tier-1 drop path and the sanitizer-failure audit path.
-
-You can also run the backend itself against the mock for a UI smoke test:
-
-```bash
-AI_ASSISTANT_MOCK_CLAUDE=1 ./target/release/ai-assistant-backend
-./target/release/ai-assistant-client
-```
-
-Messages will get canned responses, but every code path runs and nothing is
-sent to Claude.
-
----
-
-## Connectors (search your Gmail)
-
-The assistant can search external personal-data sources on demand. v2.1
-ships with **Gmail** (read-only). The assistant emits a `SEARCH: gmail
-<query>` marker when it judges the answer is likely in your inbox; the
-backend runs the search, every result passes through the Preprocessor
-(sanitization + importance scoring), and findings land in memory as
-permanent searchable items.
-
-### Defense in depth
-
-The connector is bound to the `gmail.readonly` OAuth scope. Three
-independent layers prevent abuse:
-
-1. **Google enforces the scope.** Any attempt to send, delete, or modify
-   mail returns 403 — Google's authorization server refuses, regardless
-   of what our code tries.
-2. **The connector trait has no write methods.** There is no `.send()`
-   or `.delete()` — a bug literally cannot call into them.
-3. **Every result passes the Preprocessor.** Malicious content (OTPs,
-   prompt injection) gets dropped or redacted before reaching the
-   assistant or storage.
-
-### Setting up Gmail
-
-Start the backend (no flags needed) and connect with the client:
-
-```bash
+# Backend — one flag only: --config. Uses ./config.toml if present, else defaults.
 ./target/release/ai-assistant-backend
+
+# Client — connects to ws://127.0.0.1:8765/ws by default.
 ./target/release/ai-assistant-client
 ```
 
-Then tell the assistant:
+On first connect the assistant introduces itself and tells you what it can and
+can't do. After that, just talk to it — paste an email, jot a note, ask a
+question, or tell it what to remember or forget.
 
-> set up gmail
+### Try it without spending tokens
 
-That's the whole instruction. The assistant reads its own manual for the
-exact procedure and walks you through it — Cloud Console setup, file
-upload, browser-based OAuth, the "Google hasn't verified this app"
-warning, troubleshooting, and a suggested test query at the end. You're
-having a conversation, not following a wizard.
+```bash
+cargo test --workspace          # offline; uses in-process mocks, spends no tokens
+```
 
-A few things worth knowing without asking:
-
-- The browser dance happens on **your machine** (the client launches
-  your browser; the client hosts the OAuth loopback). The auth code
-  reaches the backend over the existing trusted WebSocket. This is
-  why it works the same whether the backend runs locally or on a
-  headless EC2 instance.
-- The OAuth scope is hardcoded to `gmail.readonly`. Google enforces
-  it server-side; the connector trait exposes no `.send()` or
-  `.delete()` methods to bug-call; every fetched email passes through
-  the Preprocessor before reaching memory.
-- The token refreshes silently. Revoke at any time at
-  https://myaccount.google.com/permissions.
-
-The walkthrough lives in `backend/src/DEFAULT_MANUAL.md` under the
-`connector-setup-gmail` section. It's seeded into
-`<memory-dir>/SYSTEM_MANUAL.md` on first run, where you can edit it to
-adjust the assistant's behavior for your setup.
+For a UI smoke test against canned responses, run the backend with
+`AI_ASSISTANT_MOCK_CLAUDE=1`. Full details are in the
+[User's Guide](docs/USER_GUIDE.md) and
+[Architecture doc](docs/ARCHITECTURE.md#testing).
 
 ---
 
-## How recall works (RAG, hybrid retrieval)
+## At a glance
 
-The assistant doesn't load all your memory into the model every turn — at
-years-of-data scale that wouldn't work. Instead, each turn it hybrid-retrieves
-the top-K most relevant items and only those go into the prompt.
+| Component | Crate | Role |
+|----------:|-------|------|
+| Preprocessor | backend | Security gate. Ephemeral per-call subprocess. Three-tier classify + redact + importance score. |
+| Assistant ("the Core") | backend | The only thing you talk to. Hybrid retrieval, replies, persists turns. |
+| Memory | backend | File-based store. Atomic writes, `.vec` sidecars, explicit forget. |
+| Embedder | backend | Local fastembed-rs model — text → vector. No network. |
+| VectorIndex | backend | HNSW search structure. Derived cache, rebuildable. |
+| Indexer | backend | Periodic mechanical worker (no LLM): backfill, re-embed, stats. |
+| Workers | backend | External-data subsystems (Gmail, WWW). On-demand search and/or autonomous tick. |
+| Client | client | egui chat surface, attachments, geolocation, metadata. |
+| Protocol | shared | Wire types shared by both crates. |
 
-The score per candidate item is:
-
-```
-final = α · relevance + β · recency + γ · importance
-```
-
-where `relevance = max(vector_cosine, keyword_rank)`, `recency = exp(-age_days
-/ half_life)`, and `importance` is the score the Preprocessor assigned at ingest time.
-Defaults: `α=0.6, β=0.25, γ=0.15, half_life=30d` — configurable in
-`config.toml [retrieval]`.
-
-This means a very strong semantic match from a year ago still surfaces, a
-weak match from yesterday still surfaces, and a weak match from a year ago
-gets filtered out. Important items (a wedding invitation, a deposition date)
-float up regardless.
-
-Embedding is local — a small fastembed-rs model runs in-process, no calls
-to a remote embeddings API. The vectors live as `.vec` sidecars next to your
-text bodies; the HNSW search index is a derived cache that gets rebuilt from
-the sidecars if missing.
-
-The system never silently forgets things. The old "Curator" that
-destructively summarized aging memory has been removed; items live verbatim
-until you explicitly ask the assistant to forget a specific one ("forget
-that"), at which point the item is tombstoned (body zeroed, vector removed,
-audit metadata kept).
-
----
-
-## Config
-
-`config.toml` (optional — built-in defaults match the example):
-
-```toml
-[server]
-addr = "127.0.0.1:8765"
-
-[memory]
-dir = "./memory"
-
-[claude]
-binary = "claude"
-# Default for any role that doesn't override below.
-model = "claude-opus-4-7"
-# Per-role models — chosen to match each component's job:
-#   Preprocessor: Haiku  — pattern recognition + importance scoring on every
-#                          message; latency matters. (legacy alias:
-#                          `sanitizer_model`)
-#   Assistant:    Sonnet — chat; self-escalates to the escalation model.
-#   Escalation:   Opus   — used on self- or user-forced escalation.
-#   Scout:        Sonnet — web triage.
-preprocessor_model         = "claude-haiku-4-5"
-assistant_model            = "claude-sonnet-4-6"
-assistant_escalation_model = "claude-opus-4-7"
-scout_model                = "claude-sonnet-4-6"
-timeout_secs = 180
-scout_allowed_tools = ["WebSearch", "WebFetch"]
-
-[scout]
-enabled = false           # opt-in; enable once memory is substantial
-interval_minutes = 10
-pinned_topics = []        # empty → Scout infers topics from your memory
-
-[indexer]
-# Mechanical maintenance worker (no LLM). Backfills missing `.vec` sidecars,
-# detects embedder-model changes and re-embeds, checkpoints the HNSW
-# manifest. Replaces the old Curator.
-enabled = true
-interval_minutes = 5
-batch_size = 50
-
-[retrieval]
-alpha          = 0.6
-beta           = 0.25
-gamma          = 0.15
-half_life_days = 30.0
-vector_candidates  = 50
-keyword_candidates = 20
-recent_candidates  = 20
-```
-
-CLI overrides win over the file; the file wins over built-in defaults.
-Legacy keys (`sanitizer_model`, `[curator]`) still load via serde aliases —
-old `config.toml` files keep working (forward-compatible reads invariant).
-
----
-
-## What does what
-
-| Component    | Crate     | Role                                                |
-|-------------:|-----------|-----------------------------------------------------|
-| Preprocessor | backend   | Security Preprocessor. Three-tier classification + importance scoring. Ephemeral. |
-| The Core     | backend   | Assistant. Hybrid retrieval, replies, persists turns. |
-| Memory       | backend   | File-based store. Atomic writes. `.vec` sidecars. Explicit forget. |
-| Embedder     | backend   | Local fastembed-rs model — text → vector. No network. |
-| VectorIndex  | backend   | HNSW search structure. Derived cache, rebuildable. |
-| Indexer      | backend   | Periodic mechanical worker. Backfill + re-embed + stats. NO LLM. |
-| Connectors   | backend   | Search-only adapters to external sources (Gmail). OAuth, scope-bound. |
-| The Scout    | backend   | Periodic web/news worker (opt-in).                  |
-| Client       | client    | egui chat surface, IP-based geolocation, metadata.  |
-| Protocol     | shared    | Wire types — re-used by both crates.                |
+License: MIT.
