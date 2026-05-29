@@ -83,7 +83,7 @@ This project takes a different stance:
   memory + learned preferences.
 - **Cross-domain recall**: *"When did I last hear from my accountant?"*,
   *"What did the inspector say about the roof?"*, *"Did I ever follow up on
-  that interview?"* — across email, notes, and documents you've handed it.
+  that interview?"* — across email, your Google Drive, notes, and documents.
 - **A second brain for personal projects**: drop in research, paste
   conversations, attach PDFs, ask questions later in plain English.
 - **A proactive watch** (opt-in): a background web worker that infers what you
@@ -166,7 +166,7 @@ For a UI smoke test against canned responses, run the backend with
 | Embedder | backend | Local English embedding model (bge-base-en-v1.5). Text → vector, on-device. Weights download once. |
 | VectorIndex | backend | In-memory cosine index over the `.vec` sidecars (brute-force; fine at personal scale). Derived cache, rebuildable. |
 | Indexer | backend | Periodic mechanical worker (no LLM): backfill, re-embed, stats. |
-| Workers | backend | External-data subsystems (Gmail, WWW). On-demand search and/or autonomous tick. |
+| Workers | backend | External-data subsystems (Gmail, Google Drive, WWW). On-demand search and/or autonomous tick. |
 | Client | client | egui chat surface, attachments, geolocation, metadata. |
 | Protocol | shared | Wire types shared by both crates. |
 

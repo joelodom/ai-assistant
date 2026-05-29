@@ -86,7 +86,7 @@ too route everything through the Preprocessor before it reaches Memory. The
 | **Embedder** | `backend/src/embedder.rs` | `Embedder` trait + `FastembedEmbedder` (bge-base-en-v1.5, an English model; the default, behind the on-by-default `fastembed-real` feature) + a deterministic `MockEmbedder` (tests and `--no-default-features`). Inference is local; weights download once. |
 | **VectorIndex** | `backend/src/vector_index.rs` | In-memory cosine index over all vectors (brute-force scan; fine at personal scale, despite the legacy `hnsw/` directory name). A *derived cache* — rebuildable from `.vec` sidecars. |
 | **Indexer** | `backend/src/indexer.rs` | Mechanical maintenance worker, **no LLM**. Backfills missing embeddings, detects embedder-model changes and re-embeds, checkpoints the index manifest. (Replaced the old destructive "Curator.") |
-| **Workers** | `backend/src/workers/` | Subsystems that fetch external data: `gmail.rs`, `www.rs`, plus the `Worker` trait, `WorkerRegistry`, `WorkerContext`, `SearchEvent`, and `oauth.rs`. See [Workers](#workers). |
+| **Workers** | `backend/src/workers/` | Subsystems that fetch external data: `gmail.rs`, `gdrive.rs`, `www.rs`, plus the `Worker` trait, `WorkerRegistry`, `WorkerContext`, `SearchEvent`, and `oauth.rs`. See [Workers](#workers). |
 | **LLM client** | `backend/src/claude.rs` | `LlmClient` trait + `ClaudeCliClient` (production) + `MockLlmClient` + `FailingLlmClient` (tests). |
 | **WebSocket handler** | `backend/src/ws.rs` | axum WS endpoint; wires the turn pipeline, status frames, and error→memory→client handling. |
 | **Config protocol** | `backend/src/config_protocol.rs` | Handles sensitive `ConfigPayload` traffic (OAuth secrets/codes). The one path that bypasses both the Preprocessor and long-term memory (Invariant #8). |
@@ -197,6 +197,15 @@ a `Finished` is treated as done.
     decides keep/redact/drop.
   - Scope is hardcoded to `gmail.readonly`. The trait exposes no write verbs,
     and Google enforces the scope server-side.
+- **`gdrive` (`workers/gdrive.rs`)** — read-only Google Drive. **Search-only**
+  (no autonomous tick — we don't silently ingest an entire Drive).
+  - *search*: a `files.list` full-text query, then for each hit it pulls the
+    file's text — Google Docs/Sheets/Slides exported to text, PDFs and text
+    files downloaded + extracted (`pdf-extract`), images/video/binaries skipped
+    — fanning out through the Preprocessor (`Personal` provenance). Bounded by a
+    25-file cap and a 5 MB per-file size guard; extracted text clipped at 50k chars.
+  - Scope is hardcoded to `drive.readonly`. The trait exposes no write verbs and
+    Google enforces the scope server-side, so it cannot modify Drive.
 - **`www` (`workers/www.rs`)** — the open web via the LLM's `WebSearch` /
   `WebFetch` tools.
   - *search*: dispatched by `SEARCH: www <query>` for fresh-news questions
@@ -434,6 +443,7 @@ backend/src/
   workers/
     mod.rs                   Worker trait, WorkerRegistry, WorkerContext, SearchEvent, tick driver
     gmail.rs                 read-only Gmail: search + tick
+    gdrive.rs                read-only Google Drive: search (download + extract)
     www.rs                   open web: search + autonomous interest scan
     oauth.rs                 Google OAuth runtime
   claude.rs                  LlmClient trait + real/mock/failing clients

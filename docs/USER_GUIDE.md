@@ -17,6 +17,7 @@ the [Security Model](SECURITY.md).
 - [HAZMAT: bypassing the security gate](#hazmat-bypassing-the-security-gate)
 - [Forcing the heavier model](#forcing-the-heavier-model)
 - [Connecting Gmail](#connecting-gmail)
+- [Connecting Google Drive](#connecting-google-drive)
 - [Curated news (the web worker)](#curated-news-the-web-worker)
 - [The status bar](#the-status-bar)
 - [Multiple datasets & backup](#multiple-datasets--backup)
@@ -185,6 +186,41 @@ What's worth knowing up front:
 
 Once connected, just ask naturally — *"what did Dana say about the cabinets?"*
 — and the assistant will search Gmail if the answer isn't already in memory.
+
+## Connecting Google Drive
+
+The assistant can also search your **Google Drive, read-only** — and pull the
+*contents* of matching files into memory, not just their names. It cannot
+create, edit, move, or delete anything in your Drive.
+
+Setup is the same conversation as Gmail. Type:
+
+> set up Google Drive
+
+The assistant walks you through it: enabling the **Google Drive API** in the
+Google Cloud Console (you can reuse the same project and OAuth client you made
+for Gmail — just enable the extra API), uploading `client_secret.json`, and the
+browser authorization. On the consent screen you'll see *"See and download all
+your Google Drive files"* — that is the read-only Drive permission.
+
+What's worth knowing up front:
+
+- The scope is hardcoded to **`drive.readonly`**. Google enforces it
+  server-side, so the assistant can read and download your files but has no
+  ability to change them. It is read-*everything*, write-*nothing* — the
+  permission covers all your Drive files, not a subset.
+- When you search, each matching file's **text is downloaded and remembered**:
+  Google Docs/Sheets/Slides are exported to text, PDFs and text files are
+  extracted. Images, video, and other binaries are skipped. Everything passes
+  through the Security Preprocessor before it reaches memory.
+- It is **search-only** — unlike Gmail it does *not* run in the background, so
+  it won't pull your whole Drive into memory on its own. You ask, it fetches.
+- The token refreshes silently. Revoke anytime at
+  <https://myaccount.google.com/permissions>.
+
+Then just ask — *"find my notes about the kitchen remodel"* or *"what's in my
+budget spreadsheet?"* — and the assistant searches Drive and folds in what it
+finds.
 
 ## Curated news (the web worker)
 

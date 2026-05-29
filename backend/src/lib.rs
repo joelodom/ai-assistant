@@ -109,6 +109,18 @@ pub async fn build_app(cfg: config::Config) -> anyhow::Result<Built> {
             tracing::warn!(error = %e, "failed to open gmail worker");
         }
     }
+    match workers::gdrive::GoogleDriveWorker::open(memory.root()) {
+        Ok(Some(gdrive)) => {
+            tracing::info!("gdrive worker loaded");
+            worker_list.push(Arc::new(gdrive));
+        }
+        Ok(None) => {
+            tracing::info!("gdrive worker not configured (no client_secret.json or token.json)");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to open gdrive worker");
+        }
+    }
     // WWW worker is always present — WebSearch/WebFetch need no setup.
     // Autonomous tick is still gated on cfg.scout.enabled (kept under
     // the legacy `scout` section name for back-compat; renamed in a

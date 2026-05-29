@@ -24,7 +24,7 @@ use crate::memory::atomic_write_sync;
 use crate::workers::oauth::{
     client_secret_path, load_client_secret, token_path, ClientSecretData, StoredToken,
 };
-use crate::workers::{gmail::GmailWorker, Worker, WorkerRegistry};
+use crate::workers::{gdrive::GoogleDriveWorker, gmail::GmailWorker, Worker, WorkerRegistry};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use oauth2::basic::BasicClient;
@@ -326,6 +326,13 @@ impl ConfigProtocol {
                 }
                 None => "Token saved, but worker failed to open. Check logs.",
             },
+            "gdrive" => match GoogleDriveWorker::open(&self.memory_root)? {
+                Some(w) => {
+                    self.registry.register(Arc::new(w) as Arc<dyn Worker>);
+                    "Google Drive is now active and searchable."
+                }
+                None => "Token saved, but worker failed to open. Check logs.",
+            },
             other => {
                 tracing::warn!("config: no live-register handler for worker kind: {other}");
                 "Token saved; restart the backend to activate."
@@ -357,6 +364,7 @@ impl ConfigProtocol {
 fn scope_for(worker: &str) -> Result<&'static str> {
     match worker {
         "gmail" => Ok(crate::workers::gmail::GMAIL_SCOPE),
+        "gdrive" => Ok(crate::workers::gdrive::DRIVE_SCOPE),
         other => bail!("config: unknown worker kind: {other}"),
     }
 }

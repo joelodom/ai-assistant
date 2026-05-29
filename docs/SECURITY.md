@@ -173,7 +173,7 @@ It is safe *as a feature* because it is hedged on every side:
 
 ## Workers and defense in depth
 
-Workers (Gmail, the web) pull external data, and that data is "outside world"
+Workers (Gmail, Google Drive, the web) pull external data, and that data is "outside world"
 data — so it gets the same treatment as anything else: **every worker result
 passes through the Preprocessor before reaching memory** (enforced structurally
 because workers ingest via `WorkerContext::ingest_one`, never directly).
@@ -188,6 +188,11 @@ abuse — illustrated by Gmail:
    There is no `.send()` or `.delete()` for a bug to call into existence.
 3. **Every result is screened.** OTPs, reset links, and injected content are
    dropped or redacted before they reach the assistant or storage.
+
+The Google Drive worker follows the same model: scope `drive.readonly` (it can
+read and download all your files, but Google rejects any create/edit/delete
+server-side), no write verbs on the trait, and every downloaded file screened
+by the Preprocessor. It is read-everything / write-nothing.
 
 OAuth credentials and tokens live under `<memory-dir>/connectors/<name>/`,
 written atomically. Tokens are scope-bound at issuance and refreshed silently;

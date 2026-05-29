@@ -46,6 +46,7 @@
 //! "delete" verbs — and at the API level, scopes are pinned at OAuth
 //! time (Gmail uses `gmail.readonly`).
 
+pub mod gdrive;
 pub mod gmail;
 pub mod oauth;
 pub mod www;
@@ -70,6 +71,7 @@ use tokio::sync::mpsc::UnboundedSender;
 pub fn scope_for(name: &str) -> Option<&'static str> {
     match name {
         "gmail" => Some(crate::workers::gmail::GMAIL_SCOPE),
+        "gdrive" => Some(crate::workers::gdrive::DRIVE_SCOPE),
         _ => None,
     }
 }
@@ -86,6 +88,14 @@ pub fn known_worker_kinds() -> Vec<KnownWorker> {
                           Supports `from:`, `subject:`, `before:`/`after:`, \
                           `has:attachment`, free text. For setup, read manual section: \
                           worker-setup-gmail.",
+        },
+        KnownWorker {
+            name: "gdrive",
+            description: "Read-only Google Drive full-text search. Downloads each \
+                          matching file's text (Docs/Sheets/Slides exported, PDFs and \
+                          text files extracted) through the Preprocessor into memory. \
+                          Cannot modify Drive. For setup, read manual section: \
+                          worker-setup-gdrive.",
         },
         KnownWorker {
             name: "www",

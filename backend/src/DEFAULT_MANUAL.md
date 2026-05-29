@@ -24,6 +24,7 @@ Sections (request via `READ_MANUAL: <section-name>`):
 - **hazmat-bypass** — what HAZMAT mode does and how to talk about it.
 - **forget-action** — explicit forget, when to use it, what happens.
 - **worker-setup-gmail** — full walkthrough including Cloud Console.
+- **worker-setup-gdrive** — read-only Google Drive search; Cloud Console.
 - **worker-setup-general** — pattern for any future worker.
 - **workers** — what workers are, how they differ from the old
   "connector"/"scout" split, and how the assistant talks to them.
@@ -334,6 +335,55 @@ Once they have the JSON file:
 - Token gets refreshed automatically. Revoke any time at
   https://myaccount.google.com/permissions.
 
+## worker-setup-gdrive
+
+Read-only Google Drive search. Same client-driven OAuth flow as Gmail; the
+only differences are which API to enable and the scope shown at consent.
+
+### Cloud Console (the user does this)
+
+1. Go to **https://console.cloud.google.com/apis/credentials** (they can
+   reuse the same project as Gmail, or make a new one).
+2. Enable the **Google Drive API**: APIs & Services → Library → "Google
+   Drive API" → Enable.
+3. OAuth consent screen → **External** → publishing status **Testing**;
+   add their own Google address as a Test user. (Already done if they set
+   up Gmail in the same project.)
+4. Credentials → **+ CREATE CREDENTIALS → OAuth client ID** → type
+   **Desktop application** (an existing Desktop client can be reused).
+5. **Download the JSON.**
+
+Same "Google hasn't verified this app" warning as Gmail — expected in
+Testing mode (Advanced → Go to ... (unverified) → Allow). On the consent
+screen they'll see **"See and download all your Google Drive files"** —
+that is the read-only scope (`drive.readonly`).
+
+### Upload + OAuth (on our side, runs through markers)
+
+1. Emit `CONFIG_REQUEST_FILE: gdrive client_secret.json` and tell them to
+   pick the downloaded JSON. It reaches the backend over the existing
+   trusted WebSocket — never via any other channel.
+2. After it uploads, you'll get a continuation turn confirming storage.
+   Emit `CONFIG_BEGIN_OAUTH: gdrive` and tell them their browser is opening.
+3. After authorization the worker is live. Suggest a query or two ("find my
+   notes about the kitchen remodel", "what's in my budget spreadsheet").
+
+### Security framing to include
+
+- Scope is hardcoded to `drive.readonly`. Google enforces it server-side —
+  any create/edit/delete attempt 403s regardless of our code — and the
+  worker trait exposes only `search` (no write verbs exist to bug-call). It
+  can read and download files but CANNOT change them.
+- Be honest that `drive.readonly` grants broad READ (all the user's files),
+  not write — it's read-everything, zero-write.
+- Each matching file's text is downloaded (Docs/Sheets/Slides exported,
+  PDFs and text files extracted) and run through the Preprocessor before
+  anything is stored; images/video/binaries are skipped.
+- It is **search-only** — no autonomous background ingestion, so it won't
+  pull the whole Drive into memory on its own.
+- Token refreshes automatically. Revoke any time at
+  https://myaccount.google.com/permissions.
+
 ## worker-setup-general
 
 Workers are subsystems that fetch external data. They can be passive
@@ -369,6 +419,10 @@ Currently shipping:
   ingestion of new mail. Each new email goes through the Preprocessor,
   which decides what to do (full body, summarized, redacted, or
   dropped) before anything lands in memory.
+- **gdrive** — Read-only Google Drive. On-demand full-text search only:
+  downloads each matching file's text (Docs/Sheets/Slides exported, PDFs
+  and text files extracted) through the Preprocessor into memory. Cannot
+  modify Drive (Google enforces the `drive.readonly` scope). No autonomous tick.
 - **www** — Open web (WebSearch + WebFetch). Both an interest-inferred
   autonomous scan (when enabled) and on-demand `SEARCH: www <query>`
   for fresh-news questions whose answer isn't in memory.
