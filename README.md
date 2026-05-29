@@ -169,5 +169,3 @@ For a UI smoke test against canned responses, run the backend with
 | Workers | backend | External-data subsystems (Gmail, Google Drive, WWW). On-demand search and/or autonomous tick. |
 | Client | client | egui chat surface, attachments, geolocation, metadata. |
 | Protocol | shared | Wire types shared by both crates. |
-
-License: MIT.
