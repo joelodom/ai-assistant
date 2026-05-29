@@ -12,7 +12,9 @@
 
 mod app;
 mod geo;
+mod markdown;
 mod net;
+mod theme;
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt::init();

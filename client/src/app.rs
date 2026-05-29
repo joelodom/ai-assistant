@@ -6,6 +6,7 @@
 
 use crate::geo;
 use crate::net::{NetToUi, UiToNet};
+use crate::theme;
 use chrono::Local;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -145,8 +146,8 @@ impl AssistantApp {
         ui_tx: Sender<UiToNet>,
         ui_rx: Receiver<NetToUi>,
     ) -> Self {
-        // Light theme by default; user can toggle in egui's built-in menu.
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        // Install real font faces, the dark palette, and global spacing.
+        crate::theme::install(&cc.egui_ctx);
 
         let mut prefs = load_prefs();
         prefs.ui_scale = prefs.ui_scale.clamp(UI_SCALE_MIN, UI_SCALE_MAX);
@@ -830,8 +831,26 @@ impl eframe::App for AssistantApp {
                     ui.add_space(2.0);
                 }
 
-                // Compute height reserve for the bottom row (buttons).
-                let reserved = 36.0 + if self.pending_attachments.is_empty() { 0.0 } else { 4.0 };
+                // Reserve height for the bottom button row so it stays fully
+                // visible. Derived from the live style (button height + the two
+                // item-spacing gaps below the text box + the trailing
+                // add_space) rather than a fixed constant, so it tracks padding
+                // and spacing instead of silently clipping when they change.
+                let button_h = egui::TextStyle::Button.resolve(ui.style()).size;
+                let row_h = ui
+                    .spacing()
+                    .interact_size
+                    .y
+                    .max(button_h + 2.0 * ui.spacing().button_padding.y);
+                let gap = ui.spacing().item_spacing.y;
+                let reserved = row_h
+                    + gap * 2.0
+                    + 10.0
+                    + if self.pending_attachments.is_empty() {
+                        0.0
+                    } else {
+                        4.0
+                    };
                 ui.add_sized(
                     [ui.available_width(), (ui.available_height() - reserved).max(40.0)],
                     egui::TextEdit::multiline(&mut self.input_buf)
@@ -942,39 +961,76 @@ impl eframe::App for AssistantApp {
 }
 
 fn render_turn(ui: &mut egui::Ui, turn: &Turn) {
-    let (who, header_color, body, ts) = match turn {
-        Turn::User { text, ts } => ("you", egui::Color32::from_rgb(140, 200, 255), text, ts),
-        Turn::Assistant { text, ts } => (
-            "assistant",
-            egui::Color32::from_rgb(180, 230, 180),
+    // Each role gets a sender label, an accent, a faint card fill, and a body
+    // text color. The card makes turns read as distinct surfaces; the markdown
+    // renderer turns the assistant's `**bold**` / bullets / code into real
+    // formatting instead of literal characters.
+    let (who, accent, fill, body_color, body) = match turn {
+        Turn::User { text, ts: _ } => (
+            "YOU",
+            theme::ACCENT_USER,
+            theme::CARD_USER,
+            theme::TEXT_BODY,
             text,
-            ts,
         ),
-        Turn::Stub { text, ts } => ("gate", egui::Color32::from_rgb(240, 200, 120), text, ts),
-        Turn::Error { text, ts } => ("error", egui::Color32::from_rgb(240, 120, 120), text, ts),
-        Turn::System { text, ts } => ("system", egui::Color32::from_rgb(200, 200, 200), text, ts),
+        Turn::Assistant { text, ts: _ } => (
+            "ASSISTANT",
+            theme::ACCENT_ASSISTANT,
+            theme::CARD_ASSISTANT,
+            theme::TEXT_BODY,
+            text,
+        ),
+        Turn::Stub { text, ts: _ } => (
+            "GATE",
+            theme::ACCENT_GATE,
+            theme::CARD_GATE,
+            theme::TEXT_BODY,
+            text,
+        ),
+        Turn::Error { text, ts: _ } => (
+            "ERROR",
+            theme::ACCENT_ERROR,
+            theme::CARD_ERROR,
+            theme::ACCENT_ERROR,
+            text,
+        ),
+        Turn::System { text, ts: _ } => (
+            "SYSTEM",
+            theme::ACCENT_SYSTEM,
+            theme::CARD_SYSTEM,
+            theme::TEXT_BODY,
+            text,
+        ),
     };
-    ui.horizontal(|ui| {
-        ui.colored_label(header_color, format!("{who} ·"));
-        ui.weak(ts);
-    });
-    // Body color: keep the user's own typing at the theme default
-    // (already legible because it's what they typed), but brighten the
-    // backend's voice — assistant, gate notices, errors, system notes —
-    // so the assistant's longer replies are easier to read against the
-    // dark background. Stops short of pure white to avoid harshness.
-    match turn {
-        Turn::User { .. } => {
-            ui.label(body);
-        }
-        Turn::Assistant { .. } => {
-            ui.colored_label(egui::Color32::from_rgb(232, 232, 232), body);
-        }
-        Turn::Stub { .. } | Turn::System { .. } => {
-            ui.colored_label(egui::Color32::from_rgb(210, 210, 210), body);
-        }
-        Turn::Error { .. } => {
-            ui.colored_label(egui::Color32::from_rgb(240, 180, 180), body);
-        }
-    }
+    let ts = match turn {
+        Turn::User { ts, .. }
+        | Turn::Assistant { ts, .. }
+        | Turn::Stub { ts, .. }
+        | Turn::Error { ts, .. }
+        | Turn::System { ts, .. } => ts,
+    };
+
+    egui::Frame::none()
+        .fill(fill)
+        .rounding(egui::Rounding::same(8.0))
+        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            // Header: accent-colored sender chip + muted monospace timestamp.
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(who)
+                        .font(egui::FontId::new(11.5, theme::bold_family()))
+                        .color(accent),
+                );
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(ts)
+                        .font(egui::FontId::new(10.5, egui::FontFamily::Monospace))
+                        .color(theme::TEXT_MUTED),
+                );
+            });
+            ui.add_space(5.0);
+            crate::markdown::render_markdown(ui, body, body_color);
+        });
 }
