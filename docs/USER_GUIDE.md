@@ -30,16 +30,18 @@ the [Security Model](SECURITY.md).
 You need **Rust** (1.75+) and the authenticated **`claude` CLI**.
 
 ```bash
-# For real use — enables the local semantic embedding model.
-cargo build --release --features fastembed-real
+cargo build --release
 ```
 
 This builds `ai-assistant-backend` and `ai-assistant-client` into
-`target/release/`.
+`target/release/`. Real local semantic embeddings (**bge-base-en-v1.5**, an
+English model) are on by default; the model (~400 MB) downloads once on first
+use and then runs entirely on your machine.
 
-> Building without `--features fastembed-real` substitutes a deterministic
-> *mock* embedder. It runs and is great for kicking the tires, but recall is
-> not semantically meaningful. Use the feature flag for daily use.
+> For a fast, dependency-light build that skips ONNX Runtime, add
+> `--no-default-features`. It substitutes a deterministic *mock* embedder —
+> fine for kicking the tires or CI, but recall is **not** semantically
+> meaningful. Daily use should be the plain default build.
 
 ## Running the backend
 

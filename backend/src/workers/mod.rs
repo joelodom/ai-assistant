@@ -173,7 +173,7 @@ impl SearchEvent {
 }
 
 /// Shared infrastructure handed to every worker. Bundles the
-/// Preprocessor, memory store, embedder, and HNSW index so workers can
+/// Preprocessor, memory store, embedder, and vector index so workers can
 /// drive results into memory themselves.
 pub struct WorkerContext {
     pub preprocessor: Arc<Preprocessor>,
@@ -190,7 +190,7 @@ pub struct WorkerContext {
 impl WorkerContext {
     /// Run one raw result through the standard ingestion pipeline:
     /// Preprocessor → memory store (or stub if dropped) → embed →
-    /// HNSW upsert. Emits an `Ingested`, `Dropped`, or `Failed`
+    /// vector-index upsert. Emits an `Ingested`, `Dropped`, or `Failed`
     /// SearchEvent on the channel.
     ///
     /// Returns the new item id if it was kept, None otherwise.

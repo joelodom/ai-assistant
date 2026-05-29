@@ -10,9 +10,17 @@ It is built around one **non-negotiable property**: a strict one-way data
 flow we call **the diode**.
 
 ```
-   you ──data──▶ assistant ──answers──▶ you
-                     │
-                     └── cannot reach the outside world
+  INPUTS                      THE GATE                 THE CORE           OUT
+  ──────                      ────────                 ────────          ─────
+  you · emails ·        ┌──────────────────┐      ┌────────────────┐
+  notes · docs ·  ──▶   │     Security      │ ──▶  │   Assistant    │ ──▶ answers,
+  photos · web          │   Preprocessor    │      │       ↕        │     reminders,
+                        │  redact · score   │      │     Memory     │     summaries
+  workers (Gmail, ──▶   └──────────────────┘ only  │  (your files)  │     to you
+  the web) fetch in        sanitized text          └────────────────┘
+
+  ◀──── the diode ────▶  data flows IN and answers flow OUT. The assistant
+  cannot send, book, pay, or call any write-capable API. The architecture forbids it.
 ```
 
 Data flows **in**: emails, notes, calendar entries, scanned documents,
@@ -36,19 +44,7 @@ your behalf in the world.
 | **[User's Guide](docs/USER_GUIDE.md)** | Install, run, and *use* the assistant day to day — the chat UI, attachments, HAZMAT, connecting Gmail, telling it to forget things. |
 | **[Architecture & Development](docs/ARCHITECTURE.md)** | Understand the implementation, the design principles, and how to contribute. Written for humans and AI agents alike. |
 | **[Security Model](docs/SECURITY.md)** | Understand the threat model, what's defended, what's deliberately *not*, and the eight invariants that make the guarantee real. |
-
-Two further references that live with the code:
-
-- **`config.toml`** — the annotated configuration template (every knob the
-  backend has).
-- **`backend/src/DEFAULT_MANUAL.md`** — the assistant's own operating manual,
-  embedded in the binary and seeded to `<memory-dir>/SYSTEM_MANUAL.md` on
-  first run. It is the canonical source of *procedural* truth and is
-  user-editable.
-
-*(Contributors and AI agents: `CLAUDE.md` at the repo root holds the working
-agreement for editing this codebase. It is intentionally not part of the
-documentation set above.)*
+| **[Roadmap](ROADMAP.md)** | See what's planned and what's known-imperfect — prioritized improvements across security, scalability, and UX, with file/line evidence. |
 
 ---
 
@@ -63,15 +59,20 @@ prompt-injection away from being a liability.
 This project takes a different stance:
 
 - **Your substrate is yours.** Memory is plain text + JSON files in a folder
-  you choose. No database, no cloud, no account. You can `cat`, `grep`, and
-  `tar` your assistant's brain, and read it with `less` ten years from now.
+  you choose.
 - **Safe to feed.** Because the backend has no outbound-action machinery, the
   worst a malicious email can do is corrupt an *answer* — never trigger an
   action. That makes it safe to hand the system your real, messy, sensitive
   data.
-- **It actually remembers.** A local embedding model plus hybrid retrieval
-  (semantic + keyword + recency + importance) means a strong match from a
-  year ago still surfaces, and important things float up on their own.
+- **Screened before it's stored.** Every input — what you type, every email,
+  every web page a worker pulls in — first passes through a **Security
+  Preprocessor** that strips live secrets (2FA codes, password-reset links,
+  account and card numbers) and scores what's worth remembering. Raw input is
+  ephemeral; only sanitized text is ever persisted. That's what makes it safe
+  to hand the system your real, messy inbox.
+- **It actually remembers.** A local English embedding model plus hybrid
+  retrieval (semantic + keyword + recency + importance) means a strong match
+  from a year ago still surfaces, and important things float up on their own.
 
 ## What it's good for
 
@@ -85,8 +86,11 @@ This project takes a different stance:
   that interview?"* — across email, notes, and documents you've handed it.
 - **A second brain for personal projects**: drop in research, paste
   conversations, attach PDFs, ask questions later in plain English.
-- **Curated news** (opt-in): a background web worker that infers what you care
-  about from your memory and surfaces relevant items without you asking.
+- **A proactive watch** (opt-in): a background web worker that infers what you
+  care about from your memory and surfaces things without you asking — not just
+  news, but a house that just listed in a town you're eyeing, an obituary for
+  someone you know, a price drop on something you've been tracking, or a
+  development in a topic you follow.
 
 ## Who it's *not* for
 
@@ -109,11 +113,7 @@ This project takes a different stance:
 ### Build
 
 ```bash
-# Default build (uses a deterministic mock embedder — fine for trying it out).
 cargo build --release
-
-# Production build (real local semantic embeddings via fastembed-rs).
-cargo build --release --features fastembed-real
 ```
 
 This produces two binaries:
@@ -121,10 +121,12 @@ This produces two binaries:
 - `target/release/ai-assistant-backend` — the WebSocket server.
 - `target/release/ai-assistant-client` — the native chat UI.
 
-> **Embeddings note:** without the `fastembed-real` feature the backend uses a
-> deterministic hash-based `MockEmbedder` — great for tests and a quick look,
-> but **not semantically meaningful**. Build with `--features fastembed-real`
-> for real recall quality. See the
+> **Embeddings:** real local semantic embeddings (**bge-base-en-v1.5**, an
+> English retrieval model) are **on by default**. The model (~400 MB) downloads
+> once on first use, then runs entirely on your machine — no embedding API, no
+> tokens, nothing leaves the box. For a fast, dependency-light build that skips
+> ONNX Runtime and substitutes a deterministic mock embedder (no semantic
+> recall — handy for a quick look or CI), add `--no-default-features`. See the
 > [Architecture doc](docs/ARCHITECTURE.md#embedding--the-vector-index).
 
 ### Run
@@ -161,8 +163,8 @@ For a UI smoke test against canned responses, run the backend with
 | Preprocessor | backend | Security gate. Ephemeral per-call subprocess. Three-tier classify + redact + importance score. |
 | Assistant ("the Core") | backend | The only thing you talk to. Hybrid retrieval, replies, persists turns. |
 | Memory | backend | File-based store. Atomic writes, `.vec` sidecars, explicit forget. |
-| Embedder | backend | Local fastembed-rs model — text → vector. No network. |
-| VectorIndex | backend | HNSW search structure. Derived cache, rebuildable. |
+| Embedder | backend | Local English embedding model (bge-base-en-v1.5). Text → vector, on-device. Weights download once. |
+| VectorIndex | backend | In-memory cosine index over the `.vec` sidecars (brute-force; fine at personal scale). Derived cache, rebuildable. |
 | Indexer | backend | Periodic mechanical worker (no LLM): backfill, re-embed, stats. |
 | Workers | backend | External-data subsystems (Gmail, WWW). On-demand search and/or autonomous tick. |
 | Client | client | egui chat surface, attachments, geolocation, metadata. |

@@ -1,32 +1,26 @@
-//! HNSW vector index. The fast nearest-neighbor search structure for
-//! retrieval. Always rebuildable from `.vec` sidecars — the `hnsw/` directory
-//! is **cache, not source of truth.**
+//! Vector index for retrieval: an in-memory map of item-id → embedding,
+//! searched by **brute-force cosine similarity** (a linear scan over every
+//! vector). Despite the `hnsw/` directory name — kept for on-disk back-compat
+//! — this is NOT an HNSW/ANN graph. The linear scan is simple and plenty fast
+//! at personal scale (thousands to tens of thousands of items); swapping in a
+//! real ANN index is tracked in ROADMAP.md.
 //!
-//! Persistence layout:
-//!   <memory-dir>/hnsw/graph.bin       — serialized HNSW graph
+//! Always rebuildable from `.vec` sidecars — the `hnsw/` directory is
+//! **cache, not source of truth.**
+//!
+//! Persistence:
 //!   <memory-dir>/hnsw/manifest.json   — { model, dim, item_ids[], built_at }
+//! No graph file is written; the vectors themselves live in the per-item
+//! `.vec` sidecars. On startup `build_app` loads those sidecars into the
+//! in-memory map; `save_manifest` records a checkpoint of what's indexed. If
+//! vectors are missing or the embedder model changed, the Indexer
+//! rebuilds / re-embeds in the background.
 //!
-//! On `open()`:
-//!   - If manifest exists AND model+dim match AND every item in the
-//!     manifest still has a `.vec` sidecar with matching sha → load.
-//!   - Otherwise → leave empty; the Indexer will rebuild in the background.
+//! All writes are atomic (temp file + rename), so an interrupted rebuild just
+//! leaves the manifest unwritten; the next start re-detects and retries.
 //!
-//! All writes are atomic (temp file + rename) so a crash mid-build can never
-//! leave a half-written graph that fails to load. If rebuild crashes, the
-//! manifest simply doesn't get written; next start re-detects empty/stale
-//! and tries again.
-//!
-//! Concurrency: we hold the index behind a `parking_lot::RwLock` so search
-//! is concurrent and inserts serialize. For this prototype's scale that's
-//! plenty.
-//!
-//! HNSW parameter notes:
-//!   - `max_nb_connection = 16`  : connectivity in layer 0
-//!   - `nb_layer = 16`           : depth
-//!   - `ef_construction = 200`   : build-time accuracy knob
-//!   - `ef_search = 64`          : query-time accuracy knob (recall vs latency)
-//! These are sensible defaults for ~100k-1M items at 384 dim. Tune if the
-//! corpus grows past 10M.
+//! Concurrency: the map lives behind a std `RwLock` — searches run
+//! concurrently, inserts serialize. Fine at this scale.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

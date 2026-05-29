@@ -53,7 +53,7 @@ pinned_topics = []
 [indexer]
 # Mechanical maintenance worker. No LLM calls. Backfills missing `.vec`
 # sidecars, detects embedder-model changes and re-embeds, checkpoints the
-# HNSW manifest. Cheap; leave enabled.
+# vector-index manifest. Cheap; leave enabled.
 enabled = true
 interval_minutes = 5
 # Per-tick embedding batch size — keeps a bulk import from hammering

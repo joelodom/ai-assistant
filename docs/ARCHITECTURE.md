@@ -61,7 +61,7 @@ client (egui, native) ──WS──> backend ──> Preprocessor ──> Assis
                                        (ephemeral)         retrieve()    Embedder
                                                                │           │
                                                                ▼           ▼
-                                                        HNSW vector index  .vec sidecars
+                                                        vector index       .vec sidecars
                                                                ▲           ▲
                                                                └─ Indexer ─┘
                                                                 (rebuilds /
@@ -83,9 +83,9 @@ too route everything through the Preprocessor before it reaches Memory. The
 | **Security Preprocessor** | `backend/src/preprocessor.rs` | The gate. A fresh, isolated `claude` subprocess per call that classifies input into a `Tier` (Drop / Redact / Pass), redacts dangerous identifiers, and assigns an importance score. Stateless across calls. |
 | **Assistant ("the Core")** | `backend/src/assistant.rs` | The only component the user talks to. Builds each prompt from persona + metadata + retrieved memory + preferences + worker descriptions, calls the LLM, interprets markers, persists the turn. |
 | **Memory store** | `backend/src/memory.rs` | File-based, atomic-write store. Bodies (`.txt`), metadata (`.json`), vectors (`.vec`), stubs, preferences. Explicit-forget tombstones. SHA-256 integrity field. |
-| **Embedder** | `backend/src/embedder.rs` | `Embedder` trait + a local fastembed-rs implementation (`fastembed-real` feature) + a deterministic `MockEmbedder`. No network. |
-| **VectorIndex** | `backend/src/vector_index.rs` | HNSW graph persisted as `hnsw/graph.bin` + `manifest.json`. A *derived cache* — rebuildable from `.vec` sidecars. |
-| **Indexer** | `backend/src/indexer.rs` | Mechanical maintenance worker, **no LLM**. Backfills missing embeddings, detects embedder-model changes and re-embeds, checkpoints the HNSW manifest. (Replaced the old destructive "Curator.") |
+| **Embedder** | `backend/src/embedder.rs` | `Embedder` trait + `FastembedEmbedder` (bge-base-en-v1.5, an English model; the default, behind the on-by-default `fastembed-real` feature) + a deterministic `MockEmbedder` (tests and `--no-default-features`). Inference is local; weights download once. |
+| **VectorIndex** | `backend/src/vector_index.rs` | In-memory cosine index over all vectors (brute-force scan; fine at personal scale, despite the legacy `hnsw/` directory name). A *derived cache* — rebuildable from `.vec` sidecars. |
+| **Indexer** | `backend/src/indexer.rs` | Mechanical maintenance worker, **no LLM**. Backfills missing embeddings, detects embedder-model changes and re-embeds, checkpoints the index manifest. (Replaced the old destructive "Curator.") |
 | **Workers** | `backend/src/workers/` | Subsystems that fetch external data: `gmail.rs`, `www.rs`, plus the `Worker` trait, `WorkerRegistry`, `WorkerContext`, `SearchEvent`, and `oauth.rs`. See [Workers](#workers). |
 | **LLM client** | `backend/src/claude.rs` | `LlmClient` trait + `ClaudeCliClient` (production) + `MockLlmClient` + `FailingLlmClient` (tests). |
 | **WebSocket handler** | `backend/src/ws.rs` | axum WS endpoint; wires the turn pipeline, status frames, and error→memory→client handling. |
@@ -161,7 +161,7 @@ trait Worker {
 `WorkerContext` bundles the Preprocessor, memory store, embedder, vector index,
 and a `preprocess_concurrency` knob. `WorkerContext::ingest_one` is the **single
 ingestion pipeline** every worker uses: Preprocessor → (drop-stub *or* memory
-write) → embed → HNSW upsert, emitting `Ingested` / `Dropped` / `Failed`
+write) → embed → vector-index upsert, emitting `Ingested` / `Dropped` / `Failed`
 events. Workers never call `MemoryStore::add` directly — routing through
 `ingest_one` is what keeps Invariant #3 structurally enforced rather than
 remembered.
@@ -217,7 +217,7 @@ Two layers of fan-out, both bounded:
   `futures::stream::buffer_unordered` (`WorkerContext.preprocess_concurrency`,
   default 4). Each Preprocessor call is a fresh subprocess (Invariant #2), so
   they're independent. Memory writes stay serial — they're sub-millisecond and
-  serializing avoids HNSW upsert contention.
+  serializing avoids vector-index upsert contention.
 
 The search loop is bounded by `max_search_rounds` (default 2). If the model
 emits *another* `SEARCH:` marker after the cap, the assistant re-prompts once
@@ -239,8 +239,10 @@ The memory directory is the **only** persistent state. It's human-readable text
   preferences.json                 # standing user preferences
   embedding_model.json             # active model + dimension (for invalidation)
   connectors/<name>/               # per-worker credentials + cursors (e.g. gmail token, last_seen)
-  hnsw/graph.bin                   # derived cache: the HNSW search graph
-  hnsw/manifest.json               # derived cache: which items are indexed
+  hnsw/manifest.json               # derived cache: which item ids are indexed
+                                   #   (dir name is historical; the index is an
+                                   #   in-memory cosine scan, not an ANN graph —
+                                   #   no graph file is written)
   logs/<prefix>.YYYY-MM-DD         # daily-rotated structured logs
   SYSTEM_MANUAL.md                 # the manual, seeded on first run; user-editable
 ```
@@ -254,25 +256,40 @@ worker-produced items are written as `WorkerFinding` and tagged both
 `worker:<name>` and `connector:<name>` so old queries keep matching.
 
 **Explicit forget** tombstones an item: body becomes `[forgotten <ts>]`, kind
-becomes a forgotten stub, the `.vec` and HNSW entry are removed, and the
+becomes a forgotten stub, the `.vec` and vector-index entry are removed, and the
 metadata remains as forensic audit. Nothing background ever rewrites a body.
 
 ## Embedding & the vector index
 
 Embeddings are computed **locally** — there is no remote embeddings API call
-(Invariant #1). The `Embedder` trait has two implementations:
+(Invariant #1). The model weights download once on first use; after that
+everything runs in-process. The `Embedder` trait has two implementations:
 
-- **`FastembedEmbedder`** — a small fastembed-rs model running in-process.
-  **Opt-in** behind the `fastembed-real` Cargo feature to keep the default
-  build light.
-- **`MockEmbedder`** — deterministic hash-based vectors. Used by default and in
-  tests. Architecturally correct but **not semantically meaningful**, so always
-  build production with `--features fastembed-real`.
+- **`FastembedEmbedder`** — **bge-base-en-v1.5**, an English-first retrieval
+  model (768-dim) via fastembed-rs, running in-process on CPU. Behind the
+  `fastembed-real` Cargo feature, which is **on by default**, so `cargo build`,
+  `cargo build --release`, and `cargo run` all use it. (Heavier 1024-dim
+  options like `BGELargeENV15` / `MxbaiEmbedLargeV1` exist for more quality at
+  higher RAM/latency — change the enum and `dim` in `embedder.rs`.)
+- **`MockEmbedder`** — deterministic hash-based "bag-of-words" vectors (384-dim).
+  Used when built with `--no-default-features`, and forced in tests via
+  `AI_ASSISTANT_MOCK_EMBEDDER=1` so the suite stays offline and deterministic.
+  Architecturally correct but **not semantically meaningful**.
 
-`embedding_model.json` records the active model + dimension. If you switch
-embedders, the Indexer notices the mismatch on its next tick and re-embeds.
-Vectors are stored as `.vec` sidecars (source of truth); the HNSW graph is a
-rebuildable cache.
+`embedding_model.json` records the active model + dimension. When it differs
+from the live embedder (you switch from the mock to bge, or bump the model),
+the Indexer wipes every `.vec` sidecar and re-embeds from the stored bodies on
+its next tick — so changing models is safe and automatic. (Note: `build_app`
+only writes this record when it's absent, so it never masks a change from the
+Indexer.)
+
+The vector index itself is a **brute-force cosine scan** over an in-memory
+`HashMap` of all vectors (`vector_index.rs::search`), not an approximate-
+nearest-neighbor graph — despite the `hnsw/` directory name and `graph.bin`
+filename, no ANN graph is built or persisted. That is simple and entirely
+adequate at personal scale (thousands to tens of thousands of items); a real
+ANN index is a future change tracked in the [Roadmap](../ROADMAP.md). Vectors
+live in `.vec` sidecars (source of truth); the index is a rebuildable cache.
 
 ## Retrieval
 
@@ -385,9 +402,12 @@ cargo test --workspace
 ```
 
 The suite is **offline and free**: tests construct `MockLlmClient` /
-`MockEmbedder` (and `FailingLlmClient` for failure paths) directly, so no
-`claude` tokens are spent and no real embedding model loads. Two env switches
-let you run the *binaries* against mocks for manual smoke tests:
+`MockEmbedder` (and `FailingLlmClient` for failure paths) directly, and the
+integration tests set `AI_ASSISTANT_MOCK_EMBEDDER=1`, so no `claude` tokens are
+spent and no real embedding model loads — even though `fastembed-real` is
+compiled in by default. (`cargo test --no-default-features` skips ONNX Runtime
+for a lighter build.) Two env switches let you run the *binaries* against mocks
+for manual smoke tests:
 
 - `AI_ASSISTANT_MOCK_CLAUDE=1` — deterministic canned LLM.
 - `AI_ASSISTANT_MOCK_EMBEDDER=1` — deterministic hash embedder.
@@ -409,7 +429,7 @@ backend/src/
   assistant.rs               the Core: retrieval, prompt build, marker loop, execute_search
   memory.rs                  file-based store, atomic writes, forget, item kinds
   embedder.rs                Embedder trait + fastembed + MockEmbedder
-  vector_index.rs            HNSW wrapper
+  vector_index.rs            in-memory cosine vector index (brute-force)
   indexer.rs                 mechanical maintenance worker
   workers/
     mod.rs                   Worker trait, WorkerRegistry, WorkerContext, SearchEvent, tick driver

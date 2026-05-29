@@ -49,23 +49,27 @@ The system has these components running on the backend:
    Has read-only web access (WebSearch, WebFetch) and the marker
    vocabulary (see `markers` section).
 
-3. **Embedder**. Local model (fastembed-rs) turning sanitized text into
-   384-dim vectors. Runs in-process — no remote embedding API.
+3. **Embedder**. Local model (fastembed-rs, bge-base-en-v1.5 — an English
+   retrieval model, 768-dim) turning sanitized text into vectors. On by
+   default; runs in-process on CPU — no remote embedding API. (A deterministic
+   mock embedder is used in tests and for `--no-default-features` builds.)
 
-4. **VectorIndex**. HNSW (or brute-force) search structure. Graph file is
-   a derived cache; source of truth is the per-item `.vec` sidecars.
+4. **VectorIndex**. A brute-force cosine scan over an in-memory map of all
+   vectors — not an ANN graph, despite the `hnsw/` directory name. Source of
+   truth is the per-item `.vec` sidecars; the index is a rebuildable cache.
 
 5. **Indexer**. Mechanical background worker. NO LLM calls. Backfills
-   missing `.vec` sidecars, detects embedder-model changes and re-embeds,
-   checkpoints the HNSW manifest. Replaces the old Curator.
+   missing `.vec` sidecars, detects embedder-model changes and re-embeds
+   everything, checkpoints the index manifest. Replaces the old Curator.
 
-6. **Connectors**. Search-only adapters to external personal-data sources
-   (Gmail today). The assistant emits `SEARCH: <connector> <query>`;
-   results pass through the Preprocessor.
+6. **Workers**. Subsystems that fetch external data. Each can serve
+   on-demand searches (you emit `SEARCH: <worker> <query>`) and/or run an
+   autonomous background tick. Gmail (read-only) and the web worker ship
+   today; every result routes through the Preprocessor before it reaches
+   memory. (Unifies the old "Connectors" + "Scout" split — same job, one
+   abstraction.)
 
-7. **Scout**. Opt-in periodic web/news worker.
-
-8. **Config protocol dispatcher**. Handles client-driven configuration
+7. **Config protocol dispatcher**. Handles client-driven configuration
    (uploading credentials, OAuth handshakes). Bypasses the Preprocessor
    and memory per Invariant #8.
 
@@ -102,7 +106,7 @@ These are non-negotiable. Numbered, restated at the top of `main.rs`.
 
 7. **Forward-compatible reads.** Any version of the backend can read a
    memory directory written by any earlier version. Derived files
-   (vectors, HNSW graph) are rebuilt transparently. Source-of-truth
+   (vectors, the vector index) are rebuilt transparently. Source-of-truth
    files (.txt body, .json metadata) tolerate unknown fields and
    default missing optional fields cleanly. Orphans are quarantined,
    never deleted.
@@ -129,38 +133,37 @@ reply to the user. Use them when appropriate; never speculatively.
   or chat.
 
 - `FORGET: <item-id>` — tombstones the named memory item. The body is
-  zeroed, the .vec is deleted, and the HNSW entry is removed. The
+  zeroed, the .vec is deleted, and the vector-index entry is removed. The
   sidecar metadata stays as audit. Reversible only from backup. Only
   use when the user explicitly asks ("forget that", "don't remember X");
   never on your own initiative. Item IDs are shown in the MEMORY block
   as `id=...`.
 
-- `SEARCH: <connector> <query>` — runs a search against a configured
-- `SEARCH: <connector> <query>` — runs a search against a configured
-  connector. Each result passes through the Preprocessor and lands in
-  memory as a ConnectorFinding. You're re-prompted with the new memory
+- `SEARCH: <worker> <query>` — runs a search against a configured
+  worker. Each result passes through the Preprocessor and lands in
+  memory as a WorkerFinding. You're re-prompted with the new memory
   available. Bounded at 2 search rounds per turn. Use when the answer
   is likely outside current memory but inside one of the connected
   sources. Multiple SEARCH markers in one reply run **in parallel**
-  (default 4-way), and within a single connector the per-result
+  (default 4-way), and within a single worker the per-result
   Preprocessor calls also fan out in parallel — so a 10-result Gmail
   page no longer serializes 10×15s of Haiku latency. Status frames per
-  connector show live progress in the client status bar.
+  worker show live progress in the client status bar.
 - `READ_MANUAL: <section-name>` — fetch a section of this manual.
 - `READ_MANUAL` (alone, no args) — fetch the table of contents.
   Bounded at 4 reads per turn. Use when you need procedural reference,
   the exact marker syntax, or to walk a user through setup confidently.
 
-- `CONFIG_REQUEST_FILE: <connector> <filename>` — asks the user (via
+- `CONFIG_REQUEST_FILE: <worker> <filename>` — asks the user (via
   the client UI) to provide a file. The client opens a file picker and
-  sends the contents back as a ConfigPayload. Use during connector
+  sends the contents back as a ConfigPayload. Use during worker
   setup. After the file lands, you'll get a continuation turn with
   context that lets you move to the next step.
 
-- `CONFIG_BEGIN_OAUTH: <connector>` — kicks off the OAuth handshake.
+- `CONFIG_BEGIN_OAUTH: <worker>` — kicks off the OAuth handshake.
   The client binds a local loopback listener and the user is sent to
   Google's consent page. The token gets exchanged on the backend, and
-  the connector is registered live in the registry. You'll be told
+  the worker is registered live in the registry. You'll be told
   when it's done.
 
 Multiple markers per turn are allowed for SEARCH and READ_MANUAL.
@@ -215,8 +218,10 @@ stubs/<id>.json                  # content-free Tier-1 drop records
 preferences.json                 # standing preferences ("don't tell me
                                  # about X")
 embedding_model.json             # active embedder model + dim
-hnsw/graph.bin                   # DERIVED CACHE (rebuildable)
-hnsw/manifest.json               # which items are indexed
+hnsw/manifest.json               # DERIVED CACHE: which item ids are indexed.
+                                 # (Dir name is historical; the index is an
+                                 # in-memory cosine scan, not an ANN graph —
+                                 # no graph file is written.)
 connectors/<name>/client_secret.json   # OAuth client (uploaded by user
                                        # via client)
 connectors/<name>/token.json     # OAuth token (written after auth)
@@ -261,7 +266,7 @@ FORGET: <the-item-id>
 ```
 
 The backend tombstones the item (body becomes `[forgotten <ts>]`, kind
-becomes ForgottenStub, .vec deleted, HNSW entry removed). The sidecar
+becomes ForgottenStub, .vec deleted, vector-index entry removed). The sidecar
 metadata stays as forensic audit. Reversible only from backup.
 
 Don't emit FORGET on your own initiative. Don't infer; ask if you're

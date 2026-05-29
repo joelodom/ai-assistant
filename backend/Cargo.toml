@@ -35,15 +35,15 @@ oauth2 = "4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 urlencoding = "2"
 webbrowser = "0.8"
-# fastembed is opt-in to keep the default build fast and dependency-light.
-# Production deployments should enable it (`--features fastembed-real`) so
-# Embedder uses real semantic vectors. Without the feature, MockEmbedder is
-# used (deterministic hash-based vectors — fine for tests + architecture
-# correctness, but not semantic).
+# fastembed powers real semantic embeddings (bge-base-en-v1.5). It is ON by
+# default (see [features]) so `cargo build`, `cargo build --release`, and
+# `cargo run` all get real embeddings. It pulls in ONNX Runtime; for a light,
+# dependency-free build (e.g. fast CI), use `--no-default-features`, which
+# falls back to the deterministic MockEmbedder.
 fastembed = { version = "4", optional = true }
 
 [features]
-default = []
+default = ["fastembed-real"]
 fastembed-real = ["dep:fastembed"]
 
 [dev-dependencies]

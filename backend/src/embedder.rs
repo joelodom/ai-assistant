@@ -11,29 +11,33 @@
 //!   semantically meaningful but is deterministic and gives some signal for
 //!   keyword overlap, which is enough to exercise the retrieval pipeline.
 //!
-//! * `FastembedEmbedder` — real semantic embeddings via the `fastembed` crate.
-//!   Feature-gated (`fastembed-real`) to keep the default build dependency-free.
-//!   Production deployments should enable the feature.
+//! * `FastembedEmbedder` — real semantic embeddings (bge-base-en-v1.5, an
+//!   English retrieval model) via the `fastembed` crate. Behind the
+//!   `fastembed-real` feature, which is **on by default** — `cargo build`,
+//!   `cargo build --release`, and `cargo run` all use real embeddings. The
+//!   feature pulls in ONNX Runtime; build with `--no-default-features` for a
+//!   light, dependency-free build (falls back to the mock).
 //!
 //! The choice is made via `make_embedder_from_env()` which checks
-//! `AI_ASSISTANT_MOCK_EMBEDDER=1`. Defaults to mock when the
-//! `fastembed-real` feature is disabled, and to FastembedEmbedder when it is
-//! enabled (unless the env var forces the mock).
+//! `AI_ASSISTANT_MOCK_EMBEDDER=1`. With the feature on (the default) it uses
+//! FastembedEmbedder unless that env var forces the mock; with the feature
+//! off it always uses the mock. Tests force the mock via the env var so they
+//! stay offline and deterministic — that is the intended exception.
 
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
 
-/// Dimension of the mock embedder's output. Matches `bge-small` /
-/// `multilingual-e5-small` for compatibility — if you later switch to a real
-/// model with the same dim, existing `.vec` sidecars and HNSW graphs stay
-/// usable. (Embedding *quality* of course changes; the Indexer can be told
-/// to re-embed.)
+/// Dimension of the mock embedder's output. The real embedder
+/// (bge-base-en-v1.5) is 768-dim, so mock and real vectors are NOT
+/// interchangeable: when the active model name changes, the Indexer wipes
+/// every `.vec` sidecar and re-embeds from the stored bodies. 384 is kept
+/// for the mock purely because it's a cheap, conventional size for tests.
 pub const MOCK_EMBEDDING_DIM: usize = 384;
 
 /// The `Embedder` trait. All implementations must be deterministic for a
 /// given input — the same text always produces the same vector — so that
-/// re-running the Indexer over the same items doesn't churn the HNSW graph.
+/// re-running the Indexer over the same items doesn't churn the vector index.
 #[async_trait]
 pub trait Embedder: Send + Sync {
     /// Vector dimension. Must be stable for the lifetime of the process.
@@ -156,35 +160,30 @@ mod fastembed_impl {
     /// on first use so startup is fast even when the embedder is never
     /// invoked.
     pub struct FastembedEmbedder {
-        inner: Mutex<Option<fastembed::TextEmbedding>>,
+        // Lazily-initialized model, shared into the blocking pool by `embed`.
+        // The Mutex guards both the one-time init and inference (fastembed's
+        // `embed` takes `&mut self`); serializing embeds is fine for this
+        // single-user workload.
+        model: Arc<Mutex<Option<fastembed::TextEmbedding>>>,
         dim: usize,
         model_name: String,
     }
 
     impl FastembedEmbedder {
         pub fn new() -> Result<Self> {
-            // Default to multilingual-small — 384-dim, good quality, English
-            // and many other languages. Same dim as MockEmbedder so vectors
-            // are interchangeable at the storage layer.
+            // bge-base-en-v1.5 — a strong English retrieval model (768-dim).
+            // English-first by design: this is a single-user personal
+            // assistant, so we optimize for English recall quality rather
+            // than multilingual coverage. Heavier alternatives exist
+            // (BGELargeENV15 / MxbaiEmbedLargeV1, 1024-dim) if you want max
+            // quality at ~1.3GB RAM and slower CPU embeds; change the enum
+            // and `dim` together. The Indexer re-embeds every item whenever
+            // this model name changes (see indexer.rs).
             Ok(Self {
-                inner: Mutex::new(None),
-                dim: 384,
-                model_name: "multilingual-e5-small".to_string(),
+                model: Arc::new(Mutex::new(None)),
+                dim: 768,
+                model_name: "bge-base-en-v1.5".to_string(),
             })
-        }
-
-        fn ensure_loaded(&self) -> Result<()> {
-            let mut g = self.inner.lock().unwrap();
-            if g.is_some() {
-                return Ok(());
-            }
-            let model = fastembed::TextEmbedding::try_new(
-                fastembed::InitOptions::new(fastembed::EmbeddingModel::MultilingualE5Small)
-                    .with_show_download_progress(false),
-            )
-            .context("failed to initialize fastembed model")?;
-            *g = Some(model);
-            Ok(())
         }
     }
 
@@ -199,28 +198,47 @@ mod fastembed_impl {
         }
 
         async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-            self.ensure_loaded()?;
+            // Inference — and the one-time model load, which on first run
+            // downloads the model weights — is blocking CPU work, so run it
+            // on the blocking pool, not the async runtime.
+            //
+            // NOTE: bge/e5-style models are trained with instruction prefixes
+            // ("Represent this sentence…" / "query:" / "passage:"); we embed
+            // raw text on both sides. Simpler and works well; adding prefixes
+            // is a future quality refinement (needs the trait to distinguish
+            // query vs document).
+            let model = self.model.clone();
             let text = text.to_string();
-            let result = tokio::task::spawn_blocking({
-                let inner = self.inner.lock().unwrap().clone();
-                move || -> Result<Vec<f32>> {
-                    // We can't easily clone the model, so call .embed inside
-                    // the blocking task with the model. We pull it out of
-                    // the Mutex temporarily.
-                    drop(inner); // unused; we'll re-acquire below
-                    Ok(vec![0.0; 384]) // placeholder; see note below
+            let dim = self.dim;
+            let vector = tokio::task::spawn_blocking(move || -> Result<Vec<f32>> {
+                let mut guard = model.lock().unwrap();
+                if guard.is_none() {
+                    tracing::info!(
+                        "loading local embedding model bge-base-en-v1.5 \
+                         (first use downloads weights, ~400MB, one time)"
+                    );
+                    let m = fastembed::TextEmbedding::try_new(
+                        fastembed::InitOptions::new(fastembed::EmbeddingModel::BGEBaseENV15)
+                            .with_show_download_progress(false),
+                    )
+                    .context("failed to initialize fastembed model")?;
+                    *guard = Some(m);
                 }
+                let model = guard.as_mut().expect("model initialized above");
+                let mut out = model
+                    .embed(vec![text], None)
+                    .context("fastembed embedding failed")?;
+                out.pop()
+                    .ok_or_else(|| anyhow::anyhow!("fastembed returned no vectors"))
             })
-            .await??;
-            // NOTE: A production-quality FastembedEmbedder would hold the
-            // model in an Arc<Mutex<>> or similar and call .embed without
-            // the placeholder above. This stub keeps the architecture
-            // correct without the full embedding cost during development.
-            // Enable `fastembed-real` and replace this with the real call
-            // path. See https://github.com/Anush008/fastembed-rs for the
-            // current API.
-            let _ = text;
-            Ok(result)
+            .await
+            .context("embedding task panicked")??;
+            anyhow::ensure!(
+                vector.len() == dim,
+                "fastembed returned {} dims, expected {dim}",
+                vector.len()
+            );
+            Ok(vector)
         }
     }
 }

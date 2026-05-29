@@ -34,7 +34,9 @@ the residual risks. For how these guarantees are implemented in code, see the
 The backend is **read-in / respond-out only**. No code path writes to an
 external system: no SMTP, no outbound write APIs, no state-mutating SDKs, no
 "just one webhook." The only outbound traffic is **read-only** web search /
-fetch and read-only authenticated reads (e.g. `gmail.readonly`).
+fetch, read-only authenticated reads (e.g. `gmail.readonly`), and a **one-time
+download of the local embedding model's weights** on first run — after which
+embedding is fully on-device. None of these can mutate external state.
 
 This is not a policy you toggle for convenience — it's an architectural
 property. Its security payoff is the deepest defense against **prompt injection

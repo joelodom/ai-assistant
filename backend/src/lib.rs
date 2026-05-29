@@ -54,10 +54,18 @@ pub async fn build_app(cfg: config::Config) -> anyhow::Result<Built> {
         let _ = vector_index.upsert(&item.sidecar.id, vec);
         let _ = item;
     }
-    memory
-        .write_embedding_model(embedder.model_name(), embedder.dimension())
-        .await
-        .ok();
+    // Record the active embedding model ONLY when nothing is recorded yet
+    // (fresh install). Overwriting here would mask a model change from the
+    // Indexer, which compares the on-disk record against the live model to
+    // decide whether to re-embed — e.g. after switching from the mock
+    // embedder to bge-base-en-v1.5. The Indexer owns the write on first run
+    // and whenever the model changes.
+    if memory.read_embedding_model().is_none() {
+        memory
+            .write_embedding_model(embedder.model_name(), embedder.dimension())
+            .await
+            .ok();
+    }
 
     let facts = Arc::new(self_knowledge::SystemFacts::from_cfg(
         &cfg.claude,

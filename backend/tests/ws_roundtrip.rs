@@ -8,6 +8,10 @@ use tempfile::TempDir;
 #[tokio::test]
 async fn full_roundtrip_with_mock_llm() {
     std::env::set_var("AI_ASSISTANT_MOCK_CLAUDE", "1");
+    // Force the mock embedder so tests stay offline + deterministic even
+    // though `fastembed-real` is on by default (it would otherwise download
+    // and run the real model). This is the intended test-only exception.
+    std::env::set_var("AI_ASSISTANT_MOCK_EMBEDDER", "1");
 
     let td = TempDir::new().unwrap();
 
@@ -103,6 +107,10 @@ async fn full_roundtrip_with_mock_llm() {
 #[tokio::test]
 async fn sanitizer_drop_path_emits_stub_notice_and_persists_only_stub() {
     std::env::set_var("AI_ASSISTANT_MOCK_CLAUDE", "1");
+    // Force the mock embedder so tests stay offline + deterministic even
+    // though `fastembed-real` is on by default (it would otherwise download
+    // and run the real model). This is the intended test-only exception.
+    std::env::set_var("AI_ASSISTANT_MOCK_EMBEDDER", "1");
 
     let td = TempDir::new().unwrap();
 
@@ -219,6 +227,10 @@ async fn sanitizer_drop_path_emits_stub_notice_and_persists_only_stub() {
 #[tokio::test]
 async fn self_knowledge_is_in_assistant_prompt() {
     std::env::set_var("AI_ASSISTANT_MOCK_CLAUDE", "1");
+    // Force the mock embedder so tests stay offline + deterministic even
+    // though `fastembed-real` is on by default (it would otherwise download
+    // and run the real model). This is the intended test-only exception.
+    std::env::set_var("AI_ASSISTANT_MOCK_EMBEDDER", "1");
 
     let td = TempDir::new().unwrap();
     let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -333,6 +345,10 @@ async fn self_knowledge_is_in_assistant_prompt() {
 #[tokio::test]
 async fn hazmat_bypass_skips_sanitizer_and_tags_memory() {
     std::env::set_var("AI_ASSISTANT_MOCK_CLAUDE", "1");
+    // Force the mock embedder so tests stay offline + deterministic even
+    // though `fastembed-real` is on by default (it would otherwise download
+    // and run the real model). This is the intended test-only exception.
+    std::env::set_var("AI_ASSISTANT_MOCK_EMBEDDER", "1");
 
     let td = TempDir::new().unwrap();
     let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -447,6 +463,10 @@ async fn hazmat_bypass_skips_sanitizer_and_tags_memory() {
 #[tokio::test]
 async fn sanitizer_failure_drops_input_persists_audit_and_notifies_user() {
     std::env::set_var("AI_ASSISTANT_MOCK_CLAUDE", "1");
+    // Force the mock embedder so tests stay offline + deterministic even
+    // though `fastembed-real` is on by default (it would otherwise download
+    // and run the real model). This is the intended test-only exception.
+    std::env::set_var("AI_ASSISTANT_MOCK_EMBEDDER", "1");
 
     let td = TempDir::new().unwrap();
     let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -578,6 +598,10 @@ async fn config_payload_writes_client_secret_atomically_and_replies_config_statu
     // Crucially: the payload bypasses the Preprocessor and never lands in
     // long-term memory (Invariant #8).
     std::env::set_var("AI_ASSISTANT_MOCK_CLAUDE", "1");
+    // Force the mock embedder so tests stay offline + deterministic even
+    // though `fastembed-real` is on by default (it would otherwise download
+    // and run the real model). This is the intended test-only exception.
+    std::env::set_var("AI_ASSISTANT_MOCK_EMBEDDER", "1");
 
     let td = TempDir::new().unwrap();
     let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -669,6 +693,10 @@ async fn config_payload_writes_client_secret_atomically_and_replies_config_statu
 #[tokio::test]
 async fn unknown_config_connector_returns_bad_status_not_panic() {
     std::env::set_var("AI_ASSISTANT_MOCK_CLAUDE", "1");
+    // Force the mock embedder so tests stay offline + deterministic even
+    // though `fastembed-real` is on by default (it would otherwise download
+    // and run the real model). This is the intended test-only exception.
+    std::env::set_var("AI_ASSISTANT_MOCK_EMBEDDER", "1");
 
     let td = TempDir::new().unwrap();
     let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

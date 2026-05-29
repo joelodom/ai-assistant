@@ -10,7 +10,7 @@
 //!   5. The memory store contains sanitized data only.
 //!   6. The backend is restart-safe at any time.
 //!   7. Forward-compatible reads: old memory directories and old config
-//!      files must continue to load. Derived caches (HNSW graph) are
+//!      files must continue to load. Derived caches (the vector index) are
 //!      rebuildable from sidecars.
 //!
 //! ONE flag only: `--config <path>` to point at a TOML config file. With

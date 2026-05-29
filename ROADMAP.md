@@ -4,8 +4,7 @@
 > changed to produce this; it is analysis only. Findings cite `file:line` so
 > they can be verified before acting. Confidence is stated per item — treat the
 > "Direction" notes as starting points for a design discussion, not settled
-> decisions. Nothing here is in the README TOC on purpose; this is a planning
-> doc, not part of the documentation set.
+> decisions. This file is linked from the README's documentation table.
 
 The system is in good shape: the OAuth flow (CSRF `state` + PKCE + TTL +
 refresh rotation + atomic writes, `config_protocol.rs:256`, `oauth.rs:137`) is
@@ -14,6 +13,12 @@ careful, the LLM subprocess avoids shell/argv injection (prompt over stdin,
 and meaningful. The recommendations below are about the gaps between the
 **claims** the project makes (the diode; "remembers everything for years") and
 what the implementation currently guarantees.
+
+**Update 2026-05-28 (after this was written):** real semantic embeddings
+(bge-base-en-v1.5, English, on by default) are now implemented — the embedding
+path previously returned all-zero vectors — and the embedding / vector-index
+claims across the docs have been corrected to match the code. The items below
+still stand.
 
 ---
 
@@ -147,16 +152,15 @@ and then item #1 gives them a way out. The two compound.
   daemon.
 
 ### Performance / scale
-- **The "HNSW index" is a brute-force linear scan, and the docs say otherwise.**
-  `VectorIndex::search` (`vector_index.rs:135`) computes cosine against *every*
-  vector each query; `save_manifest` only writes `manifest.json` and the
-  `GRAPH_FILE` ("hnsw/graph.bin") const is never written. README,
-  `docs/ARCHITECTURE.md`, and `CLAUDE.md` all describe an HNSW graph. Two
-  actions: (a) **fix the docs** — they oversell scalability; (b) decide
-  consciously: brute-force is genuinely fine to ~tens of thousands of items
-  (sub-ms over 384-dim vectors), so the honest move may be to *rename it*
-  (`VectorIndex`, not HNSW) and document the ceiling, deferring a real ANN
-  index until item #2's in-memory store proves the bottleneck.
+- **The vector index is a brute-force linear scan** (`VectorIndex::search`,
+  `vector_index.rs:135` — cosine against *every* vector each query; the
+  `GRAPH_FILE` "hnsw/graph.bin" const is never written). The docs **no longer
+  claim HNSW** (corrected 2026-05-28); brute-force is genuinely fine to ~tens of
+  thousands of items. Remaining work, when scale demands it: rename the type and
+  `hnsw/` dir away from "hnsw", or swap in a real ANN index (the `hnsw_rs` crate
+  is already a dependency). Deferred until item #2's in-memory store proves the
+  bottleneck. Note bge's 768-dim vectors are 2× the old 384-dim, so the scan is
+  ~2× the work per query — still trivial at personal scale.
 - **Every Preprocessor call spawns a fresh `claude` (Node) CLI subprocess.**
   This is required to be *stateless* (Invariant #2), but the CLI's process +
   runtime startup is heavy, and it runs **per message and per worker result**
@@ -204,8 +208,13 @@ and then item #1 gives them a way out. The two compound.
 
 ---
 
-## Doc/impl mismatches found (fix when convenient — not urgent)
-1. "HNSW" everywhere vs. brute-force linear scan in `vector_index.rs` (see above).
-2. `SECURITY.md` frames all outbound traffic as harmless "read-only"; `WebFetch`
-   GETs can carry data outbound (item #1).
-3. `hnsw/graph.bin` is documented as a derived cache file but is never written.
+## Doc/impl mismatches — status
+1. ✅ **Resolved (2026-05-28).** "HNSW" claims vs. the brute-force cosine scan:
+   the docs (README, ARCHITECTURE, DEFAULT_MANUAL, CLAUDE.md) now describe the
+   in-memory cosine index honestly.
+2. ⚠️ **Open.** `SECURITY.md` frames outbound traffic as harmless "read-only",
+   but `WebFetch` GETs can still carry data outbound (item #1). Only partially
+   touched (the one-time model download is now disclosed); the exfil framing
+   still needs work.
+3. ✅ **Resolved (2026-05-28).** `hnsw/graph.bin` was documented as a cache file
+   but is never written; the memory-store layout no longer lists it.

@@ -17,6 +17,25 @@ all. `ct` covers every one of these: counts and line/symbol info via `ct`
 lookups, search via `ct grep` / `ct search` / `ct vsearch`, and edits via
 `ct splice` / `ct move-lines` / `ct extract-function` / `ct delete-function`.
 
+## Documentation freshness
+
+When you change behavior — a marker, the wire protocol, a setup flow, an
+invariant, a default, a model — **update the docs in the same change**; never
+leave them describing the old reality. A doc claim must be true of the code
+**as written, not as intended** (the embedding path that shipped returning
+zero vectors while the docs promised "real semantic recall" is the cautionary
+tale). Code wins when they disagree — fix the doc. Where each is canonical:
+
+- `backend/src/DEFAULT_MANUAL.md` — the assistant's operating manual:
+  *procedural* truth (markers, setup, troubleshooting). Embedded in the binary
+  and seeded to the user's editable `SYSTEM_MANUAL.md`.
+- `docs/ARCHITECTURE.md` — how it's built + how to contribute.
+- `docs/SECURITY.md` — threat model + invariant rationale.
+- `docs/USER_GUIDE.md` — install / run / use.
+- `README.md` — the pitch + the documentation table of contents.
+- `ROADMAP.md` — known gaps + planned work.
+- `CLAUDE.md` (this file) — the security-relevant working agreement.
+
 ## Security model
 
 A personal AI assistant built around a strict one-way data flow ("the diode").
@@ -121,6 +140,6 @@ Never silently swallow LLM errors. Always persist + surface.
 The system never silently forgets things. When the user asks ("forget that"),
 the Assistant emits a `FORGET:` marker line; the WS handler tombstones the
 named item (`MemoryStore::forget(id)` → body replaced with `[forgotten <ts>]`,
-sidecar kind becomes `ForgottenStub`, `.vec` and HNSW entry removed).
+sidecar kind becomes `ForgottenStub`, `.vec` and vector-index entry removed).
 Tombstones are intentional and durable: the metadata stays as forensic audit.
 Background workers do NOT delete or rewrite item bodies.

@@ -6,9 +6,9 @@
 //!  2. Embed the message, upsert into the vector index.
 //!  3. Hybrid retrieve: vector + keyword + recency + importance.
 //!  4. Build prompt with persona, metadata, retrieved memory, preferences,
-//!     and the AVAILABLE CONNECTORS block.
+//!     and the AVAILABLE WORKERS block.
 //!  5. Call LLM. Handle three kinds of markers in a single loop:
-//!       - SEARCH: <connector> <query>  → run search, ingest, re-call
+//!       - SEARCH: <worker> <query>     → run search, ingest, re-call
 //!       - ESCALATE_TO_OPUS: <reason>   → re-call with escalation model
 //!       - FORGET: <item_id>            → tombstone (handled post-loop)
 //!  6. Persist assistant note.
@@ -48,16 +48,17 @@ pub struct Assistant {
     /// Maximum total READ_MANUAL fetches per turn. Counts each section
     /// pulled, across however many rounds.
     pub max_manual_reads: usize,
-    /// Max concurrent Preprocessor calls when fanning out connector
+    /// Max concurrent Preprocessor calls when fanning out worker
     /// results. Each call spawns a fresh `claude` subprocess
     /// (Invariant #2), so it's the subprocess startup that dominates;
     /// 4-way parallelism cuts a 10-result Gmail page from ~170s wall
     /// time to ~45s without changing semantics.
     pub preprocess_concurrency: usize,
-    /// Max concurrent connectors within one SEARCH round. When the LLM
+    /// Max concurrent workers within one SEARCH round. When the LLM
     /// emits `SEARCH: gmail …` and `SEARCH: calendar …` in the same
-    /// reply, both run side-by-side. Each connector internally fans
-    /// out its own preprocessing.
+    /// reply, both run side-by-side. Each worker internally fans
+    /// out its own preprocessing. (The field keeps its legacy
+    /// `connector_concurrency` name.)
     pub connector_concurrency: usize,
     pub system_facts: Arc<crate::self_knowledge::SystemFacts>,
 }
@@ -67,8 +68,8 @@ pub const ESCALATION_MARKER: &str = "ESCALATE_TO_OPUS:";
 /// Marker the assistant emits when the user asks to forget a specific item.
 pub const FORGET_MARKER: &str = "FORGET:";
 
-/// Marker the assistant emits to request a connector search.
-/// Format: `SEARCH: <connector_name> <free-form query>`.
+/// Marker the assistant emits to request a worker search.
+/// Format: `SEARCH: <worker_name> <free-form query>`.
 pub const SEARCH_MARKER: &str = "SEARCH:";
 
 /// Marker the assistant emits to fetch a section of the system manual.
@@ -76,11 +77,11 @@ pub const SEARCH_MARKER: &str = "SEARCH:";
 pub const READ_MANUAL_MARKER: &str = "READ_MANUAL";
 
 /// Marker the assistant emits to request a file from the user during
-/// connector setup. Format: `CONFIG_REQUEST_FILE: <connector> <filename>`.
+/// worker setup. Format: `CONFIG_REQUEST_FILE: <worker> <filename>`.
 pub const CONFIG_REQUEST_FILE_MARKER: &str = "CONFIG_REQUEST_FILE:";
 
-/// Marker the assistant emits to begin the OAuth handshake for a connector.
-/// Format: `CONFIG_BEGIN_OAUTH: <connector>`.
+/// Marker the assistant emits to begin the OAuth handshake for a worker.
+/// Format: `CONFIG_BEGIN_OAUTH: <worker>`.
 pub const CONFIG_BEGIN_OAUTH_MARKER: &str = "CONFIG_BEGIN_OAUTH:";
 
 /// User-facing substitute when the LLM returns zero bytes. Kept
@@ -103,7 +104,7 @@ pub struct RespondOutcome {
     pub escalation_reason: Option<String>,
     /// Item id that was tombstoned, if a FORGET marker was acted on.
     pub forgotten_item_id: Option<String>,
-    /// One-line summaries of any connector searches executed this turn.
+    /// One-line summaries of any worker searches executed this turn.
     /// Used by the WS handler to prepend a preamble to the user's reply
     /// so they can see what the assistant did under the hood.
     pub search_log: Vec<String>,
@@ -554,7 +555,7 @@ impl Assistant {
                     "search_round_starting"
                 );
                 // Run multiple SEARCH markers concurrently — each
-                // connector hits a different external service and each
+                // worker hits a different external service and each
                 // result inside hits the Preprocessor in parallel
                 // (execute_search owns its own fan-out). Order doesn't
                 // matter for the search_log preamble; the user just
@@ -988,7 +989,7 @@ fn strip_config_markers(text: &str) -> (String, Vec<shared::ConfigRequestKind>) 
 /// `slot` is forwarded as-is: pass `None` for linear pipeline phases
 /// (retrieving / thinking / replying) that should own the default
 /// single-slot line, or `Some(key)` for concurrent activities that
-/// should each get their own live line (e.g. parallel connector
+/// should each get their own live line (e.g. parallel worker
 /// preprocessing).
 fn emit_status(
     tx: Option<&tokio::sync::mpsc::UnboundedSender<shared::ServerMessage>>,
@@ -1005,7 +1006,7 @@ fn emit_status(
     }
 }
 
-/// Parse SEARCH: markers from an LLM reply. Returns (connector_name,
+/// Parse SEARCH: markers from an LLM reply. Returns (worker_name,
 /// query) pairs in the order they appeared. Tolerates extra whitespace and
 /// missing args.
 fn parse_search_markers(text: &str) -> Vec<(String, String)> {
@@ -1020,12 +1021,12 @@ fn parse_search_markers(text: &str) -> Vec<(String, String)> {
             continue;
         }
         let mut split = rest.splitn(2, char::is_whitespace);
-        let connector = split.next().unwrap_or("").trim().to_string();
+        let worker = split.next().unwrap_or("").trim().to_string();
         let query = split.next().unwrap_or("").trim().to_string();
-        if connector.is_empty() || query.is_empty() {
+        if worker.is_empty() || query.is_empty() {
             continue;
         }
-        out.push((connector, query));
+        out.push((worker, query));
     }
     out
 }
@@ -1578,7 +1579,7 @@ mod tests {
         );
     }
 
-    // --- Connector-pathway tests ---
+    // --- Worker-pathway tests ---
 
     #[test]
     fn parses_search_markers() {
