@@ -12,6 +12,7 @@
 
 mod app;
 mod geo;
+mod icon;
 mod markdown;
 mod net;
 mod theme;
@@ -45,7 +46,8 @@ fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([800.0, 720.0])
-            .with_title("AI Assistant"),
+            .with_title("AI Assistant")
+            .with_icon(icon::app_icon()),
         ..Default::default()
     };
     eframe::run_native(

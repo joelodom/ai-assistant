@@ -11,6 +11,12 @@
 //! it covers what the assistant actually emits, fails safe (an unterminated
 //! `**` just renders literally), and never panics on odd input.
 //!
+//! Wrapping: every block is rendered as a *single* label in the vertical card
+//! ui, so it wraps at the card width like an ordinary paragraph. List/quote
+//! markers are prepended as inline spans rather than laid out in a side-by-side
+//! `horizontal` — a horizontal layout reports an effectively unbounded width,
+//! which makes long lines run off the right edge instead of wrapping.
+//!
 //! One intentional non-rule: underscores are *not* emphasis. Personal data is
 //! full of `IMG_4708.png` and `N271SD_notes`; treating `_` as italics would
 //! mangle them. Only `*` and backticks are markers.
@@ -76,47 +82,40 @@ pub fn render_markdown(ui: &mut egui::Ui, text: &str, body_color: Color32) {
                 _ => size + 1.0,
             };
             ui.add_space(2.0);
-            indented(ui, indent, |ui| {
-                ui.label(
-                    egui::RichText::new(rest)
-                        .font(FontId::new(hsize, bold_family()))
-                        .color(TEXT_STRONG),
-                );
-            });
-            return_space(ui);
+            let mut job = LayoutJob::default();
+            job.append(
+                rest,
+                0.0,
+                TextFormat {
+                    font_id: FontId::new(hsize, bold_family()),
+                    color: TEXT_STRONG,
+                    ..Default::default()
+                },
+            );
+            apply_indent(&mut job, indent);
+            label_job(ui, job);
+            ui.add_space(1.0);
             continue;
         }
 
         // Bullets: "- ", "* ", "+ ", "• " (the space is required, so "*x*" at
         // line start is still italics, not a bullet).
         if let Some(rest) = bullet(trimmed) {
-            indented(ui, indent, |ui| {
-                ui.horizontal_top(|ui| {
-                    ui.label(
-                        egui::RichText::new("•")
-                            .color(TEXT_MUTED)
-                            .font(FontId::new(size, FontFamily::Proportional)),
-                    );
-                    ui.add_space(7.0);
-                    label_job(ui, inline_job(rest, size, body_color));
-                });
-            });
+            let mut job = LayoutJob::default();
+            append_prefix(&mut job, "•  ", size, TEXT_MUTED);
+            append_inline(&mut job, rest, size, body_color);
+            apply_indent(&mut job, indent);
+            label_job(ui, job);
             continue;
         }
 
         // Numbered list: "1. ", "2) " …
         if let Some((marker, rest)) = numbered(trimmed) {
-            indented(ui, indent, |ui| {
-                ui.horizontal_top(|ui| {
-                    ui.label(
-                        egui::RichText::new(marker)
-                            .color(TEXT_MUTED)
-                            .font(FontId::new(size, FontFamily::Proportional)),
-                    );
-                    ui.add_space(7.0);
-                    label_job(ui, inline_job(rest, size, body_color));
-                });
-            });
+            let mut job = LayoutJob::default();
+            append_prefix(&mut job, &format!("{marker}  "), size, TEXT_MUTED);
+            append_inline(&mut job, rest, size, body_color);
+            apply_indent(&mut job, indent);
+            label_job(ui, job);
             continue;
         }
 
@@ -125,16 +124,19 @@ pub fn render_markdown(ui: &mut egui::Ui, text: &str, body_color: Color32) {
             .strip_prefix("> ")
             .or_else(|| trimmed.strip_prefix(">"))
         {
-            indented(ui, indent + 6.0, |ui| {
-                label_job(ui, inline_job(rest, size, TEXT_MUTED));
-            });
+            let mut job = LayoutJob::default();
+            append_prefix(&mut job, "▏  ", size, TEXT_MUTED);
+            append_inline(&mut job, rest, size, TEXT_MUTED);
+            apply_indent(&mut job, indent);
+            label_job(ui, job);
             continue;
         }
 
         // Ordinary paragraph line.
-        indented(ui, indent, |ui| {
-            label_job(ui, inline_job(trimmed, size, body_color));
-        });
+        let mut job = LayoutJob::default();
+        append_inline(&mut job, trimmed, size, body_color);
+        apply_indent(&mut job, indent);
+        label_job(ui, job);
     }
 
     if in_fence && !code_buf.is_empty() {
@@ -142,28 +144,35 @@ pub fn render_markdown(ui: &mut egui::Ui, text: &str, body_color: Color32) {
     }
 }
 
-/// A little breathing room after a heading.
-fn return_space(ui: &mut egui::Ui) {
-    ui.add_space(1.0);
-}
-
-/// Run `add` inside an optional left indent. Keeps wrapping correct because the
-/// inner ui owns the remaining width.
-fn indented(ui: &mut egui::Ui, indent: f32, add: impl FnOnce(&mut egui::Ui)) {
-    if indent <= 0.5 {
-        add(ui);
-    } else {
-        ui.horizontal_top(|ui| {
-            ui.add_space(indent);
-            ui.vertical(|ui| add(ui));
-        });
-    }
-}
-
-/// Set the job's wrap width to the available width and emit it.
+/// Emit a job, wrapping at the available width. Always called from the vertical
+/// card ui, so `available_width` is the real card width (a `horizontal` layout
+/// would report an unbounded width and defeat wrapping).
 fn label_job(ui: &mut egui::Ui, mut job: LayoutJob) {
     job.wrap.max_width = ui.available_width();
     ui.label(job);
+}
+
+/// Indent a block by offsetting its first line. Continuation lines wrap to the
+/// left margin — fine for the shallow nesting the assistant emits.
+fn apply_indent(job: &mut LayoutJob, indent: f32) {
+    if indent > 0.5 {
+        if let Some(first) = job.sections.first_mut() {
+            first.leading_space = indent;
+        }
+    }
+}
+
+/// Append a list/quote marker as a normal span in `color`.
+fn append_prefix(job: &mut LayoutJob, text: &str, size: f32, color: Color32) {
+    job.append(
+        text,
+        0.0,
+        TextFormat {
+            font_id: FontId::new(size, FontFamily::Proportional),
+            color,
+            ..Default::default()
+        },
+    );
 }
 
 fn render_code_block(ui: &mut egui::Ui, lines: &[String]) {
@@ -228,9 +237,17 @@ fn leading_indent(line: &str) -> f32 {
     px.min(48.0)
 }
 
-/// Flat inline tokenizer → a `LayoutJob` with one section per styled span.
+/// Build a `LayoutJob` from one line of inline Markdown. (Thin wrapper over
+/// [`append_inline`], kept for the unit tests.)
+#[cfg(test)]
 fn inline_job(text: &str, size: f32, body_color: Color32) -> LayoutJob {
     let mut job = LayoutJob::default();
+    append_inline(&mut job, text, size, body_color);
+    job
+}
+
+/// Flat inline tokenizer → appends one section per styled span into `job`.
+fn append_inline(job: &mut LayoutJob, text: &str, size: f32, body_color: Color32) {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
     let mut i = 0;
@@ -240,9 +257,9 @@ fn inline_job(text: &str, size: f32, body_color: Color32) -> LayoutJob {
         // `code`
         if chars[i] == '`' {
             if let Some(j) = find_char(&chars, i + 1, '`') {
-                flush(&mut job, &mut normal, size, body_color);
+                flush(job, &mut normal, size, body_color);
                 let inner: String = chars[i + 1..j].iter().collect();
-                append(&mut job, &inner, Span::Code, size, body_color);
+                append(job, &inner, Span::Code, size, body_color);
                 i = j + 1;
                 continue;
             }
@@ -256,14 +273,14 @@ fn inline_job(text: &str, size: f32, body_color: Color32) -> LayoutJob {
             if open_end < n && !chars[open_end].is_whitespace() {
                 if let Some(j) = find_run(&chars, open_end, '*', run) {
                     if j > open_end && !chars[j - 1].is_whitespace() {
-                        flush(&mut job, &mut normal, size, body_color);
+                        flush(job, &mut normal, size, body_color);
                         let inner: String = chars[open_end..j].iter().collect();
                         let span = match run {
                             3 => Span::BoldItalic,
                             2 => Span::Bold,
                             _ => Span::Italic,
                         };
-                        append(&mut job, &inner, span, size, body_color);
+                        append(job, &inner, span, size, body_color);
                         i = j + run;
                         continue;
                     }
@@ -275,8 +292,7 @@ fn inline_job(text: &str, size: f32, body_color: Color32) -> LayoutJob {
         i += 1;
     }
 
-    flush(&mut job, &mut normal, size, body_color);
-    job
+    flush(job, &mut normal, size, body_color);
 }
 
 fn flush(job: &mut LayoutJob, normal: &mut String, size: f32, body_color: Color32) {
@@ -422,6 +438,19 @@ mod tests {
             job.sections[0].format.font_id.family,
             FontFamily::Proportional
         );
+    }
+
+    #[test]
+    fn bullet_marker_is_a_prefix_span() {
+        // The bullet glyph and the text share one job, so the whole line wraps
+        // as a unit instead of running off the right in a horizontal layout.
+        let mut job = LayoutJob::default();
+        append_prefix(&mut job, "•  ", 15.0, TEXT_MUTED);
+        append_inline(&mut job, "**do** the thing", 15.0, Color32::WHITE);
+        assert!(job.text.starts_with("•  "));
+        assert!(job.text.contains("do the thing"));
+        // first span = marker, then the bold "do".
+        assert_eq!(job.sections[1].format.font_id.family, bold_family());
     }
 
     #[test]

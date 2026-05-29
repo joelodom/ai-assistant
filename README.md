@@ -6,6 +6,10 @@ documents. It remembers. Later you ask *"what am I supposed to be thinking
 about right now?"* and it answers — using everything you've ever told it,
 weighted by recency and importance.
 
+<p align="center">
+  <img src="screenshot.png" alt="The AI Assistant desktop client: a message-card chat transcript where the assistant summarizes activity with real bold text and bulleted points, with sender labels, a connection indicator, and an input bar carrying Attach, HAZMAT, and Opus controls." width="640">
+</p>
+
 It is built around one **non-negotiable property**: a strict one-way data
 flow we call **the diode**.
 
