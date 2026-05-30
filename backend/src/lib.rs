@@ -6,8 +6,10 @@ pub mod attachments;
 pub mod claude;
 pub mod config;
 pub mod config_protocol;
+pub mod devnote;
 pub mod embedder;
 pub mod indexer;
+pub mod logcapture;
 pub mod manual;
 pub mod memory;
 pub mod preprocessor;
@@ -133,6 +135,16 @@ pub async fn build_app(cfg: config::Config) -> anyhow::Result<Built> {
         Some(cfg.claude.model_for_scout()),
     )));
 
+    // Briefing worker is always present too — it reads only memory, needs no
+    // setup. Its autonomous tick is gated on cfg.briefing.enabled (on by
+    // default); it synthesizes the "what's important now" briefing that the
+    // startup greeting summarizes.
+    worker_list.push(Arc::new(workers::briefing::BriefingWorker::new(
+        llm.clone(),
+        cfg.briefing.clone(),
+        Some(cfg.claude.model_for_briefing()),
+    )));
+
     let workers_registry = Arc::new(workers::WorkerRegistry::new(worker_ctx, worker_list));
     for k in workers::known_worker_kinds() {
         workers_registry.register_kind(k);
@@ -163,6 +175,8 @@ pub async fn build_app(cfg: config::Config) -> anyhow::Result<Built> {
         4, // max_manual_reads
         4, // preprocess_concurrency
         4, // connector_concurrency
+        Some(cfg.claude.model_for_briefing_summary()),
+        cfg.briefing.staleness_minutes,
         facts,
     ));
     let state = ws::AppState {

@@ -142,7 +142,16 @@ pub async fn retrieve(
     let half_life = weights.half_life_days.max(0.1);
     let mut scored: Vec<ScoredItem> = candidates
         .into_iter()
-        .filter(|(_, item)| item.sidecar.kind != ItemKind::ForgottenStub)
+        // Exclude ForgottenStub tombstones and auto-generated Briefing items.
+        // A briefing is a meta-summary OF memory, not a fact, and its high
+        // recency would otherwise surface it in unrelated queries; the startup
+        // greeting and `SEARCH: briefing` read briefings directly instead.
+        .filter(|(_, item)| {
+            !matches!(
+                item.sidecar.kind,
+                ItemKind::ForgottenStub | ItemKind::Briefing
+            )
+        })
         .map(|(id, item)| {
             let v = vector_scores.get(&id).copied().unwrap_or(0.0);
             let w = keyword_scores.get(&id).copied().unwrap_or(0.0);
@@ -352,6 +361,42 @@ mod tests {
             .unwrap();
         let ids: Vec<_> = hits.iter().map(|s| s.item.sidecar.id.clone()).collect();
         assert!(!ids.contains(&id));
+    }
+
+    #[tokio::test]
+    async fn briefing_items_excluded() {
+        let (_td, mem, emb, idx) = build().await;
+        // Same body for a normal item and a Briefing item; without the
+        // exclusion the briefing would be just as strong a candidate.
+        let normal = add_with_age(&mem, &emb, &idx, "roof inspector follow up", 0.5, 0).await;
+        let sc = mem
+            .add(
+                "roof inspector follow up",
+                ItemKind::Briefing,
+                0.1,
+                None,
+                "".into(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let item = mem.get(&sc.id).unwrap().unwrap();
+        let v = emb.embed(&item.body).await.unwrap();
+        mem.write_vector(&item, &v).await.unwrap();
+        idx.upsert(&sc.id, v).unwrap();
+
+        let w = RetrievalWeights::default();
+        let hits = retrieve(&mem, &*emb, &idx, &w, "roof inspector follow up", 10)
+            .await
+            .unwrap();
+        assert!(
+            !hits.iter().any(|s| s.item.sidecar.kind == ItemKind::Briefing),
+            "briefing items must be excluded from retrieval"
+        );
+        assert!(
+            hits.iter().any(|s| s.item.sidecar.id == normal),
+            "the normal item should still be retrievable"
+        );
     }
 
     #[tokio::test]

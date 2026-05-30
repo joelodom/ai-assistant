@@ -23,6 +23,7 @@ Sections (request via `READ_MANUAL: <section-name>`):
 - **memory-store** — on-disk layout, atomic writes, sha256, forward-compat.
 - **hazmat-bypass** — what HAZMAT mode does and how to talk about it.
 - **forget-action** — explicit forget, when to use it, what happens.
+- **developer-notes** — recording a NOTE_TO_DEV for the developer; user-initiated only.
 - **worker-setup-gmail** — full walkthrough including Cloud Console.
 - **worker-setup-gdrive** — read-only Google Drive search; Cloud Console.
 - **worker-setup-general** — pattern for any future worker.
@@ -167,9 +168,51 @@ reply to the user. Use them when appropriate; never speculatively.
   the worker is registered live in the registry. You'll be told
   when it's done.
 
+- `NOTE_TO_DEV: … END_NOTE_TO_DEV` — a multi-line block recorded to
+  SUGGESTIONS.md for the developer. Emit it ONLY when the user points out
+  something you did wrong, or suggests an improvement/fix — NEVER on your own
+  initiative. The backend strips the whole block from your reply, attaches
+  this turn's diagnostic logs automatically, and appends it. See the
+  `developer-notes` section for the exact format.
+
 Multiple markers per turn are allowed for SEARCH and READ_MANUAL.
-ESCALATE_TO_OPUS must be the whole reply. FORGET can appear anywhere
-in the reply text.
+ESCALATE_TO_OPUS must be the whole reply. FORGET and the NOTE_TO_DEV block
+can appear anywhere in the reply text. Emit NOTE_TO_DEV only at the user's
+prompting — a problem they raised or an improvement they suggested — never on
+your own initiative.
+
+## developer-notes
+
+The user can have you record a note for the developer — but ONLY when THEY
+raise it. Two triggers, both user-initiated:
+
+1. The user points out something you did wrong (a bad answer, a wrong recall,
+   a confusing explanation).
+2. The user suggests an improvement, fix, or feature.
+
+NEVER file a note on your own initiative, and never log your own ideas
+unprompted. When the user does (explicitly, or by clearly pointing out a
+problem), include a block of EXACTLY this form anywhere in your reply:
+
+```
+NOTE_TO_DEV:
+TYPE: issue        (`issue` = a problem the user raised; `idea` = a suggestion)
+INPUT: <what the user asked or pointed out, one line>
+OUTPUT: <what you had answered that was wrong or insufficient, one line>
+DETAILS: <thorough, multi-line: full context, exactly what went wrong or what
+the improvement is, and your best understanding of the cause>
+END_NOTE_TO_DEV
+```
+
+The backend strips the whole block from your reply (the user never sees the
+raw marker), attaches the diagnostic logs captured for this turn — the lines
+emitted from the start of the turn in question through now — and appends a
+timestamped entry to `SUGGESTIONS.md` in the memory root. You do NOT need to
+include logs yourself. Because the block is hidden, ALSO acknowledge in your
+normal prose that you've recorded it.
+
+Be specific and generous in DETAILS: this file is read later (often with
+Claude Code) to triage fixes and shape the roadmap, so more context helps.
 
 ## hybrid-retrieval
 
@@ -402,7 +445,8 @@ they decline, just answer using what's in memory.
 
 ## workers
 
-A Worker is "a thing that produces external data". It may:
+A Worker is usually "a thing that produces external data" (the `briefing`
+worker is the one exception — it synthesizes from memory). It may:
 
 - Respond to `SEARCH: <worker> <query>` from you — the worker runs
   the search, streams each result through the Preprocessor, writes
@@ -426,6 +470,17 @@ Currently shipping:
 - **www** — Open web (WebSearch + WebFetch). Both an interest-inferred
   autonomous scan (when enabled) and on-demand `SEARCH: www <query>`
   for fresh-news questions whose answer isn't in memory.
+- **briefing** — The one worker that produces NO external data. Every few
+  minutes it reads your memory and synthesizes a short "what's important right
+  now" briefing (time-sensitive, newly added, high-stakes, open loops).
+  Because its input is already-sanitized memory and its LLM call is given no
+  tools, the result is stored directly — like an AssistantNote, NOT through
+  the Preprocessor — as a low-importance `Briefing` item tagged
+  `auto-briefing`. Briefings are EXCLUDED from your contextual retrieval
+  (they're meta-summaries of memory, not facts). The startup greeting reads
+  the latest *fresh* briefing and a cheap model summarizes it into the
+  welcome; `SEARCH: briefing` forces a new one on demand. Gated on
+  `[briefing].enabled` (on by default).
 
 Workers REPLACE the previous "connectors" + "Scout" split — that
 distinction was bookkeeping; both did the same architectural job. Old
@@ -541,6 +596,12 @@ what happened, why, and what to improve.
 - Both destinations are independently toggleable via `[logging]
   stdout = ...` / `file = ...`. Format (`json` or `text`) is also a
   config knob. `RUST_LOG` env var overrides the configured level.
+- **in-memory capture (for developer notes)**: a separate ring buffer holds
+  the most recent backend log lines at DEBUG (with warn+ from dependencies, so
+  ONNX model-load and HTTP plumbing stay out) — independent of the stdout/file
+  the turn in question. These lines are copied into `SUGGESTIONS.md` only when
+  the user requests a note; they are never otherwise persisted. See
+  `developer-notes`.
 
 If a user asks "where are my logs," point them at
 `<memory-dir>/logs/`. If they want to share for analysis, suggest the

@@ -31,7 +31,10 @@ use anyhow::Result;
 use backend::config::LoggingCfg;
 use std::path::{Path, PathBuf};
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{fmt::writer::MakeWriterExt, EnvFilter};
+use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriterExt};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{fmt, EnvFilter, Layer};
 
 #[derive(Debug, Default)]
 struct CliArgs {
@@ -91,71 +94,50 @@ fn init_logging(cfg: &LoggingCfg, memory_dir: &Path) -> Result<Option<WorkerGuar
         None
     };
 
-    // Compose writers per the (stdout, file) matrix. Cases collapse to:
-    //   (true, true)   stdout + file
-    //   (true, false)  stdout only
-    //   (false, true)  file only
-    //   (false, false) silent (we still install a subscriber so events are
-    //                  defined but discarded)
     let is_json = cfg.format.eq_ignore_ascii_case("json");
 
-    match (cfg.stdout, file_writer) {
-        (true, Some(fw)) => {
-            let w = std::io::stdout.and(fw);
-            if is_json {
-                tracing_subscriber::fmt()
-                    .json()
-                    .with_env_filter(env_filter)
-                    .with_writer(w)
-                    .with_target(true)
-                    .init();
-            } else {
-                tracing_subscriber::fmt()
-                    .with_env_filter(env_filter)
-                    .with_writer(w)
-                    .with_target(true)
-                    .init();
-            }
-        }
-        (true, None) => {
-            if is_json {
-                tracing_subscriber::fmt()
-                    .json()
-                    .with_env_filter(env_filter)
-                    .with_writer(std::io::stdout)
-                    .with_target(true)
-                    .init();
-            } else {
-                tracing_subscriber::fmt()
-                    .with_env_filter(env_filter)
-                    .with_writer(std::io::stdout)
-                    .with_target(true)
-                    .init();
-            }
-        }
-        (false, Some(fw)) => {
-            if is_json {
-                tracing_subscriber::fmt()
-                    .json()
-                    .with_env_filter(env_filter)
-                    .with_writer(fw)
-                    .with_target(true)
-                    .init();
-            } else {
-                tracing_subscriber::fmt()
-                    .with_env_filter(env_filter)
-                    .with_writer(fw)
-                    .with_target(true)
-                    .init();
-            }
-        }
-        (false, None) => {
-            tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
-                .with_writer(std::io::sink)
-                .init();
-        }
-    }
+    // Display layer: the user's visible logs, exactly as configured. Collapse
+    // the (stdout, file) matrix into one boxed writer, then a json- or text-
+    // formatted fmt layer filtered by the env filter.
+    let display_writer: BoxMakeWriter = match (cfg.stdout, file_writer) {
+        (true, Some(fw)) => BoxMakeWriter::new(std::io::stdout.and(fw)),
+        (true, None) => BoxMakeWriter::new(std::io::stdout),
+        (false, Some(fw)) => BoxMakeWriter::new(fw),
+        (false, None) => BoxMakeWriter::new(std::io::sink),
+    };
+    let display_layer = if is_json {
+        fmt::layer()
+            .json()
+            .with_target(true)
+            .with_writer(display_writer)
+            .with_filter(env_filter)
+            .boxed()
+    } else {
+        fmt::layer()
+            .with_target(true)
+            .with_writer(display_writer)
+            .with_filter(env_filter)
+            .boxed()
+    };
+
+    // Capture layer: a SECOND, in-memory sink, independent of the display
+    // filter, so a developer note (see logcapture/devnote) can attach rich
+    // per-turn diagnostics even when the user runs their visible logs at info.
+    // Scoped to the backend's OWN targets at debug (with warn+ from everything
+    // else): without this, a single turn's report drowns in ONNX model-load
+    // spam and h2/hyper/rustls HTTP plumbing, burying the dozen backend lines
+    // that actually matter. Text format, no ANSI, so the lines drop cleanly
+    // into a markdown report.
+    let capture_layer = fmt::layer()
+        .with_ansi(false)
+        .with_target(true)
+        .with_writer(backend::logcapture::CaptureMakeWriter)
+        .with_filter(EnvFilter::new("warn,backend=debug"));
+
+    tracing_subscriber::registry()
+        .with(display_layer)
+        .with(capture_layer)
+        .init();
 
     install_panic_hook();
     Ok(guard)

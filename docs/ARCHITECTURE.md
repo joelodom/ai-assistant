@@ -215,6 +215,16 @@ a `Finished` is treated as done.
     section keeps the legacy `scout` name; renaming it is a deferred schema
     bump — see [Known deferrals](#known-deferrals-and-rough-edges).)
   - Web content uses `PublicWeb` provenance (the stricter sanitization pass).
+- **`briefing` (`workers/briefing.rs`)** — the one worker that fetches nothing
+  external. On a tick (`[briefing].enabled`, default on) it reads memory and has
+  the LLM (with NO tools) synthesize a short "what's important now" briefing.
+  - It does NOT use the Preprocessor: its input is already-sanitized memory and
+    its call has no tools, so the output is a pure function of sanitized data
+    (like an `AssistantNote`). No new raw-input path, so the diode holds. Stored
+    directly as a low-importance `Briefing` item tagged `auto-briefing`.
+  - `Briefing` items are excluded from contextual retrieval; the startup greeting
+    (`Assistant::introduction`) summarizes the latest *fresh* one with the cheap
+    `briefing_summary_model`. `SEARCH: briefing` forces one on demand.
 
 ### Parallelism
 

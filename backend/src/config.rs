@@ -20,6 +20,7 @@ pub struct Config {
     pub claude: ClaudeCfg,
     pub scout: ScoutCfg,
     pub indexer: IndexerCfg,
+    pub briefing: BriefingCfg,
     pub retrieval: RetrievalWeights,
     pub logging: LoggingCfg,
     /// Legacy section. Accepted on load and ignored — the Curator is gone.
@@ -85,6 +86,12 @@ pub struct ClaudeCfg {
     pub assistant_escalation_model: Option<String>,
     /// Scout: web summarization + triage.
     pub scout_model: Option<String>,
+    /// Briefing worker: background synthesis of what's important in memory.
+    /// Not latency-critical; Sonnet by default.
+    pub briefing_model: Option<String>,
+    /// Startup briefing summary: condenses the latest briefing into the
+    /// welcome message on connect. Latency-sensitive; Haiku by default.
+    pub briefing_summary_model: Option<String>,
     /// Per-call timeout in seconds.
     pub timeout_secs: u64,
     /// Tools to allow the Scout and Assistant.
@@ -100,6 +107,21 @@ pub struct ScoutCfg {
     pub enabled: bool,
     pub interval_minutes: u64,
     pub pinned_topics: Vec<String>,
+}
+
+/// Briefing worker: every `interval_minutes`, synthesizes a short briefing of
+/// what's important in memory and stores it as a low-importance `Briefing`
+/// item. The startup greeting reads the latest one (if fresh) and summarizes
+/// it cheaply. On by default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BriefingCfg {
+    pub enabled: bool,
+    pub interval_minutes: u64,
+    /// On connect, the latest briefing is only used if it was built within
+    /// this many minutes; older than that, the greeting falls back to the
+    /// plain welcome rather than reciting a stale briefing.
+    pub staleness_minutes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +142,7 @@ impl Default for Config {
             claude: ClaudeCfg::default(),
             scout: ScoutCfg::default(),
             indexer: IndexerCfg::default(),
+            briefing: BriefingCfg::default(),
             retrieval: RetrievalWeights::default(),
             logging: LoggingCfg::default(),
             _legacy_curator: None,
@@ -171,6 +194,10 @@ impl Default for ClaudeCfg {
             assistant_escalation_model: Some("claude-opus-4-7".to_string()),
             // Scout: web summarization. Sonnet is plenty.
             scout_model: Some("claude-sonnet-4-6".to_string()),
+            // Briefing: background memory synthesis. Sonnet is plenty.
+            briefing_model: Some("claude-sonnet-4-6".to_string()),
+            // Startup briefing summary runs on connect; Haiku is fast.
+            briefing_summary_model: Some("claude-haiku-4-5".to_string()),
             timeout_secs: 180,
             scout_allowed_tools: vec!["WebSearch".to_string(), "WebFetch".to_string()],
             curator_model: None,
@@ -203,6 +230,16 @@ impl ClaudeCfg {
             .clone()
             .unwrap_or_else(|| self.model.clone())
     }
+    pub fn model_for_briefing(&self) -> String {
+        self.briefing_model
+            .clone()
+            .unwrap_or_else(|| self.model.clone())
+    }
+    pub fn model_for_briefing_summary(&self) -> String {
+        self.briefing_summary_model
+            .clone()
+            .unwrap_or_else(|| self.model.clone())
+    }
 }
 
 impl Default for ScoutCfg {
@@ -211,6 +248,16 @@ impl Default for ScoutCfg {
             enabled: false,
             interval_minutes: 10,
             pinned_topics: vec![],
+        }
+    }
+}
+
+impl Default for BriefingCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_minutes: 10,
+            staleness_minutes: 30,
         }
     }
 }
@@ -273,6 +320,17 @@ stale_age_days = 90
     fn default_config_has_indexer_enabled() {
         let cfg = Config::default();
         assert!(cfg.indexer.enabled);
+    }
+
+    #[test]
+    fn default_config_has_briefing_enabled() {
+        let cfg = Config::default();
+        assert!(cfg.briefing.enabled);
+        assert_eq!(cfg.briefing.interval_minutes, 10);
+        assert_eq!(cfg.briefing.staleness_minutes, 30);
+        // Distinct model roles resolve to a non-empty model id.
+        assert!(!cfg.claude.model_for_briefing().is_empty());
+        assert!(!cfg.claude.model_for_briefing_summary().is_empty());
     }
 
     #[test]

@@ -46,6 +46,7 @@
 //! "delete" verbs — and at the API level, scopes are pinned at OAuth
 //! time (Gmail uses `gmail.readonly`).
 
+pub mod briefing;
 pub mod gdrive;
 pub mod gmail;
 pub mod oauth;

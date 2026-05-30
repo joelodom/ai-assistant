@@ -36,6 +36,8 @@ preprocessor_model         = "claude-haiku-4-5"   # runs on every msg, latency m
 assistant_model            = "claude-sonnet-4-6"  # chat; self-escalates when needed
 assistant_escalation_model = "claude-opus-4-7"    # target of ESCALATE_TO_OPUS
 scout_model                = "claude-sonnet-4-6"  # web triage
+briefing_model             = "claude-sonnet-4-6"  # background memory synthesis
+briefing_summary_model     = "claude-haiku-4-5"   # cheap startup briefing summary
 # Per-call timeout for any `claude` CLI invocation.
 timeout_secs = 180
 # Tools the Scout (and Assistant) may use.
@@ -49,6 +51,18 @@ enabled = false
 interval_minutes = 10
 # Optional pinned topics. Empty list = Scout infers from memory.
 pinned_topics = []
+
+[briefing]
+# Background "what's important" worker. Every interval_minutes it reads your
+# memory and writes a short briefing (stored as a low-importance Briefing item,
+# excluded from normal recall). The startup greeting summarizes the latest one
+# with the cheap briefing_summary_model. On by default; it spends a little each
+# tick, so set enabled = false to turn it off.
+enabled = true
+interval_minutes = 10
+# On connect, only use the latest briefing if it was built within this many
+# minutes; older than that, you get the plain welcome instead of a stale brief.
+staleness_minutes = 30
 
 [indexer]
 # Mechanical maintenance worker. No LLM calls. Backfills missing `.vec`

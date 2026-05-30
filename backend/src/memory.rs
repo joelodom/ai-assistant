@@ -117,6 +117,15 @@ pub enum ItemKind {
     /// "connector" and "scout" as two distinct slots. Reads only;
     /// new items use `WorkerFinding`. See above.
     ConnectorFinding,
+    /// An auto-generated briefing produced by the `briefing` worker every
+    /// few minutes: a short synthesis of what's important / time-sensitive in
+    /// memory. Derived purely from already-sanitized memory (the worker's LLM
+    /// call gets no tools, so no new external data enters), so it is stored
+    /// directly like an AssistantNote — NOT re-run through the Preprocessor.
+    /// Low importance; tagged `auto-briefing`. Excluded from the assistant's
+    /// contextual retrieval (it's a meta-summary, not a fact); the startup
+    /// greeting reads the latest one directly.
+    Briefing,
 }
 /// Legacy decay stage. The Curator used to advance items through these
 /// stages and destructively summarize them. The Curator has been removed
@@ -551,6 +560,7 @@ impl MemoryStore {
                     ItemKind::AssistantError => "assistant_error",
                     ItemKind::SelfKnowledge => "self_knowledge",
                     ItemKind::ForgottenStub => "forgotten",
+                    ItemKind::Briefing => "briefing",
                 };
                 *out.entry(k).or_insert(0) += 1;
             }

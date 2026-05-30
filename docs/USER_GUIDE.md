@@ -289,6 +289,11 @@ enabled = false           # the autonomous web scan; opt-in
 interval_minutes = 10
 pinned_topics = []        # empty → infer from your memory
 
+[briefing]
+enabled = true            # background "what's important" worker → the startup greeting
+interval_minutes = 10
+staleness_minutes = 30    # ignore a briefing older than this when you connect
+
 [indexer]
 enabled = true            # mechanical maintenance; leave on
 ```

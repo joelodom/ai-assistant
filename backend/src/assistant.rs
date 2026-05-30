@@ -60,6 +60,12 @@ pub struct Assistant {
     /// out its own preprocessing. (The field keeps its legacy
     /// `connector_concurrency` name.)
     pub connector_concurrency: usize,
+    /// Cheap model that summarizes the latest briefing into the startup
+    /// greeting. None disables the briefing path (plain welcome instead).
+    pub briefing_summary_model: Option<String>,
+    /// A briefing older than this many minutes is treated as stale and not
+    /// used for the startup greeting.
+    pub briefing_staleness_minutes: u64,
     pub system_facts: Arc<crate::self_knowledge::SystemFacts>,
 }
 
@@ -83,6 +89,14 @@ pub const CONFIG_REQUEST_FILE_MARKER: &str = "CONFIG_REQUEST_FILE:";
 /// Marker the assistant emits to begin the OAuth handshake for a worker.
 /// Format: `CONFIG_BEGIN_OAUTH: <worker>`.
 pub const CONFIG_BEGIN_OAUTH_MARKER: &str = "CONFIG_BEGIN_OAUTH:";
+
+/// Markers the assistant emits — ONLY when the user points out a problem or
+/// suggests an improvement — to record a developer note. A multi-line block
+/// terminated by `END_NOTE_TO_DEV`; the backend strips the whole block from
+/// the reply, attaches the turn's diagnostic logs (see `logcapture`), and
+/// appends it to SUGGESTIONS.md (see `devnote`). Never self-initiated.
+pub const NOTE_TO_DEV_MARKER: &str = "NOTE_TO_DEV:";
+pub const NOTE_TO_DEV_END_MARKER: &str = "END_NOTE_TO_DEV";
 
 /// User-facing substitute when the LLM returns zero bytes. Kept
 /// concise, honest, and actionable.
@@ -148,6 +162,8 @@ impl Assistant {
             max_manual_reads: 4,
             preprocess_concurrency: 4,
             connector_concurrency: 4,
+            briefing_summary_model: None,
+            briefing_staleness_minutes: 30,
             system_facts: Arc::new(crate::self_knowledge::SystemFacts::placeholder()),
         }
     }
@@ -168,6 +184,8 @@ impl Assistant {
         max_manual_reads: usize,
         preprocess_concurrency: usize,
         connector_concurrency: usize,
+        briefing_summary_model: Option<String>,
+        briefing_staleness_minutes: u64,
         system_facts: Arc<crate::self_knowledge::SystemFacts>,
     ) -> Self {
         Self {
@@ -185,6 +203,8 @@ impl Assistant {
             max_manual_reads,
             preprocess_concurrency,
             connector_concurrency,
+            briefing_summary_model,
+            briefing_staleness_minutes,
             system_facts,
         }
     }
@@ -226,22 +246,64 @@ impl Assistant {
 
     pub async fn introduction(&self) -> String {
         let prefs = self.memory.preferences().await;
-        let user_items: usize = self
-            .memory
-            .scan_all()
-            .unwrap_or_default()
+        let all = self.memory.scan_all().unwrap_or_default();
+        let user_items: usize = all
             .iter()
-            .filter(|i| i.sidecar.kind != ItemKind::SelfKnowledge)
+            .filter(|i| !matches!(i.sidecar.kind, ItemKind::SelfKnowledge | ItemKind::Briefing))
             .count();
         let bootstrap = user_items == 0 && prefs.statements.is_empty();
         if bootstrap {
-            BOOTSTRAP_INTRO.to_string()
-        } else {
-            format!(
-                "Welcome back. I have {user_items} item(s) in memory and {} stored preference(s). \
-                 Ask me what you need to be thinking about, or hand me more to remember.",
-                prefs.statements.len()
-            )
+            return BOOTSTRAP_INTRO.to_string();
+        }
+
+        // Morning-briefing path: if the briefing worker has produced a recent
+        // briefing, have the cheap summary model turn it into the greeting.
+        // Falls back to the plain welcome when there's no fresh briefing, no
+        // summary model configured, or the summary call fails.
+        if let Some(greeting) = self.briefing_greeting(&all).await {
+            return greeting;
+        }
+
+        format!(
+            "Welcome back. I have {user_items} item(s) in memory and {} stored preference(s). \
+             Ask me what you need to be thinking about, or hand me more to remember.",
+            prefs.statements.len()
+        )
+    }
+
+    /// If a recent auto-briefing exists, summarize it into a welcome-back
+    /// greeting with the cheap summary model. Returns None (→ plain welcome)
+    /// when no summary model is configured, there's no briefing, the latest
+    /// briefing is staler than `briefing_staleness_minutes`, or the call fails.
+    async fn briefing_greeting(&self, all: &[crate::memory::MemoryItem]) -> Option<String> {
+        let model = self.briefing_summary_model.clone()?;
+        let latest = all
+            .iter()
+            .filter(|i| i.sidecar.kind == ItemKind::Briefing)
+            .max_by_key(|i| i.sidecar.created_at)?;
+
+        let age = chrono::Utc::now() - latest.sidecar.created_at;
+        if age > chrono::Duration::minutes(self.briefing_staleness_minutes as i64) {
+            return None; // stale — don't recite an out-of-date briefing
+        }
+
+        let prompt = format!(
+            "You are greeting the user as they open their assistant. Below is the latest \
+             auto-generated briefing of what's important in their memory, built {}. Rewrite it \
+             as a brief, warm welcome-back greeting: one short lead line, then the 3-6 most \
+             important points, trimmed and plain. Use only what's in the briefing; add nothing.\
+             \n\nBRIEFING:\n{}",
+            latest.sidecar.created_at.to_rfc3339(),
+            latest.body
+        );
+        let opts = LlmOptions {
+            allowed_tools: vec![],
+            model: Some(model),
+            ..Default::default()
+        };
+        match self.llm.oneshot(&prompt, opts).await {
+            Ok(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            _ => None,
         }
     }
 
@@ -286,6 +348,10 @@ impl Assistant {
     ) -> Result<RespondOutcome> {
         let turn_start = std::time::Instant::now();
         tracing::info!("turn_started");
+
+        // Mark a turn boundary so a later NOTE_TO_DEV can attach exactly the
+        // logs emitted while processing the turn the user is reacting to.
+        crate::logcapture::global().mark_turn_start();
 
         // 1. Persist user-side first.
         let user_kind = if looks_like_question(&preprocessed.output) {
@@ -633,8 +699,29 @@ impl Assistant {
         //     the user as-is.
         let (after_config_strip, config_requests) = strip_config_markers(&final_reply);
 
-        // 4b. Handle FORGET markers in the (now config-stripped) final reply.
-        let (final_text, forgotten_item_id) = self.handle_forget_markers(&after_config_strip).await;
+        // 4b. Extract a NOTE_TO_DEV block (a user-pointed-out problem or idea)
+        //     BEFORE forget handling, so a FORGET-looking line inside the note
+        //     body can't be acted on. The block is stripped from what the user
+        //     sees; we attach this turn's diagnostic logs and append it to
+        //     SUGGESTIONS.md. Recorded only when the user asked for it — the
+        //     prompt forbids self-initiated notes.
+        let (after_devnote_strip, dev_note) = crate::devnote::extract(&after_config_strip);
+        if let Some(note) = &dev_note {
+            let logs = crate::logcapture::global().logs_for_issue();
+            match crate::devnote::append(self.memory.root(), note, &logs) {
+                Ok(()) => tracing::info!(
+                    note_kind = ?note.kind,
+                    n_log_lines = logs.len(),
+                    details_len = note.details.chars().count(),
+                    "dev_note_recorded"
+                ),
+                Err(e) => tracing::warn!(error = %e, "dev_note_write_failed"),
+            }
+        }
+
+        // 4c. Handle FORGET markers in the (config + dev-note stripped) reply.
+        let (final_text, forgotten_item_id) =
+            self.handle_forget_markers(&after_devnote_strip).await;
 
         // 5. Persist assistant note.
         let model_used = current_model.clone().unwrap_or_default();
@@ -650,6 +737,9 @@ impl Assistant {
         }
         if !search_log.is_empty() {
             note_tags.push("search-action".into());
+        }
+        if dev_note.is_some() {
+            note_tags.push("dev-note".into());
         }
         let note_body = if escalated {
             format!(
@@ -687,6 +777,7 @@ impl Assistant {
             n_searches = search_log.len(),
             n_manual_reads = manual_reads_log.len(),
             n_config_requests = config_requests.len(),
+            dev_note = dev_note.is_some(),
             "turn_complete"
         );
         Ok(RespondOutcome {
@@ -1228,7 +1319,27 @@ fn build_prompt(
          \n\
          The backend will replace the marker line with a confirmation. Use this only when \
          the user clearly asks (\"forget that\", \"don't remember X\"); never on your own \
-         initiative.\n\n",
+         initiative.\n\
+         \n\
+         DEVELOPER NOTE (feedback capture): You can record a note for the developer, but \
+         ONLY when the user does one of two things: (a) points out something you did \
+         wrong, or (b) suggests an improvement or fix. NEVER on your own initiative — do \
+         not volunteer your own ideas, and never file a note the user didn't ask for. \
+         When the user does, include a block of EXACTLY this form anywhere in your reply:\n\
+         \n\
+           NOTE_TO_DEV:\n\
+           TYPE: issue   (`issue` = a problem the user pointed out; `idea` = a suggestion)\n\
+           INPUT: <what the user asked or pointed out, one line>\n\
+           OUTPUT: <what you had answered that was wrong or insufficient, one line>\n\
+           DETAILS: <thorough, multi-line: the full context, exactly what went wrong or \
+         what the improvement is, and your best understanding of the cause>\n\
+           END_NOTE_TO_DEV\n\
+         \n\
+         The backend strips this whole block from your reply (the user never sees the raw \
+         block) and automatically attaches the recent diagnostic logs — you do NOT need to \
+         include logs. Because the block is hidden, ALSO acknowledge in your normal prose \
+         that you've recorded it. Be specific and generous in DETAILS; this file is read \
+         later to fix the software.\n\n",
     );
     comp.persona = buf.len() - mark;
     mark = buf.len();
@@ -1400,6 +1511,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn introduction_summarizes_fresh_briefing() {
+        let (_td, mut a, mock) = setup_with_mock().await;
+        a.briefing_summary_model = Some("claude-haiku-4-5".into());
+        a.briefing_staleness_minutes = 30;
+        a.memory
+            .add("Bought milk", ItemKind::Ingestion, 0.5, None, String::new(), vec![])
+            .await
+            .unwrap();
+        // A fresh briefing (created_at = now).
+        a.memory
+            .add(
+                "(auto-generated briefing) - Roof follow-up open\n- Recital Saturday",
+                ItemKind::Briefing,
+                0.1,
+                None,
+                String::new(),
+                vec!["auto-briefing".into()],
+            )
+            .await
+            .unwrap();
+        mock.respond_when(
+            "greeting the user as they open",
+            "Welcome back! Top of mind: roof follow-up, recital Saturday.",
+        );
+
+        let intro = a.introduction().await;
+        assert!(intro.contains("roof follow-up") || intro.contains("recital"));
+        // Took the summary path, not the plain count-based welcome.
+        assert!(!intro.contains("item(s) in memory"));
+    }
+
+    #[tokio::test]
+    async fn introduction_ignores_stale_briefing() {
+        let (_td, mut a, _mock) = setup_with_mock().await;
+        a.briefing_summary_model = Some("claude-haiku-4-5".into());
+        a.briefing_staleness_minutes = 0; // any briefing is immediately stale
+        a.memory
+            .add("Bought milk", ItemKind::Ingestion, 0.5, None, String::new(), vec![])
+            .await
+            .unwrap();
+        a.memory
+            .add(
+                "(auto-generated briefing) - stale stuff",
+                ItemKind::Briefing,
+                0.1,
+                None,
+                String::new(),
+                vec!["auto-briefing".into()],
+            )
+            .await
+            .unwrap();
+
+        // Stale → falls back to the plain welcome (no summary call).
+        let intro = a.introduction().await;
+        assert!(intro.contains("item(s) in memory"));
+    }
+
+    #[tokio::test]
     async fn preprocessor_importance_is_used() {
         let (_td, a) = setup().await;
         let pp = PreprocessorResult {
@@ -1546,6 +1715,41 @@ mod tests {
         let item = a.memory.get(&id).unwrap().unwrap();
         assert_eq!(item.sidecar.kind, ItemKind::ForgottenStub);
         assert!(item.body.starts_with("[forgotten"));
+    }
+
+    #[tokio::test]
+    async fn note_to_dev_is_stripped_from_reply_and_written_to_suggestions() {
+        let (td, a, mock) = setup_with_mock().await;
+        mock.respond_when(
+            "USER MESSAGE",
+            "Thanks for flagging that — I've recorded it for the developer.\n\
+             NOTE_TO_DEV:\n\
+             TYPE: issue\n\
+             INPUT: asked what's on my plate\n\
+             OUTPUT: invented a dentist appointment\n\
+             DETAILS: I stated a stale memory item as a current commitment \
+             instead of hedging.\n\
+             END_NOTE_TO_DEV\n",
+        );
+
+        let outcome = a
+            .respond(&pp_pass("that dentist appointment was wrong"), &meta(), false)
+            .await
+            .unwrap();
+
+        // The raw block never leaks to the user; the surrounding prose does.
+        assert!(!outcome.text.contains("NOTE_TO_DEV"));
+        assert!(!outcome.text.contains("END_NOTE_TO_DEV"));
+        assert!(outcome.text.contains("recorded it for the developer"));
+
+        // It landed in SUGGESTIONS.md in the memory root, with the fields and
+        // the (empty, in tests) diagnostic-log section rendered.
+        let suggestions =
+            std::fs::read_to_string(td.path().join("SUGGESTIONS.md")).unwrap();
+        assert!(suggestions.contains("— issue"));
+        assert!(suggestions.contains("invented a dentist appointment"));
+        assert!(suggestions.contains("stale memory item"));
+        assert!(suggestions.contains("Diagnostic logs"));
     }
 
     #[tokio::test]
